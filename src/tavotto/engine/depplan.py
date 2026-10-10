@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import shutil
+import stat
 import subprocess
 import threading
 from collections.abc import Callable
@@ -219,6 +220,10 @@ for key in ("stdlib", "platstdlib"):
     except Exception:
         pass
 extra_roots = []
+# 被**有意排除**的目录（安装根目录、标准库目录及其子目录、lib-dynload / DLLs、探针 cwd）：不当包层读，但 `.pth` 路径行指向它们
+# 不算「指向没读过的目录」——里面没有第三方提供者（Windows 的 venv 里 sys.path 本来就带 DLLs 与基础解释器根目录，conda / 某些发行版的
+# `.pth` 也会指向标准库目录）。只是路径列表，静态索引据此认「已跟进」
+skipped_roots = []
 for entry in sys.path:
     if not entry or not isinstance(entry, str):
         continue
@@ -229,11 +234,13 @@ for entry in sys.path:
     except Exception:
         continue
     norm = os.path.normcase(path)
-    if norm in install_roots:
-        continue
-    if os.path.basename(path).lower() in ("lib-dynload", "dlls"):
-        continue
-    if any(norm == k or norm.startswith(k + os.sep) for k in skip):
+    if (
+        norm in install_roots
+        or os.path.basename(path).lower() in ("lib-dynload", "dlls")
+        or any(norm == k or norm.startswith(k + os.sep) for k in skip)
+    ):
+        if path not in skipped_roots:
+            skipped_roots.append(path)
         continue
     extra_roots.append(path)
 # sys.path 上**不是目录**却存在的条目（PYTHONPATH 上的 zip / egg 等 zipimport 来源）：静态索引读不了里面有哪些名字，只数个数，
@@ -251,6 +258,21 @@ for entry in sys.path:
     if re.fullmatch(r"python\d+t?\.zip", os.path.basename(path).lower()):
         continue
     opaque_roots += 1
+# site_roots 里 Python 的 `site` 真会处理 `.pth` 的那几层（getsitepackages / 启用的 user site）；经 PYTHONPATH 或 `.pth` 路径行进来的
+# 目录不处理它的 `.pth`，那里的行不会被执行。只是路径列表
+pth_roots = [p for p in site_roots if os.path.normcase(p) in known]
+# site_roots 与 extra_roots 合起来**按 sys.path 的原顺序**排成一份（#929）：静态索引按它给各层定先后，谁遮蔽谁才和真实 import 一致
+# （PYTHONPATH / `.pth` 目录排在 site-packages 前面时，前面的同名模块先被 import）。只是路径列表；成员与上面两份一致，不另做筛选
+path_order = []
+for entry in sys.path:
+    if not entry or not isinstance(entry, str):
+        continue
+    try:
+        path = os.path.abspath(entry)
+    except Exception:
+        continue
+    if (path in site_roots or path in extra_roots) and path not in path_order:
+        path_order.append(path)
 sys.stdout.write(json.dumps({
     "marker_env": env,
     "stdlib": sorted(getattr(sys, "stdlib_module_names", ())),
@@ -262,6 +284,9 @@ sys.stdout.write(json.dumps({
     "site_roots": site_roots,
     "extra_roots": extra_roots,
     "opaque_roots": opaque_roots,
+    "pth_roots": pth_roots,
+    "path_order": path_order,
+    "skipped_roots": skipped_roots,
 }))
 """
 
@@ -292,6 +317,20 @@ class TargetFacts:
     #: `sys.path` 上存在、但不是目录的 import 来源（zip / egg）的个数。里面的名字静态读不到：> 0 时索引的名字层不完整，
     #: 本该判缺的改判来源未定，不去装同名包遮蔽它。同上：不进 digest / payload。
     opaque_roots: int = 0
+    #: `site_roots` 里 Python 真会处理 `.pth` 的那几层（`site.getsitepackages()` / 启用的 user site）。静态索引据此只对这几层
+    #: 的 `.pth` 行计 `uncovered_paths`：经 `PYTHONPATH` 或 `.pth` 路径行进 `sys.path` 的 site-packages 不处理它的 `.pth`（#925）。
+    #: 空 = 没量到，每一层都当作会处理（旧口径）。不进 `digest()` / `to_payload()`。
+    pth_roots: tuple[str, ...] = ()
+    #: `site_roots` ∪ `extra_roots` 按 `sys.path` 原顺序排成的一份（#929）。静态索引据此交错给各层定先后（遮蔽语义沿用跨层规则）；
+    #: 空 = 没量到，退回「先 site 层、再额外层」的旧排法。不进 `digest()` / `to_payload()`。
+    path_order: tuple[str, ...] = ()
+    #: 被有意排除、不当包层的 `sys.path` 目录（安装根目录 / 标准库及其子目录 / lib-dynload / DLLs / 探针 cwd）。静态索引据此把指向它们
+    #: 的 `.pth` 路径行算已跟进（不计 `uncovered_paths`）。不进 `digest()` / `to_payload()`，也不进 `layer_digest`：它们由解释器
+    #: 的安装布局决定，不是会在确认窗口里变的 import 层（要变的话 site / extra / path_order 会先变）。空 = 没量到。
+    skipped_roots: tuple[str, ...] = ()
+    #: `layer_digest` 在**量事实的同一刻**算好的值（真探测才有；与静态索引同一刻读，计划与它描述同一个时间点）。空 = 没量到，
+    #: `layer_digest(facts)` 退回现算。不进 `digest()` / `to_payload()`。
+    layers: str = ""
 
     @property
     def python_version(self) -> str:
@@ -310,6 +349,72 @@ class TargetFacts:
             "installed_count": len(self.installed),
             "digest": self.digest(),
         }
+
+
+#: `layer_digest` 读单个 `.pth` 的字节上限 / 每个 site 层最多看几个 `.pth`：超出的只记个数与大小，不无限读。
+_PTH_READ_LIMIT = 256 * 1024
+_PTH_MAX_PER_ROOT = 200
+
+
+def layer_digest(facts: TargetFacts | None) -> str:
+    """目标解释器**import 层**的指纹（#922）：`site_roots` / `extra_roots` / `opaque_roots`（sys.path 顺序）加上 site 层里
+    每个 `.pth` 的内容摘要（`.pth` 会往 `sys.path` 加目录、或执行 `import` 行）。
+
+    只用于**执行期**的过期校验（`deprepair.prepare` 重量事实后与计划形成时的值比）：`TargetFacts.digest()` 只看 marker 与
+    已装集合，`.pth` / 可见 site 层变了而发行包名字版本表没变时它不变，旧计划会被照单接受；而新出现的提供者本会改变
+    missing / requirements。**不进** `digest()` / `to_payload()` / `inputs_digest` / `identity`——无关的重装不会因此发生。
+    没有层信息（替身事实、老缓存、`fresh_venv_facts`）回空串：两侧都空 = 没有可比的东西，不拦。读文件，不起进程。"""
+    if facts is None or not (facts.site_roots or facts.extra_roots or facts.opaque_roots):
+        return ""
+    if facts.layers:
+        return facts.layers
+    return _measure_layers(facts)
+
+
+def _measure_layers(facts: TargetFacts) -> str:
+    pth: dict[str, list] = {}
+    for root in facts.site_roots:
+        rows: list = []
+        try:
+            # 符号链接的 `.pth` 也计入（`site` 会跟随它）：下面记链接本身 + 目标内容摘要
+            names = sorted(
+                e.name
+                for e in os.scandir(root)
+                if e.name.lower().endswith(".pth") and (e.is_file() or e.is_symlink())
+            )
+        except OSError:
+            pth[root] = ["unreadable"]
+            continue
+        for name in names[:_PTH_MAX_PER_ROOT]:
+            full = os.path.join(root, name)
+            try:
+                link = os.readlink(full) if os.path.islink(full) else ""
+                if not stat.S_ISREG(
+                    os.stat(full).st_mode
+                ):  # 指向设备 / 管道 / 目录的链接：不打开，记成不可读
+                    rows.append([name, link, "unreadable"])
+                    continue
+                with open(full, "rb") as fh:
+                    body = fh.read(_PTH_READ_LIMIT + 1)
+                rows.append(
+                    [name, link, len(body), hashlib.sha256(body[:_PTH_READ_LIMIT]).hexdigest()]
+                )
+            except OSError:
+                rows.append([name, "unreadable"])
+        if len(names) > _PTH_MAX_PER_ROOT:
+            rows.append(["…", len(names)])
+        pth[root] = rows
+    text = json.dumps(
+        {
+            "site": list(facts.site_roots),
+            "extra": list(facts.extra_roots),
+            "opaque": facts.opaque_roots,
+            "order": list(facts.path_order),
+            "pth": pth,
+        },
+        sort_keys=True,
+    )
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
 
 _facts_lock = threading.Lock()
@@ -377,7 +482,11 @@ def target_facts(python: str, *, use_cache: bool = True) -> TargetFacts | None:
         opaque_roots=int(data.get("opaque_roots") or 0)
         if isinstance(data.get("opaque_roots"), int)
         else 0,
+        pth_roots=tuple(str(x) for x in data.get("pth_roots") or () if isinstance(x, str)),
+        path_order=tuple(str(x) for x in data.get("path_order") or () if isinstance(x, str)),
+        skipped_roots=tuple(str(x) for x in data.get("skipped_roots") or () if isinstance(x, str)),
     )
+    facts = dataclasses.replace(facts, layers=_measure_layers(facts))
     with _facts_lock:
         _facts_cache[key] = facts
         _index_cache.pop(key, None)  # 重新量了事实 = 环境可能变了：旧的元数据索引一起作废
@@ -425,7 +534,14 @@ def static_index(facts: TargetFacts | None) -> distmeta.Index | None:
     # 读目标解释器报告的**全部**层（含基础解释器 / user site）；没量到层（替身事实）才退回只读前缀的旧口径。任何一层没读成
     # → `Index.complete=False`，下游据此不把「没查到」当「没装」（见 `plan` 的 `index_incomplete`）。
     index = distmeta.index_environment(
-        facts.prefix, site_paths=facts.site_roots or None, extra_paths=facts.extra_roots
+        facts.prefix,
+        site_paths=facts.site_roots or None,
+        extra_paths=facts.extra_roots,
+        # 目标解释器的精确后缀集（#925）；没量到保持宽松口径
+        ext_suffixes=facts.ext_suffixes or None,
+        pth_paths=facts.pth_roots or None,
+        layer_order=facts.path_order or None,
+        skipped_paths=facts.skipped_roots,
     )
     if not index.checked:
         return None
@@ -665,6 +781,26 @@ def _reason_of(status: str) -> str:
     }.get(status, ORIGIN_UNVERIFIED)
 
 
+def _shadowed_names(c: importscan.ImportClass, present: list[str]) -> bool:
+    """名字级「装着」的那些发行包，在静态索引里是不是**全被排在前面的别的提供者遮蔽了**（#929）：`PYTHONPATH` / `.pth` 目录里自己的
+    同名模块、前面一层的 editable fork 排在 site-packages 前面，真实 import 到的是它们，不是名字级装着的那个。没有索引（候选里
+    没有已装行）或还有未被遮蔽的行时回 False。"""
+    if not present:
+        return False
+    rows = [x for x in c.distribution_candidates if x.get("source") == distmeta.SRC_INSTALLED]
+    live = {
+        depresolve.normalize_distribution(str(x.get("distribution") or ""))
+        for x in rows
+        if not x.get("shadowed")
+    }
+    shadowed = {
+        depresolve.normalize_distribution(str(x.get("distribution") or ""))
+        for x in rows
+        if x.get("shadowed")
+    }
+    return all(d in shadowed and d not in live for d in present) and _installed_claims(c)
+
+
 def _verdict(
     c: importscan.ImportClass,
     installed: dict,
@@ -686,14 +822,22 @@ def _verdict(
     if present and state == "import_error":
         # 名字级「装着」不等于满足：装了但导入失败（装坏的 PyYAML）——覆盖度缓存的判决先于名字级，装它救不了（Codex #920 P2）
         return _Verdict(_OPEN, reason=ORIGIN_IMPORT_FAILED)
-    if c.distribution and c.distribution in present:
-        return _Verdict(_PRESENT, c.distribution)
+    if present and "layer_order_unresolved" in c.compatibility:
+        # 前面有一层的提供者形状推不出（可能是常规包、也可能不是）：名字级装着的那个是不是胜出者判不出来——不冒充满足（#929）
+        return _Verdict(_OPEN, reason=ORIGIN_AMBIGUOUS)
+    if _shadowed_names(c, present):
+        # 名字级装着的发行包被 sys.path 上排在前面的别的提供者遮蔽（#929）：import 到的是前面那个，不是它——不算满足，也不装
+        return _Verdict(_OPEN, reason=_reason_of(c.distribution_status))
     if len(present) > 1:
-        # 项目点名了其中一个（requirements 里写的就是 `opencv-python-headless`）：用户已经替我们选了
+        # 多个提供者同时装着：歧义 / 声明判定**先于**映射提供者的早返回（#924：`opencv-python` 与 `-headless` 都装着、项目没点名时
+        # 不能因为映射表里的 `opencv-python` 在就报满足）。项目点名了其中一个（requirements 里写的就是 `opencv-python-headless`）：
+        # 用户已经替我们选了
         chosen = [d for d in present if d in declared]
         if len(chosen) == 1:
             return _Verdict(_PRESENT, chosen[0])
         return _Verdict(_OPEN, reason=ORIGIN_AMBIGUOUS)
+    if c.distribution and c.distribution in present:
+        return _Verdict(_PRESENT, c.distribution)
     if present:
         return _Verdict(_PRESENT, present[0])
     if _installed_claims(c):
@@ -820,8 +964,12 @@ def plan(
     states = _coverage_states(coverage, scan, plain_unknown)
     declared_names = frozenset(by_name)
     # 静态索引读不全（有一层没读成）：名字级查不到的不当「缺」（见 `_verdict`）。没给索引（None）= 没量，维持旧口径
+    # 同样当「看不全」：site 层里有**未建模**的可执行 `.pth` 钩子 / 没跟进的路径行（`uncovered_paths > 0`，已知良性钩子已在
+    # distmeta 建模、不计入）——钩子可能装了自定义 finder，名字层里没有的 import 不等于没装（#925）
     index_incomplete = (
-        isinstance(dists, distmeta.Index) and dists.checked and not dists.names_complete
+        isinstance(dists, distmeta.Index)
+        and dists.checked
+        and (not dists.names_complete or dists.uncovered_paths > 0)
     )
     verdicts = {
         c.module: _verdict(
@@ -1073,6 +1221,10 @@ def fresh_venv_facts(
         site_roots=(),
         extra_roots=(),
         opaque_roots=0,
+        pth_roots=(),
+        path_order=(),
+        skipped_roots=(),
+        layers="",
     )
 
 
