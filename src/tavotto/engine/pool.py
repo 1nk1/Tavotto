@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import re
 import shutil
@@ -20,6 +21,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from . import (
     patchspec,
     projectenv,
     runtime,
+    scanbudget,
     workdir,
 )
 
@@ -1046,7 +1049,6 @@ def _prioritized_candidates() -> list[tuple[str, str]]:
     第 5 条留着不是摆设：用户的论文脚本可能要 import 内置 runtime 里没有的包
     （rdkit、astropy、自家实验室的库），那时他自己那套环境才是对的。
     """
-    import os
     import sys
 
     cands: list[tuple[str | None, str]] = [
@@ -1072,34 +1074,127 @@ def _prioritized_candidates() -> list[tuple[str, str]]:
         # 与 config 那条同路径时靠 `select_worker_python` 的去重，标签不变。
         cands.append((_bootstrap_venv_python(), SOURCE_MANAGED))
 
+    system = _system_python_paths()
+    cands += [(p, SOURCE_SYSTEM) for p in system]
+    return [(p, src) for p, src in cands if p]
+
+
+def _system_python_paths(
+    *,
+    which: Callable[[str], str | None] | None = None,
+    glob: Callable[[str], list[str]] | None = None,
+    nt: bool | None = None,
+) -> list[str | None]:
+    """系统 Python / Conda 的常见落点（第 5 档）——**执行路径与只读扫描共用这一份清单**。
+
+    `which` / `glob` 可注入：自动扫描（`system_python_candidates(budget=)`）换成跳过 UNC、遵守预算与取消的版本，
+    清单本身不分叉，两边看到的是同一批身份。"""
+    import os
+
+    which = which or shutil.which
+    glob = glob or _glob
+    nt = os.name == "nt" if nt is None else nt
     # 一律用字符串拼路径：pathlib.Path 会按 os.name 分派 Posix/Windows 实现，
     # 在非目标平台上构造另一半会直接抛 UnsupportedOperation。
     home = os.path.expanduser("~")
     system: list[str | None] = []
-    if os.name == "nt":
-        system += [shutil.which("python"), shutil.which("python3")]
+    if nt:
+        system += [which("python"), which("python3")]
         # python.org 与 conda 的常见落点。内置 runtime 缺失/损坏时全靠这里
         # 把用户已有的环境翻出来，值得多找几个地方。
         local = os.environ.get("LOCALAPPDATA")
         roots = ([local + r"\Programs\Python"] if local else []) + ["C:\\"]
         for root in roots:
-            system += _glob(root + r"\Python*\python.exe")
+            system += glob(root + r"\Python*\python.exe")
         system += [f"{home}\\{n}\\python.exe" for n in ("anaconda3", "miniconda3")]
     else:
         system += [
             "/opt/homebrew/opt/python@3.13/libexec/bin/python3",  # macOS Homebrew
             "/opt/homebrew/bin/python3",
-            shutil.which("python3"),
+            which("python3"),
             "/usr/bin/python3",
         ]
         # python.org 的 framework 安装（新版优先）与 conda
-        system += _glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3")
+        system += glob("/Library/Frameworks/Python.framework/Versions/*/bin/python3")
         system += [f"{home}/{n}/bin/python3" for n in ("anaconda3", "miniconda3", "mambaforge")]
-    cands += [(p, SOURCE_SYSTEM) for p in system]
-    return [(p, src) for p, src in cands if p]
+    return system
 
 
-def system_python_candidates() -> list[tuple[str, str]]:
+def _is_network_path(path: str) -> bool:
+    """UNC / 网络共享路径（`\\\\host\\share`、`//host/share`）。碰它（`which` / `is_file` / `glob`）会联系共享、
+    断线时卡住，Windows 上还会发 NTLM——自动扫描一律不碰（与 `scanbudget` 对项目内 UNC 的立场同一条）。"""
+    return path.startswith(("\\\\", "//"))
+
+
+def _scan_glob_nt(pattern: str, budget, walker) -> list[str]:
+    """Windows 语义的只读扫描版 glob：**不**让 `glob` 去跟随通配段匹配到的目录（`C:\\Python312` 本身可能是指向
+    断线共享的 junction，glob 为了找 `python.exe` 会穿过它）。字面父目录逐级过 `walker`；父目录用
+    `os.scandir` 枚举，通配段按 fnmatch 比名字，命中的目录先过 `walker`（`lstat` 不跟随，重定向 / UNC 拒）
+    再拼尾部。只支持「字面前缀 + 一个通配目录段 + 字面尾部」（`_system_python_paths` 的形状）；别的形状回空。"""
+    import fnmatch
+
+    drive, rest = ntpath.splitdrive(pattern)
+    lead = rest[:1] if rest[:1] in ("\\", "/") else ""
+    segs = [x for x in re.split(r"[\\/]+", rest) if x]
+    wild = [i for i, x in enumerate(segs) if re.search(r"[*?\[]", x)]
+    if len(wild) != 1 or wild[0] == len(segs) - 1 or not (drive + lead or wild[0]):
+        return []
+    i = wild[0]
+    parent = os.path.join(drive + lead, *segs[:i])
+    tail = segs[i + 1 :]
+    if walker.redirected(parent) is not None:
+        return []
+    out: list[str] = []
+    want = os.path.normcase(segs[i])
+    # 边枚举边记账：每个条目（不论是否命中）都先扣预算、超预算或取消即停——大盘根（`C:\`）不能先整目录读完
+    # 再记账（Codex #957）。只缓冲命中的名字，排序也只排它们。
+    names: list[str] = []
+    try:
+        with os.scandir(parent) as it:
+            for e in it:
+                if not budget.charge_entry():
+                    break
+                if fnmatch.fnmatchcase(os.path.normcase(e.name), want):
+                    names.append(e.name)
+    except (OSError, ValueError):
+        return []
+    for name in sorted(names, reverse=True):
+        child = os.path.join(parent, name)
+        if walker.redirected(child) is not None:
+            continue
+        out.append(os.path.join(child, *tail))
+    return out
+
+
+def _scan_which(budget, nt: bool, walker) -> Callable[[str], str | None]:
+    """只读扫描版 `shutil.which`：逐项 PATH 过预算，跳过 UNC / 空项，取消或超预算就停。
+    Windows 语义下 PATH 目录的**每一级祖先**与候选本身若是重定向条目也跳过（`walker` 逐级不跟随 lstat，
+    不 `isfile`；目录的结果按路径缓存，同一目录下的多个扩展名不重复）。"""
+    import os
+
+    def which(name: str) -> str | None:
+        exts = [""]
+        if nt:
+            exts = [e for e in os.environ.get("PATHEXT", ".EXE").split(os.pathsep) if e] or [".EXE"]
+        for d in os.environ.get("PATH", "").split(os.pathsep):
+            if not d or _is_network_path(d):
+                continue
+            if walker.redirected(d) is not None:
+                continue
+            for ext in exts:
+                if not budget.charge_entry():
+                    return None
+                cand = os.path.join(d, name + ext)
+                if walker.redirected(cand) is not None:
+                    continue
+                if os.path.isfile(cand) and (nt or os.access(cand, os.X_OK)):
+                    return cand
+        return None
+
+    return which
+
+
+def system_python_candidates(*, budget=None, nt: bool | None = None) -> list[tuple[str, str]]:
     """这台机器上已有的解释器——老链条第四、五级（自身 / 系统 Python / Conda）。
 
     给项目环境接手的第二层用（ADR 0044）：内置 runtime 缺包、项目里又没有
@@ -1107,17 +1202,54 @@ def system_python_candidates() -> list[tuple[str, str]]:
     `_prioritized_candidates()` 已经枚举的那些位置，只是丢掉前三级——环境变量
     与设置里指定的那个若存在就是当前渲染环境（正是报缺包的那个），内置
     runtime 永远不缺 matplotlib 却正因缺别的包才走到这里。
+
+    `budget`（`scanbudget.Budget`，导入即扫描传）：只读扫描版——同一份清单，但 PATH 逐项过预算、UNC / 网络路径
+    一律不碰（不 `which`、不 `is_file`、不 `glob`），到期 / 取消停在已枚举的部分（账本记 time_budget /
+    cancelled → 报告 partial）。不传 = 执行路径的老行为。
     """
+    import os
+    import stat
+    import sys
+
+    if budget is None:
+        pairs = _prioritized_candidates()
+        wanted = [(c, s) for c, s in pairs if s in (SOURCE_CURRENT, SOURCE_SYSTEM)]
+        guard = None
+    else:
+        nt = os.name == "nt" if nt is None else nt
+
+        walker = scanbudget.PathWalker(nt=nt, budget=budget)
+
+        def scan_glob(pattern: str) -> list[str]:
+            if _is_network_path(pattern) or not budget.charge_entry():
+                return []
+            if not nt:
+                return _glob(pattern)  # POSIX 语义下链接是常态（walker 空操作），保持原 glob
+            return _scan_glob_nt(pattern, budget, walker)
+
+        paths = _system_python_paths(which=_scan_which(budget, nt, walker), glob=scan_glob, nt=nt)
+        wanted = [] if is_frozen() else [(sys.executable, SOURCE_CURRENT)]
+        wanted += [(p, SOURCE_SYSTEM) for p in paths if p]
+        guard = budget
     out: list[tuple[str, str]] = []
-    for cand, source in _prioritized_candidates():
-        if source not in (SOURCE_CURRENT, SOURCE_SYSTEM):
+    for cand, source in wanted:
+        if guard is not None and (_is_network_path(cand) or not guard.charge_entry()):
             continue
         try:
-            if not Path(cand).is_file():
+            if guard is not None and nt:
+                # 构造出的「本地样子」候选可能在任何一级（祖先或叶子）是指向断线共享的 symlink / junction：
+                # 从盘符根起逐级不跟随地查（祖先之下零 lstat），再用叶子的 lstat 判常规文件，不调用跟随型谓词。
+                if walker.redirected(cand) is not None:
+                    continue
+                if not stat.S_ISREG(os.lstat(cand).st_mode):
+                    continue
+            elif not Path(cand).is_file():
                 continue
-        except OSError:
+        except (OSError, ValueError):
             continue
         out.append((cand, source))
+    if guard is not None:
+        guard.stop_reason()  # 到期 / 取消要进账本（不足 64 项时 charge_entry 不查时钟）
     return out
 
 
@@ -3633,8 +3765,6 @@ def try_project_env(figures_dir: str, script_name: str, module: str) -> dict:
         return outcome
     python = outcome["python"]
     if not projectenv.silent_adoption_enabled():
-        from . import userenvs
-
         # 确认模式（ADR 0114）：项目 venv 体检通过、缺的包也在里面——这是**建议**，不是决定。体检是这次
         # 运行缺包触发的有界检查（上面的 `mark_attempted` 一次一对），采用是用户在修复卡片上点的那一下
         # （`PATCH /api/engine/environment`），之后才进项目设置
@@ -3648,7 +3778,7 @@ def try_project_env(figures_dir: str, script_name: str, module: str) -> dict:
                 # 是为哪个脚本发现的：脚本在子目录时 venv 也许在子目录里，采用端点要照同一个脚本重新枚举候选，
                 # 不带它就从项目根找、报 `environment_candidate_gone`（Codex 评 #911 补审 P1）
                 "script": script_name,
-                "id": userenvs.env_id(python),
+                "id": projectenv.env_id(python),
                 "generation": projectenv.environment_generation(python),
                 "health": outcome.get("health"),
             },
