@@ -172,6 +172,15 @@
   legendmodel 的每一处 `set_alpha(` / `set_fill(`，新增一处会红）；行为看护在 `tests/support/rc_hatch_text_legend_figure.py`
   那张图上的 `test_override_sequences.py::test_rc_context_hatch_text_legend_*`、写回 `test_hatch_rc_context_writeback.py`
   与 `test_hatch_mode_restored.py`。
+- **`hatchcolor` 可编辑：getter 回「模式」不回值，setter 复用钉住（#874 第二步）**：只在有 `set_hatchcolor` 的 artist 上生效（≤3.10 getter 回 None、
+  setter 空操作）。getter 的两条分支——显式模式（`_original_hatchcolor` 非 None）回它的副本（RGBA / 颜色名 / `'edge'`，setter
+  吃得回去）；「脚本没设」模式回 `_HatchUnset(base)` 哨兵（`base` = `_hatch_base`，创建时已解析的花纹色，与 `_with_hatch_pinned`
+  共用一份判据）。**不能回解析后的当前值**：按值写回会把模式永久换成显式，native 屏障释放后用户的 Python 改 rc 再 `set_alpha`
+  就不再跟随（与 `_PatchEdge` 同一个坑，Codex #950 r4245786615）；撤销到哨兵时 `_restore_hatch_unset` 用 `base` 配**当前** alpha
+  重新合成，再把 `_original_hatchcolor` 还原成 None。setter 设显式值是直接 `set_hatchcolor(颜色)`（不读 rc，不需要钉住；包进 `_with_hatch_pinned` 做过变异，是等价变异，故不留死分支）。与 alpha / fill 的应用顺序无关
+  （先 alpha：钉住 → 收尾还原 None → 再显式设；先 hatchcolor：模式已显式，alpha 的钉住见显式模式原样放行，花纹色以显式色配当前 alpha）。
+  哨兵只活在 `originals` 里，不过 JSON。`bar_series` 照 `hatch` 加进 `for _bprop` 一串。**柱系列代采原样（#968，已修）**：系列代采每根柱的「原样」时，若该柱在单柱层已有 `originals`（单柱先改过），取那一份脚本原样而不是此刻的热态——否则全撤时系列的还原把单柱的编辑写回。`ALIAS_GROUPS[("bar_series", *)]` 带 `_member_aligned` 标记（成员序与 getter 列表序一致），`apply()` 采原样那段据此替换，对 `_bprop` 整串通用（hatch / hatch_linewidth / hatchcolor / 颜色 / 线宽…）。看护 `test_single_and_series_undo_orders_match_replay_and_return_to_the_script`。
+  看护 `tests/test_hatchcolor_editing.py`、`tests/test_hatch_mode_restored.py`、`tests/test_override_sequences.py`（采样器 `_ENABLERS["hatchcolor"]`）。
 - **`value_original`：override 之前脚本的值，与 `value` 同一口径（ADR 0081 §十三，2026-09-25）**。
   前端拿它判「脚本重跑后改没改这一项」：样式写的 override 在脚本改过的那一项上让位（用户裁决：
   重跑后脚本赢）。`originals` 存的是 getter 的原始对象（元组 / Colormap / 哨兵），前端没法拿它与
