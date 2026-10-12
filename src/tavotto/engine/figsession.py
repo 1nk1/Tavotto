@@ -47,6 +47,7 @@ import json
 import math
 import os
 import platform
+import shutil
 import sys
 import threading
 import time
@@ -449,6 +450,20 @@ def export_format_kwargs(fmt: str) -> dict:
     return {}
 
 
+class PreviewInvalidated(RuntimeError):
+    """发布中途失败且还原上一版也失败：该 stem 的预览已作废（读者看到「无预览」，不是成功）。"""
+
+
+class PreviewPoisoned(PreviewInvalidated):
+    """还原、删除 / 改名、失效标记**三道都落空**：磁盘上的错配对读方无法在磁盘层面隐藏。
+
+    致命：`protocol_code` 让 `wireproto.respond` 回 `preview_poisoned`（非 retryable），
+    app 侧据此判死这条会话并把 `out_dir` 记进读方进程的作废表（`figcapture.poison_preview_dir`）。
+    """
+
+    protocol_code = figcapture.PREVIEW_POISONED_CODE
+
+
 class LiveFigureSession:
     """捕获到的一组 Figure + 它们的可编辑状态。
 
@@ -705,12 +720,26 @@ class LiveFigureSession:
         # 裁成什么样」——原件是在它们之前存下的
         for stem, fig in fresh:
             self.establish_frame(stem, fig)
-        for stem, fig in fresh:
-            overrides_mod.ensure_figure_fallback(fig)
-            state = overrides_mod.FigState(fig)
-            manifest_mod.instrument(state)
-            self.states[stem] = state
-            self.render(stem)
+        try:
+            for stem, fig in fresh:
+                overrides_mod.ensure_figure_fallback(fig)
+                state = overrides_mod.FigState(fig)
+                manifest_mod.instrument(state)
+                self.states[stem] = state
+                self.render(stem)
+        except BaseException:
+            # 这一批新图里任何一张首次发布失败（例如 Windows 上账本瞬时被锁）：**整批**撤掉——pool 会复用这个 worker
+            # 重跑脚本，重跑画出的是新 Figure；留着同批里已发布的旧图，`add_figure` 会拒收它们的新图，再把失败那次执行
+            # 的旧图当成功结果；没出过预览的那张还会让 `stems_summary` 缺缓存 manifest、永久 KeyError（Codex #958）。
+            # 已在编辑的图不在 `fresh` 里，不受影响；同批已发布的磁盘产物会在重试时被新发布覆盖。
+            for stem, _fig in fresh:
+                self.states.pop(stem, None)
+                self._manifest_cache.pop(stem, None)
+                self.capture.pop(stem, None)
+                self.capture_source.pop(stem, None)
+                self.savefig_calls.pop(stem, None)
+                self.savefig_extras.pop(stem, None)
+            raise
 
     def stems_summary(self, dropped_figures: int = 0) -> dict:
         """build 响应的 stems 表。
@@ -826,14 +855,18 @@ class LiveFigureSession:
         # 抓到它的是 `test_v1_render_reports_the_preview_verdict` 在
         # `backend-platforms (windows-latest)` 上——PR 上那一格是 skipping，
         # 所以本机与 PR 全绿都是真的，它只在 merge_group 里发作。
-        svg_path = self.out_dir / f"{stem}.svg"
+        # **先写临时文件，成功了才发布**（P01b，EX12）：直接开正式 `<stem>.svg` 写，
+        # 画到一半抛了就留下半份 XML——既被当成「这张图完成了」，也覆盖了上一版
+        # 有效预览。临时名不以 `.svg` 结尾，任何按后缀找预览的人都看不到它。
+        svg_part = self.out_dir / f".{stem}.svg.part"
+        man_part = self.out_dir / f".{stem}.json.part"
         dpi = preview_dpi or self.preview_dpi
 
         def _save(_plan) -> int:
-            with self.real_output(), open(svg_path, "w", encoding="utf-8", newline="") as fh:
+            with self.real_output(), open(svg_part, "w", encoding="utf-8", newline="") as fh:
                 state.fig.savefig(fh, format="svg", dpi=dpi, **pathgeom.output_kwargs(state.fig))
             try:
-                return svg_path.stat().st_size
+                return svg_part.stat().st_size
             except OSError:
                 # 刚写完它，这里读不到 size 说明磁盘 / 权限出了事。按 0 记会把
                 # 这一版说成「很小的矢量图」，接着 read_text 也一定会抛——不如
@@ -842,11 +875,15 @@ class LiveFigureSession:
 
         # `preview_plan_ms` / `canvas_draw_ms` 由 `save_preview_svg` 自己填——
         # 只有它知道那两段各自从哪到哪（升档时 savefig 跑两遍）。
-        with manifest_mod.capture_preview_manifest(state, stem) as measured:
-            plan, svg_bytes = preview_hybrid.save_preview_svg(state, _save, timings)
-            # Rasterization has been restored before reading semantic fields.
-            t2 = time.perf_counter()
-            man = measured()
+        try:
+            with manifest_mod.capture_preview_manifest(state, stem) as measured:
+                plan, svg_bytes = preview_hybrid.save_preview_svg(state, _save, timings)
+                # Rasterization has been restored before reading semantic fields.
+                t2 = time.perf_counter()
+                man = measured()
+        except BaseException:
+            self._discard_parts(svg_part, man_part)
+            raise
         if timings is not None:
             timings["manifest_ms"] = round((t1 - t0 + time.perf_counter() - t2) * 1000.0, 3)
         if preview is not None:
@@ -866,11 +903,147 @@ class LiveFigureSession:
                     estimated_nodes=plan.estimated_nodes,
                 )
             )
-        (self.out_dir / f"{stem}.json").write_text(
-            json.dumps(man, ensure_ascii=False, default=_json_default), encoding="utf-8"
-        )
+        try:
+            man_part.write_text(
+                json.dumps(man, ensure_ascii=False, default=_json_default), encoding="utf-8"
+            )
+            self._publish_preview(
+                stem, svg_part, man_part, svg_bytes_on_disk=svg_part.stat().st_size
+            )
+        except BaseException:
+            self._discard_parts(svg_part, man_part)
+            raise
         self._manifest_cache[stem] = man
         return man
+
+    def _publish_preview(self, stem, svg_part, man_part, *, svg_bytes_on_disk: int) -> int:
+        """把已写完的临时 SVG / manifest 放到正式名下，**最后**记账。
+
+        这是「同代发布」的唯一出口：SVG、manifest、完成记录对着同一个发布序号。
+        任何一步失败，上一版（若有）原封不动——`os.replace` 是单文件原子的，所以
+        顺序是先 SVG 后 manifest 再记账；账本是最后一步，它写出去之前这一版对
+        「完成了几张图」就不存在。
+        """
+        finals = [self.out_dir / f"{stem}.svg", self.out_dir / f"{stem}.json"]
+        parts = [svg_part, man_part]
+        backups: list[Path | None] = []
+        replaced: list[int] = []
+        was_invalid = figcapture.preview_invalid(self.out_dir, stem)
+        try:
+            with self.real_output():
+                # 先给上一版留一份不会被 replace 动到的备份（硬链接：目标名在整个过程中
+                # 始终指向完整文件，读者不会看到「缺一半」；不支持硬链接就拷一份）。
+                for final in finals:
+                    backups.append(self._backup_of(final))
+                for i, (part, final) in enumerate(zip(parts, finals)):
+                    os.replace(part, final)
+                    replaced.append(i)
+                seq = figcapture.record_preview_published(self.out_dir, stem, svg_bytes_on_disk)
+                # 账本记成之后才撤失效标记：之前任何一步失败，旧标记原样还在，读方仍是「无预览」（Codex #958）
+                figcapture.clear_preview_invalid(self.out_dir, stem)
+        except BaseException as exc:
+            if not self._restore_previous(finals, backups, replaced):
+                # 还原也失败：磁盘上可能是新 SVG 配旧 manifest。备份**不删**，这一对整体作废。
+                guarded = self._invalidate_preview(stem, finals)
+                cls = PreviewInvalidated if guarded else PreviewPoisoned
+                raise cls(
+                    f"preview of {stem!r} is invalidated: publishing failed ({exc}) "
+                    "and the previous generation could not be restored"
+                    + (
+                        ""
+                        if guarded
+                        else "; neither removal nor an invalid marker could be written"
+                    )
+                ) from exc
+            if (
+                was_invalid
+                and not figcapture.preview_invalid(self.out_dir, stem)
+                and not figcapture.mark_preview_invalid(self.out_dir, stem)
+            ):
+                # 还原回来的是此前就作废的那一代（可能错配），标记又写不回去：读方失去保证，升级为致命
+                raise PreviewPoisoned(
+                    f"preview of {stem!r} was invalid, publishing failed ({exc}) "
+                    "and the invalid marker could not be re-established"
+                ) from exc
+            raise
+        # 成功：本 stem 两个文件的备份（含失效那次留下的）都由这里清掉
+        self._discard_parts(*[f.with_name(f".{f.name}.prev.part") for f in finals])
+        return seq
+
+    def _invalidate_preview(self, stem, finals) -> bool:
+        """把 `stem` 当前（可能错配的）`.svg` / `.json` 撤掉，读者只会看到「无预览」。
+
+        先尝试删，删不掉改名到隔离名；两者都失败时靠失效标记兜底——所有消费者经
+        `figcapture.usable_preview_path` 取路径，标记存在就读不到。账本同时摘掉该 stem。
+        返回读方是否**有保证**读不到错配：两个文件都撤掉了，或失效标记写成了。都不成立
+        返回 False，调用方升级成致命的 `PreviewPoisoned`（还原 → 删除 / 改名 → 标记 → 会话作废）。
+        `.<name>.prev.part` 备份留着：下一次成功发布同一 stem 会重建并清掉它们
+        （发布失败时 `_backup_of` 也会覆盖它们），所以清理的责任人是下一次发布。
+        """
+        removed = True
+        for final in finals:
+            try:
+                final.unlink()
+            except FileNotFoundError:
+                continue
+            except OSError:
+                try:
+                    os.replace(final, final.with_name(f".{final.name}.invalid.part"))
+                except OSError:
+                    removed = False
+        marked = figcapture.mark_preview_invalid(self.out_dir, stem)
+        return removed or marked
+
+    @staticmethod
+    def _backup_of(final: Path) -> Path | None:
+        """`final` 现存就返回它的备份路径（`.<name>.prev.part`），不存在返回 None。"""
+        if not final.exists():
+            return None
+        backup = final.with_name(f".{final.name}.prev.part")
+        try:
+            backup.unlink()
+        except OSError:
+            pass
+        try:
+            os.link(final, backup)
+        except OSError:
+            shutil.copy2(final, backup)
+        return backup
+
+    @staticmethod
+    def _restore_previous(finals, backups, replaced) -> bool:
+        """发布中途失败：把已经换上新版的文件逐个还原成上一版。
+
+        SVG 已换上而 manifest 被（Windows 上的）锁挡住时，不还原就是新像素配旧命中
+        几何——与 `render` 「任何失败都保住上一版预览」的承诺相反。没有上一版的（首次
+        发布）就删掉新文件。还原本身失败**如实记录**（stderr）并返回 False，备份留着，
+        由调用方作废整个 stem（见 `_invalidate_preview`）；全部还原成功返回 True。
+        """
+        ok = True
+        for i in replaced:
+            final, backup = finals[i], backups[i] if i < len(backups) else None
+            try:
+                if backup is not None:
+                    os.replace(backup, final)
+                else:
+                    final.unlink()
+            except OSError as exc:
+                ok = False
+                print(
+                    f"tavotto: could not restore previous preview file {final.name}: {exc}",
+                    file=sys.stderr,
+                )
+        if ok:
+            LiveFigureSession._discard_parts(*[b for b in backups if b is not None and b.exists()])
+        return ok
+
+    @staticmethod
+    def _discard_parts(*parts: Path) -> None:
+        for part in parts:
+            try:
+                part.unlink()
+            except OSError:
+                pass
 
     def manifest(self, stem: str) -> dict:
         return self._manifest_cache[stem]

@@ -437,9 +437,19 @@ class NativeSession:
         return self.transport
 
     def _request(self, obj: dict, timeout: float) -> dict:
-        return self._require_barrier().request(
-            obj, generation=self.generation, revision=self.rev, timeout=timeout
-        )
+        try:
+            return self._require_barrier().request(
+                obj, generation=self.generation, revision=self.rev, timeout=timeout
+            )
+        except pool.WorkerError as exc:
+            if exc.code == pool.figcapture.PREVIEW_POISONED_CODE:
+                # 预览产物对读方不可信：读方进程回「无预览」，传输标 poison（既有的
+                # 「会话不再可信」机制），之后每条请求都 NATIVE_RELAY_FAILED
+                pool.figcapture.poison_preview_dir(self.out_dir)
+                transport = self.transport
+                if transport is not None and transport.poison is None:
+                    transport.poison = {"code": runcodes.NATIVE_RELAY_FAILED, "detail": str(exc)}
+            raise
 
     @property
     def last_build_descriptors(self) -> list:
@@ -587,7 +597,7 @@ class NativeSession:
             return resp
 
     def svg_path(self, stem: str) -> Path:
-        return self.out_dir / f"{stem}.svg"
+        return Path(pool.figcapture.usable_preview_path(self.out_dir, stem, ".svg"))
 
     def resume(self) -> dict:
         """放开屏障，让用户脚本接着往下跑。

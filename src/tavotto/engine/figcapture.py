@@ -147,6 +147,7 @@ import dataclasses
 import hashlib
 import inspect
 import io
+import itertools
 import json
 import math
 import ntpath
@@ -155,6 +156,7 @@ import pathlib
 import posixpath
 import re
 import sys
+import threading
 import weakref
 
 if __package__:
@@ -193,6 +195,9 @@ __all__ = [
     "PROFILE_NATIVE",
     "ARTIFACT_EXTS",
     "DESCRIPTOR_VERSION",
+    "PREVIEW_LEDGER",
+    "record_preview_published",
+    "published_preview_stems",
     "CapturedFigureDescriptor",
     "build_descriptor",
     "descriptor_from_payload",
@@ -291,6 +296,217 @@ ARTIFACT_EXTS = (".pdf", ".png", ".svg", ".jpg", ".jpeg", ".eps", ".tif", ".tiff
 #: fingerprint 构成……）；它参与 fingerprint，所以升版 = 所有旧 fingerprint
 #: 自然失配 = 「按旧语义捕的图可能已过时」这句 stale hint 如实成立。
 DESCRIPTOR_VERSION = 1
+
+#: 预览发布账本（P01b，EX12）：会话产物目录里的这份文件逐 stem 记着
+#: 「**本次运行**已经完整发布过的预览」。`<stem>.svg` 文件存在**不是**完成事实——
+#: 半写的文件、上一次运行残留的文件都满足「存在」。CLI 的「捕获了几张图」读它，
+#: 不再数 `.svg` 后缀。写入方是 `figsession.render`（发布成功之后才记），读取方是
+#: `runcli`；两边都 import 这一个模块，不各写一份格式。
+#:
+#: **文件名不能撞用户 stem**：stem 来自 `savefig("published.png")` 这类脚本自己起的名字
+#: （可以以点开头），引擎写进同一目录的名字只有 `<stem>.svg` / `<stem>.json` /
+#: `.<stem>.svg.part` / `.<stem>.json.part` / `.<stem>.<ext>.prev.part`。账本取一个
+#: **不带任何扩展名**的点名——它不以 `.svg` / `.json` / `.part` 结尾，上面任何一个
+#: 形态都不可能等于它（`published.json` 就曾被 stem=`published` 的 manifest 撞上）。
+#: 它也不是图：任何按 `.svg` / `.json` 后缀枚举目录的人都看不见它。
+PREVIEW_LEDGER = ".preview-ledger"
+
+
+def _read_preview_ledger(out_dir) -> dict:
+    try:
+        with open(os.path.join(os.fspath(out_dir), PREVIEW_LEDGER), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return {"seq": 0, "stems": {}}
+    stems = data.get("stems") if isinstance(data, dict) else None
+    seq = data.get("seq") if isinstance(data, dict) else None
+    if not isinstance(stems, dict) or not isinstance(seq, int):
+        return {"seq": 0, "stems": {}}
+    return {"seq": seq, "stems": stems}
+
+
+def record_preview_published(out_dir, stem: str, svg_bytes: int) -> int:
+    """把 `stem` 的这一版预览记成「已完整发布」，返回它的发布序号（单调递增）。
+
+    **调用方必须已经把 `<stem>.svg` 与 `<stem>.json` 都原子地放到位**——账本是
+    「完成」的声明，不是「开始写」的声明。账本自己也是临时文件 + `os.replace`：
+    读到它的人要么看到上一版、要么看到这一版，不会看到半份 JSON。
+    序号是同代发布的锚：P08a 逐图隔离时，同一个 stem 的 SVG / manifest / 完成记录
+    以它对齐。
+    """
+    out_dir = os.fspath(out_dir)
+    ledger = _read_preview_ledger(out_dir)
+    ledger["seq"] += 1
+    ledger["stems"][stem] = {"seq": ledger["seq"], "svg_bytes": int(svg_bytes)}
+    path = os.path.join(out_dir, PREVIEW_LEDGER)
+    tmp = path + ".part"
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(ledger, fh)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+    return ledger["seq"]
+
+
+def _invalid_marker(out_dir, stem: str) -> str:
+    # 无扩展名（不以 .svg / .json / .part 结尾），与账本同理不会撞用户 stem 的任何产物名
+    return os.path.join(os.fspath(out_dir), f".{stem}.preview-invalid")
+
+
+def preview_invalid(out_dir, stem: str) -> bool:
+    """`stem` 的预览是否被标成失效（发布中途失败且还原也失败，磁盘上可能新旧错配）。"""
+    return os.path.exists(_invalid_marker(out_dir, stem))
+
+
+#: 失效标记都写不下去时的最后一道（`PREVIEW_POISONED_CODE`，规则 worker-protocol-and-lifecycle §预览失效四级）：
+#: 写预览的是 worker / native 子进程，读的是 app 进程——磁盘标记写不下去，worker 进程内的任何
+#: 内存标记读方都看不见。所以这一级由 **读方进程**自己记：app 侧收到该错误码（会话同时被判死）
+#: 就把整个 `out_dir` 记进这张表，`usable_preview_path` 对它回「无预览」，直到下一代会话 build 成功。
+PREVIEW_POISONED_CODE = "preview_poisoned"
+#: 目录键 → (作废那一刻账本的发布序号, 作废代号)。解除时要求磁盘上每个还有预览文件的 stem 都在该序号之后重新
+#: 完整发布过；代号每次作废单调递增（与账本无关），审计结束时按它 compare-and-delete（Codex #958）。
+_poisoned_dirs: dict[str, tuple[int, int]] = {}
+_poison_generations = itertools.count(1)
+#: 作废 / 解除的状态转换互斥：读方审计与新的 `preview_poisoned` 可能并发（Codex #958）
+_poison_lock = threading.Lock()
+
+
+def _dir_key(out_dir) -> str:
+    return os.path.normcase(os.path.abspath(os.fspath(out_dir)))
+
+
+def poison_preview_dir(out_dir) -> None:
+    """读方进程：`out_dir` 下所有预览产物都不可信（见 `PREVIEW_POISONED_CODE`）。记下此刻的账本序号。"""
+    key = _dir_key(out_dir)
+    seq = _read_preview_ledger(out_dir)["seq"]
+    with _poison_lock:
+        prev = _poisoned_dirs.get(key)
+        floor = max(seq, prev[0]) if prev else seq
+        _poisoned_dirs[key] = (floor, next(_poison_generations))
+
+
+def clear_preview_poison(out_dir) -> bool:
+    """新一代会话 build 成功后**尝试**解除，返回是否已解除。
+
+    `out_dir` 跨会话代复用、build 不会清掉旧文件：新一代可能一张图都没出、或出的是另一组 stem，被作废时
+    藏起来的错配文件仍在磁盘上（Codex #958）。所以只有当磁盘上**每一个**还有 `<stem>.svg` / `<stem>.json`
+    的 stem 都在作废之后重新完整发布过（账本序号大于作废时的序号、字节数对得上），才解除；否则继续「无预览」。
+    """
+    key = _dir_key(out_dir)
+    with _poison_lock:
+        if key not in _poisoned_dirs:
+            return True
+        floor, generation = _poisoned_dirs[key]
+    try:
+        names = os.listdir(os.fspath(out_dir))
+    except OSError:
+        return False
+    # 不按「点开头」排除：用户 stem 可以以点开头（`savefig(".published.png")`，Codex #958）。引擎自己的
+    # 内部文件（账本 `.preview-ledger`、失效标记 `.<stem>.preview-invalid`、`.part` 临时件）都不以
+    # `.svg` / `.json` 结尾，天然不在这里。
+    on_disk = {n.rsplit(".", 1)[0] for n in names if n.endswith(".svg") or n.endswith(".json")}
+    ledger = _read_preview_ledger(out_dir)["stems"]
+    fresh = set(published_preview_stems(out_dir))
+    stale = False
+    for stem in on_disk:
+        rec = ledger.get(stem)
+        if stem in fresh and isinstance(rec, dict) and int(rec.get("seq") or 0) > floor:
+            continue
+        # 作废之后没被重新完整发布的旧产物：新一代不再出这张图时它永远不会被覆盖——留着会让整个目录永远「无预览」
+        # （Codex #958）。读方进程这里尽力删掉它；删不掉（仍被锁着）就继续作废，宁可无预览也不放出错配。
+        for suffix in (".svg", ".json"):
+            try:
+                os.remove(os.path.join(os.fspath(out_dir), stem + suffix))
+            except FileNotFoundError:
+                pass
+            except OSError:
+                stale = True
+    if stale:
+        return False
+    with _poison_lock:
+        # compare-and-delete：审计期间若又来了一次作废（代号变了——哪怕账本序号没动），这次审计没覆盖它，不得一并抹掉
+        if (_poisoned_dirs.get(key) or (None, None))[1] != generation:
+            return False
+        del _poisoned_dirs[key]
+    return True
+
+
+def preview_dir_poisoned(out_dir) -> bool:
+    """`out_dir` 是否仍在作废中。作废期间每次问都**重试审计**：build 成功那一刻旧产物可能正被锁着删不掉，
+    之后锁放开、worker 却不会再 build——一次性的解除会让目录在这个 worker 的整个生命周期都「无预览」（Codex #958）。"""
+    if _dir_key(out_dir) not in _poisoned_dirs:
+        return False
+    return not clear_preview_poison(out_dir)
+
+
+def usable_preview_path(out_dir, stem: str, suffix: str) -> str:
+    """读 `<stem><suffix>`（`.svg` / `.json`）的**统一入口**：失效的 stem 返回一个必不存在的路径。
+
+    所有按路径读预览产物的消费者（`/api/engine/svg`、manifest 读取、runtimeasset 物化……）
+    经它拿路径，于是「新像素配旧几何」的错配代只会被读成「无预览」。
+    """
+    out_dir = os.fspath(out_dir)
+    if preview_invalid(out_dir, stem) or preview_dir_poisoned(out_dir):
+        return os.path.join(out_dir, f".{stem}{suffix}.invalid-absent")
+    return os.path.join(out_dir, f"{stem}{suffix}")
+
+
+def mark_preview_invalid(out_dir, stem: str) -> bool:
+    """尽力把 `stem` 从账本里摘掉并落失效标记；返回**标记是否写成**（账本那步失败不抛）。
+
+    标记写不下去（缓存卷满 / 权限变了）不是可以吞掉的小事：它可能是读方唯一的防线，
+    调用方必须据返回值升级（见 `LiveFigureSession._invalidate_preview`）。
+    """
+    out_dir = os.fspath(out_dir)
+    marked = True
+    try:
+        with open(_invalid_marker(out_dir, stem), "w", encoding="utf-8") as fh:
+            fh.write("invalid\n")
+    except OSError:
+        marked = False
+    ledger = _read_preview_ledger(out_dir)
+    if stem in ledger["stems"]:
+        del ledger["stems"][stem]
+        path = os.path.join(out_dir, PREVIEW_LEDGER)
+        try:
+            with open(path + ".part", "w", encoding="utf-8") as fh:
+                json.dump(ledger, fh)
+            os.replace(path + ".part", path)
+        except OSError:
+            pass
+    return marked
+
+
+def clear_preview_invalid(out_dir, stem: str) -> None:
+    try:
+        os.remove(_invalid_marker(out_dir, stem))
+    except FileNotFoundError:
+        pass
+
+
+def published_preview_stems(out_dir) -> list:
+    """本次运行**完整发布过**预览的 stem。
+
+    账本说发布了、磁盘上的 `<stem>.svg` 也还在且字节数对得上才算——被截断或被
+    换掉的文件不计。没有账本（引擎一张都没发布成功）就是空表，不退回去数文件。
+    """
+    out_dir = os.fspath(out_dir)
+    done = []
+    for stem, rec in _read_preview_ledger(out_dir)["stems"].items():
+        if preview_invalid(out_dir, stem):
+            continue
+        try:
+            size = os.stat(os.path.join(out_dir, f"{stem}.svg")).st_size
+        except OSError:
+            continue
+        if isinstance(rec, dict) and rec.get("svg_bytes") == size:
+            done.append(stem)
+    return done
 
 
 def size_mm_of(fig) -> tuple[float, float]:

@@ -942,16 +942,25 @@ def main(argv: list | None = None) -> int:
     if plt is not None:
         collect_pyplot(plt)
 
-    if args.report:
-        _write_report(run, args, exit_code)
-
     if run.control is not None and _CAPTURE:
         try:
             run.barrier("script_end")
-        except SystemExit:
-            pass
+        except SystemExit as exc:
+            # 最后一道屏障上的 terminate 与 `show` 屏障同一规则：退出码是确定的
+            # `TERMINATE_EXIT`。上面那次判据在屏障**之前**，赶不上这一次，所以在
+            # 这里补（P01b / EX10）。`shutdown`（client）不是终止，码维持脚本自己的。
+            if run.terminated or exc.code == TERMINATE_EXIT:
+                exit_code = TERMINATE_EXIT
+
+    # 报告在最终码定下之后写：它的 `exit_code` 与进程真实退出码是同一个数
+    if args.report:
+        _write_report(run, args, exit_code)
+
     if run.control is not None:
-        run.control.event("exit", code=exit_code, figures=len(_CAPTURE))
+        # 与 `tavotto run` 的 status-file 同一判据：按预览发布账本数，不按捕获到的 Figure 数——
+        # 预览没发布成的图不算「完成」，桌面卡片与终端不得一个说 2、一个说 1（P01b，EX12，Codex #958）
+        figures = len(figcapture.published_preview_stems(args.out_dir)) if args.out_dir else 0
+        run.control.event("exit", code=exit_code, figures=figures)
         run.control.close()
     return exit_code
 

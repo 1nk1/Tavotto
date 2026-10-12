@@ -2052,6 +2052,12 @@ class EngineWorker:
             # 当时是谁在渲染（内置 / 受管 / 用户的环境）：诊断包的缺依赖现场要说出来
             exc.python_source = getattr(self, "python_source", "") or ""
             return exc
+        if code == figcapture.PREVIEW_POISONED_CODE:
+            # 预览产物对读方不可信（还原 / 删除 / 标记三道都落空）：与超时同纪律——杀掉判死，
+            # 下一次 `get()` 起新会话；新会话 build 成功之前，本进程读 `out_dir` 一律回「无预览」
+            self._dead = True
+            figcapture.poison_preview_dir(self.out_dir)
+            self._kill_now()
         out = WorkerError(msg, tb, code=code)
         out.script_name = self.script_name
         # v1 信封把 `extra` 平铺进 error 对象（`wireproto`：`err.update(exc.extra)`），
@@ -2174,6 +2180,10 @@ class EngineWorker:
             raise
         self.build_failed = False
         self.built = True
+        if (
+            getattr(self, "out_dir", None) is not None
+        ):  # 只造了一半的 worker（测试替身）没有产物目录
+            figcapture.clear_preview_poison(self.out_dir)
         self.last_build_descriptors = list(resp.get("descriptors") or [])
         self.last_build_runtime = _runtime_of(resp)
         self.last_build_artifact_probe = resp.get("artifact_probe")
@@ -2222,7 +2232,7 @@ class EngineWorker:
         return _fold_build_timings(resp, build)
 
     def svg_path(self, stem: str) -> Path:
-        return self.out_dir / f"{stem}.svg"
+        return Path(figcapture.usable_preview_path(self.out_dir, stem, ".svg"))
 
     def render_png(self, stem: str, width_px: int) -> Path:
         if not self.built:
@@ -2383,6 +2393,7 @@ _FATAL_CODES = frozenset(
         BUILD_TIMEOUT_CODE,
         "workerd_dead",
         "workerd_unavailable",
+        figcapture.PREVIEW_POISONED_CODE,
     }
 )
 
@@ -2628,6 +2639,8 @@ class WorkerdWorker:
         if code in _FATAL_CODES:
             # 状态未知的会话绝不复用（与 Python 池的超时/错乱路径同纪律）
             self._dead = True
+        if code == figcapture.PREVIEW_POISONED_CODE:
+            figcapture.poison_preview_dir(self.out_dir)  # 读方进程：新会话 build 成功前回「无预览」
         tb = exc.traceback_text or ""
         if not tb and code in _FATAL_CODES:
             tb = self._log_tail(FATAL_TAIL_LINES)  # 进程级失败时 worker 的 traceback 全在日志里
@@ -2753,6 +2766,10 @@ class WorkerdWorker:
             raise
         self.build_failed = False
         self.built = True
+        if (
+            getattr(self, "out_dir", None) is not None
+        ):  # 只造了一半的 worker（测试替身）没有产物目录
+            figcapture.clear_preview_poison(self.out_dir)
         self.last_build_descriptors = list(resp.get("descriptors") or [])
         self.last_build_runtime = _runtime_of(resp)
         self.last_build_artifact_probe = resp.get("artifact_probe")
@@ -2795,7 +2812,7 @@ class WorkerdWorker:
         return _fold_build_timings(resp, build)
 
     def svg_path(self, stem: str) -> Path:
-        return self.out_dir / f"{stem}.svg"
+        return Path(figcapture.usable_preview_path(self.out_dir, stem, ".svg"))
 
     def render_png(self, stem: str, width_px: int) -> Path:
         if not self.built:
