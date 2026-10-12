@@ -1041,6 +1041,34 @@ def savefig_stem(fname) -> str:
     return os.path.splitext(os.path.basename(os.fsdecode(fname)))[0]
 
 
+def savefig_effective_names(fname, kwargs: dict) -> list:
+    """`savefig(fname, **kwargs)` 真正会写（被拦截时就是没写）的文件名，供 `BlockedFileOps` 记账（P01a）。
+
+    `print_figure` 的规则：显式 `format=` 时文件名**原样**（不补后缀）；否则 `str` / `PathLike`
+    取文件名后缀作格式，**没有后缀**就补默认格式（`stage` → `stage.png`，`stage.` → `stage.png`）。
+    默认格式由 canvas 决定、用户可重载（`savefig_call` 因此不把它当已确定），这里不调用任何用户方法：
+    显式 `format=` / 有后缀 / `bytes` 只记字面名；否则字面名**不会**被写出，只记补 `rcParams["savefig.format"]` 与 `png` 两个候选后缀名——多记一个候选只会让
+    「读了那个名字」多算一次回读，不会漏。`bytes` 目的地 matplotlib 不补后缀，只记字面名。
+    """
+    if not savefig_targets_path(fname):
+        return []
+    name = os.fsdecode(fname)
+    names = [fname]
+    if kwargs.get("format") is not None or isinstance(fname, bytes):
+        return names
+    if os.path.splitext(name)[1][1:]:
+        return names
+    mpl = sys.modules.get("matplotlib")
+    rc = getattr(mpl, "rcParams", None) or {}
+    fmts = (rc.get("savefig.format"), "png")
+    # 没有后缀也没有显式 format：matplotlib 写的是补了后缀的名字，字面名不会被写出——不记，
+    # 否则同名的无关旧文件被读时会被误判成回读被拦下的 savefig（#952 Codex P2）
+    return [
+        name.rstrip(".") + "." + fmt
+        for fmt in dict.fromkeys(f for f in fmts if isinstance(f, str) and f)
+    ]
+
+
 def savefig_call(fname, kwargs: dict) -> dict:
     """一次 `fig.savefig(fname, **kwargs)` 里决定产物长相的参数 → JSON 对象。
 
@@ -1649,6 +1677,499 @@ def _readonly_mode(mode) -> bool:
     return "r" in mode and not any(c in mode for c in "+wxa")
 
 
+class BlockedFileOps:
+    """safe worker 的守卫**确实拦下**了哪些关键文件操作，以及脚本随后有没有去看被它们影响的路径（P01a）。
+
+    守卫（删除 / 改名 / `write_text` 对真实图库、以及被拦截不落盘的 `savefig` 路径目标）是 safe 档的
+    保护，原样保留；它们靠「悄悄跳过」工作，脚本看不到异常。这本账补上缺的那半句终局事实：
+    **跳过之后脚本读到了什么**。判据一条：被拦下的操作影响了路径 P，此后脚本打开（读，含 `r+`/`a+`）
+    或 `os.stat`（`exists` / `isfile` / `Path.exists`）P，就是「这个脚本随后观察到的世界与直接用 Python
+    运行不同」——`material()` 非空，build 以 `safe_file_operation_blocked` 结束，不记成完整成功。
+
+    * **只算拦下之后的观察**：先于阻断的读、读不相干的路径、拦下了但从没回读（脚本只是顺手删个过期
+      输出），都不算——这些脚本照旧成功。
+    * **脚本自己重写（`w` / `x` 打开）会清掉那条路径的嫌疑**：此后读到的是它自己写的，与直接运行一致。
+    * **拦下上百次也不丢**：事件账有上限（`MAX_EVENTS`），超出的操作并入按 (op, kind) 的溢出路径集合
+      （去重、有上限，再超则粗化为父目录，最后记「丢失」＝此后任何观察都算命中）；回读第 201+ 个被拦路径
+      同样判失败，拦下几百次但从不回读照旧成功。
+    * **事实在带外账本里，不在异常里**：脚本 `except Exception: pass` 吞掉什么都洗不掉它。
+    * **盲区写在明处（判不出就别判）**：C 扩展直接 `fopen`、`os.open`、`os.scandir` / `listdir` / `glob`、
+      `os.access`、`os.path.samefile` 等不在包装清单里的状态查询观察不到——这些不会产生 `material()`，
+      也就**不宣称**它们干净；账本只回答「观察到了」，不回答「没观察到所以没事」。被拦截的 `savefig`
+      目标只认**读内容**（open），不认 `exists` / `getsize` 这类 stat：`savefig(p); print(os.path.exists(p))`
+      是常见的校验打印，据此判失败会把原本能出图的脚本变成失败。
+    * 记账只存**操作类别与次数**，路径只在进程内用来比对，不出进程、不进 message / 诊断。
+
+    `install()` 装的 open / `os.stat` / `os.path.exists` 系包装在没有任何阻断记录时是一次属性读取就返回；`stop()`
+    （脚本跑完）之后整本账变成惰性——引擎自己后续写预览、读字体不会被误算。
+    """
+
+    MAX_EVENTS = 200
+    #: 超过 `MAX_EVENTS` 之后的「溢出账」：每个 (op, kind) 一本，只存受影响路径的集合（去重）。
+    #: 路径数超过 `MAX_SPILL_PATHS` 就粗化成它们的父目录；父目录也超过就记「丢失」，
+    #: 此后任何脚本观察都算命中（宁可误报也不假成功；只发生在拦下上千个互不相干的目录之后）。
+    MAX_SPILL_PATHS = 2048
+
+    #: 操作类别（`kind`）的闭集：message 与载荷只出现这些，不出现路径。
+    KIND_RENAME = "rename"
+    KIND_DELETE = "delete"
+    KIND_DELETE_DIR = "delete_dir"
+    KIND_WRITE = "write"
+    KIND_SAVEFIG = "savefig"
+
+    def __init__(self) -> None:
+        self._events: list[dict] = []
+        self._spill: dict[tuple[str, str], dict] = {}
+        self._active = True
+        self._busy = False
+        self._uninstall = None
+        #: 脚本自己 `w` / `x` 重写成功的路径：目录级污点（`rmtree` 后重建）盖不到它们。后来的阻断会撤销。
+        self._rewritten: set[str] = set()
+        #: 只读相对路径回退的解析函数（worker 装回退后挂上）：脚本交出的路径 → 回退实际会去读的路径。
+        self.read_redirect = None
+
+    # ---- 记账 ----
+    @staticmethod
+    def _norm(path) -> str | None:
+        if isinstance(path, bytes):
+            try:
+                path = os.fsdecode(path)
+            except ValueError:
+                return None
+        elif isinstance(path, os.PathLike):
+            try:
+                path = os.fspath(path)
+            except TypeError:
+                return None
+            if isinstance(path, bytes):
+                path = os.fsdecode(path)
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            return os.path.normcase(os.path.realpath(path))
+        except (OSError, ValueError):
+            return None
+
+    def blocked(self, op: str, kind: str, *paths, dests=()) -> None:
+        """守卫拦下了 `op`（`os.replace` / `Path.unlink` / `savefig`…）：记它影响的路径。永不抛。
+
+        `dests`：`paths` 里属于改名 / 移动**目的**的那几条（直接运行后它们存在、不是被移走的）。"""
+        try:
+            if not self._active:
+                return
+            affected = [p for p in (self._norm(x) for x in paths) if p]
+            if not affected:
+                return
+            dest_set = {p for p in (self._norm(x) for x in dests) if p}
+            if self._rewritten:  # 新的阻断重新盖住这些路径：之前的「已重写」不再作数
+                self._rewritten = {
+                    r for r in self._rewritten if not any(self._covers(p, r) for p in affected)
+                }
+            if len(self._events) >= self.MAX_EVENTS:
+                self._spill_paths(op, kind, affected, dest_set)
+                return
+            self._events.append(
+                {"op": op, "kind": kind, "paths": affected, "dests": dest_set, "observed": False}
+            )
+        except Exception:  # noqa: BLE001 —— 记账失败就少一条，不影响脚本
+            return
+
+    def _spill_paths(
+        self, op: str, kind: str, affected: list[str], dest_set: frozenset | set = frozenset()
+    ) -> None:
+        """超过 `MAX_EVENTS` 的操作不丢：影响的路径并进该 (op, kind) 的溢出集合，终局仍能判回读。"""
+        ev = self._spill.get((op, kind))
+        if ev is None:
+            ev = self._spill[(op, kind)] = {
+                "op": op,
+                "kind": kind,
+                "paths": set(),
+                "dests": set(),
+                "observed": False,
+                "lost": False,
+                "coarse": False,
+            }
+        if ev["lost"]:
+            return
+        ev["paths"].update(affected)
+        if len(ev["dests"]) + len(dest_set) <= self.MAX_SPILL_PATHS:
+            ev["dests"].update(dest_set)
+        if len(ev["paths"]) > self.MAX_SPILL_PATHS:
+            if ev["coarse"]:
+                ev["lost"], ev["paths"] = True, set()
+            else:
+                ev["coarse"] = True
+                ev["paths"] = {os.path.dirname(p) or p for p in ev["paths"]}
+                if len(ev["paths"]) > self.MAX_SPILL_PATHS:
+                    ev["lost"], ev["paths"] = True, set()
+
+    @staticmethod
+    def _spill_hit(ev: dict, real: str) -> bool:
+        if ev["lost"]:
+            return True
+        paths = ev["paths"]
+        cur = real
+        while True:
+            if cur in paths:
+                return True
+            parent = os.path.dirname(cur)
+            if not parent or parent == cur:
+                return False
+            cur = parent
+
+    @staticmethod
+    def _covers(taint: str, path: str) -> bool:
+        return path == taint or path.startswith(taint.rstrip(os.sep) + os.sep)
+
+    def observe(self, path, mode="r") -> None:
+        """脚本打开了 `path`（`mode` 是 `open` 的模式串）。永不抛。"""
+        if not (self._events or self._spill) or not self._active or self._busy:
+            return
+        self._busy = True
+        try:
+            if not isinstance(mode, str):
+                return
+            real = self._norm(path)
+            if real is None:
+                return
+            if "w" in mode or "x" in mode:
+                return  # 写模式：打开**成功**之后才清嫌疑（`opened`），这里什么都不动
+            if "a" in mode and "+" not in mode:
+                return  # 纯追加：不读
+            self._mark(real)
+            # 只读相对路径回退会把这次读改到项目里的另一条路径：那才是脚本实际读到的文件，也要比对
+            redirect = self.read_redirect
+            if redirect is not None and _readonly_mode(mode):
+                alt = self._norm(redirect(path))
+                if alt is not None and alt != real:
+                    self._mark(alt)
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._busy = False
+
+    @staticmethod
+    def is_write_mode(mode) -> bool:
+        return isinstance(mode, str) and ("w" in mode or "x" in mode)
+
+    def opened(self, path, mode) -> None:
+        """写模式（`w` / `x`）的底层 open **成功返回**了：脚本自己重写了这条路径，此后读到的是它写的
+        （与直接运行一致），清掉它的嫌疑。open 抛异常（如被拦删除后 `x` 撞上还在的旧文件）时不调用，记录保留。永不抛。"""
+        if not (self._events or self._spill) or not self._active or self._busy:
+            return
+        self._busy = True
+        try:
+            real = self._norm(path)
+            if real is None:
+                return
+            # 写进一个被拦下的目录删除所覆盖、且脚本没（成功）重建过的目录：直接运行里父目录已被删，
+            # 这次 open 会 FileNotFoundError，这里却因目录还在而成功——写入本身就是分叉，记为观察，不给豁免
+            unrecreated = self._under_unrecreated_deleted_dir(real)
+            if unrecreated:
+                self._mark(real)
+            for ev in self._events:
+                ev["paths"] = [p for p in ev["paths"] if p != real]
+            for ev in self._spill.values():
+                if not ev["coarse"]:  # 粗化后存的是目录，清不掉其中某个文件的嫌疑
+                    ev["paths"].discard(real)
+            # 目录级污点（`rmtree` 之后脚本重建目录、写进新文件）盖不到脚本自己写成功的后代
+            if not unrecreated and len(self._rewritten) < self.MAX_SPILL_PATHS:
+                self._rewritten.add(real)
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._busy = False
+
+    def _deleted_dirs_covering(self, real: str) -> list[str]:
+        """被拦下的目录删除里，覆盖 `real`（自身或祖先）的那些目录。粗化 / 丢失的溢出账认不出具体目录，不在此列。"""
+        found: list[str] = []
+        for ev in (*self._events, *self._spill.values()):
+            if ev["kind"] != self.KIND_DELETE_DIR or ev.get("lost") or ev.get("coarse"):
+                continue
+            found.extend(p for p in ev["paths"] if self._covers(p, real))
+        return found
+
+    def _under_unrecreated_deleted_dir(self, real: str) -> bool:
+        """`real` 落在某个被拦下的目录删除之下，且那个被删的目录没被脚本成功重建过。
+        溢出账粗化 / 丢失后认不出具体目录：命中就宁可当作没重建。"""
+        for ev in (*self._events, *self._spill.values()):
+            if ev["kind"] != self.KIND_DELETE_DIR:
+                continue
+            if ev.get("lost"):
+                return True
+            if ev.get("coarse"):
+                if self._spill_hit(ev, real):
+                    return True
+                continue
+            if any(
+                d != real and self._covers(d, real) and d not in self._rewritten
+                for d in ev["paths"]
+            ):
+                return True
+        return False
+
+    def recreating_directory(self, path, *, parents: bool = False) -> None:
+        """脚本 `mkdir` 一个被拦下的 `rmtree` / `rmdir` 影响过的目录，且直接运行也会得到同样的成功结果
+        （mkdir 成功，或 `makedirs(exist_ok=True)` / `Path.mkdir(exist_ok=True)` 撞上还在的目录）：
+        记这条目录已被脚本重建，随后的 `isdir` 探测与写进去的新文件都不算分叉。只豁免这条目录自身的状态
+        与脚本写成功的后代——里面没被重写的文件仍受污点覆盖。
+        `path` 是被删目录**之内**的子目录时：`parents`（`makedirs` / `mkdir(parents=True)`）会连父目录一起重建；
+        否则直接运行里父目录不在、会 FileNotFoundError，这里的成功是分叉，记为观察。永不抛。"""
+        if not (self._events or self._spill) or not self._active or self._busy:
+            return
+        self._busy = True
+        try:
+            real = self._norm(path)
+            if real is None:
+                return
+            covering = self._deleted_dirs_covering(real)
+            if not covering:
+                return
+            if real in covering:
+                self._rewritten.add(real)
+            elif parents:
+                self._rewritten.update(covering)
+            else:
+                self._mark(real)
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._busy = False
+
+    def mkdir_collided(self, path) -> None:
+        """脚本 `os.mkdir`（非 `exist_ok`）一个被拦下的删除所覆盖的目录，撞上了守卫留下的旧目录
+        （`FileExistsError`）：直接运行里目录已被删、mkdir 会成功——脚本走进了异常分支，本身就是一次观察。
+        脚本自己重建过的目录不算（两边都会失败；`_mark` 对 `_rewritten` 直接放行）。
+        与 `x` 打开撞名同一判据：只有**破坏性**操作（删除 / 删除目录 / 改名移动的源）影响过的路径才算——
+        写入等保留存在性的操作被拦后，`os.mkdir` 撞名在两边同样失败，不是分叉（Codex #952）。永不抛。"""
+        self.exclusive_create_failed(path)
+
+    def exclusive_create_failed(self, path) -> None:
+        """`x` 打开撞上了已存在的文件（`FileExistsError`）。若这条路径被守卫拦下的**破坏性**操作
+        （删除 / 删除目录 / 改名移动的源）影响过，直接运行时那次操作已经生效、`x` 会成功——脚本这里看到的
+        结果（异常、随后读到的旧文件）与直接运行不同，本身就是一次观察，不必等它回读。
+        写入（直跑后同样存在）、改名移动的**目的**、被拦截的 savefig 目标（直跑后也存在）不走这条捷径：
+        `x` 在两边都会失败。永不抛。"""
+        if not (self._events or self._spill) or not self._active or self._busy:
+            return
+        self._busy = True
+        try:
+            real = self._norm(path)
+            if real is None or real in self._rewritten:
+                return
+            destructive = (self.KIND_DELETE, self.KIND_DELETE_DIR, self.KIND_RENAME)
+            for ev in (*self._events, *self._spill.values()):
+                if ev["observed"] or ev["kind"] not in destructive:
+                    continue
+                if isinstance(ev["paths"], list):
+                    hit = any(self._covers(p, real) for p in ev["paths"])
+                else:
+                    hit = self._spill_hit(ev, real)
+                if not hit:
+                    continue
+                if ev["kind"] == self.KIND_RENAME and any(
+                    self._covers(d, real) for d in ev["dests"]
+                ):
+                    continue  # 改名 / 移动的目的：直跑后它存在，`x` 同样失败
+                ev["observed"] = True
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._busy = False
+
+    def move_destination(self, src, dst):
+        """`shutil.move(src, dst)` 真正影响的目的路径：`dst` 是已存在的目录时是 `dst/basename(src)`，
+        否则就是 `dst`——不能把整个目录记成受影响（目录里无关的文件不受这次移动影响）。永不抛。"""
+        try:
+            self._busy, was = True, self._busy  # 判断目录不算脚本的观察
+            try:
+                dst_s = os.fspath(dst)
+                src_s = os.fspath(src)
+                if os.path.isdir(dst_s):
+                    if isinstance(src_s, bytes):
+                        src_s = os.fsdecode(src_s)
+                    if isinstance(dst_s, bytes):
+                        dst_s = os.fsdecode(dst_s)
+                    base = os.path.basename(src_s.rstrip("/" + (os.sep or "/")))
+                    return os.path.join(dst_s, base) if base else dst_s
+                return dst_s
+            finally:
+                self._busy = was
+        except Exception:  # noqa: BLE001
+            return dst
+
+    def observe_stat(self, path) -> None:
+        """脚本查了 `path` 的状态（`exists` / `isfile` / `stat`）。永不抛。"""
+        if not (self._events or self._spill) or not self._active or self._busy:
+            return
+        self._busy = True
+        try:
+            real = self._norm(path)
+            if real is not None:
+                self._mark(real, via_stat=True)
+        except Exception:  # noqa: BLE001
+            return
+        finally:
+            self._busy = False
+
+    def _mark(self, real: str, *, via_stat: bool = False) -> None:
+        if real in self._rewritten:
+            return  # 读到的是脚本自己写的（阻断在其后会撤销这条）
+        for ev in self._events:
+            # 被拦截的 savefig 目标：`exists` / `getsize` 多是「存好了」的校验打印，不据此判分叉；
+            # 读内容（open）才算——`Image.open` / `imread` / `open('rb')` 读到的才是错的数据
+            if via_stat and ev["kind"] == self.KIND_SAVEFIG:
+                continue
+            if not ev["observed"] and any(self._covers(p, real) for p in ev["paths"]):
+                ev["observed"] = True
+        for ev in self._spill.values():
+            if via_stat and ev["kind"] == self.KIND_SAVEFIG:
+                continue
+            if not ev["observed"] and self._spill_hit(ev, real):
+                ev["observed"] = True
+
+    # ---- 终局 ----
+    def material(self) -> list[dict]:
+        """被拦下、且脚本随后观察过受影响路径的操作，按 (op, kind) 聚合：`[{op, kind, count}]`。"""
+        counts: dict[tuple[str, str], int] = {}
+        for ev in (*self._events, *self._spill.values()):
+            if ev["observed"]:
+                key = (ev["op"], ev["kind"])
+                counts[key] = counts.get(key, 0) + 1
+        return [{"op": op, "kind": kind, "count": n} for (op, kind), n in sorted(counts.items())]
+
+    def stop(self) -> None:
+        """脚本跑完：之后一切观察都不算（引擎自己的读写不是脚本的）。"""
+        self._active = False
+
+    # ---- 钩子 ----
+    def install(self):
+        """装 open（`builtins.open` / `io.open` / `Path.open`）与 `os.stat` 的观察包装；返回卸载函数。
+
+        worker 把它装在**最外层**（晚于输入观察器、数据改指与相对路径回退）：看到的是脚本交出的那条路径，
+        与守卫记账时用的是同一个 cwd 下的同一种解析。`os.stat` 一并包——`os.path.exists` /
+        `isfile` / `Path.exists` 都经它（Windows 3.12+ 的 `os.path.exists` 系是 C 实现、不经 `os.stat`，另行逐个包装，见下）。
+        """
+        ledger = self
+        real_open, real_io_open = builtins.open, io.open
+        real_path_open, real_stat = pathlib.Path.open, os.stat
+        real_mkdir = os.mkdir
+        real_makedirs = os.makedirs
+        real_path_mkdir = pathlib.Path.mkdir
+        #: 正在进行的 `makedirs` / `Path.mkdir` 的 (exist_ok, parents)：内部的 `os.mkdir` 撞上还在的目录时
+        #: 由外层自己吞掉（`exist_ok`），不是脚本看到的异常
+        mk_ctx: list[tuple[bool, bool]] = []
+
+        def _open_through(original, file, mode, args, kwargs):
+            ledger.observe(file, mode)
+            if not ledger.is_write_mode(mode):
+                return original(file, mode, *args, **kwargs)
+            try:
+                result = original(file, mode, *args, **kwargs)
+            except FileExistsError:
+                if "x" in mode:
+                    ledger.exclusive_create_failed(file)
+                raise
+            ledger.opened(file, mode)  # 写模式成功之后才清嫌疑
+            return result
+
+        def _wrap(original):
+            def watched_open(file, mode="r", *args, **kwargs):
+                return _open_through(original, file, mode, args, kwargs)
+
+            return watched_open
+
+        def watched_path_open(self_path, mode="r", *args, **kwargs):
+            return _open_through(
+                lambda f, m, *a, **k: real_path_open(f, m, *a, **k), self_path, mode, args, kwargs
+            )
+
+        def watched_stat(path, *args, **kwargs):
+            ledger.observe_stat(path)
+            return real_stat(path, *args, **kwargs)
+
+        # Windows 3.12+ 的 `os.path.exists` / `isfile` / `isdir` / `islink` / `lexists` 是 C 实现，
+        # 不经 `os.stat`：逐个包上（POSIX 上它们本来经 `os.stat`，重复观察是幂等的）
+        real_path_checks: dict[str, object] = {}
+
+        def _wrap_check(original):
+            def watched_check(path, *args, **kwargs):
+                ledger.observe_stat(path)
+                return original(path, *args, **kwargs)
+
+            return watched_check
+
+        for name in ("exists", "lexists", "isfile", "isdir", "islink"):
+            fn = getattr(os.path, name, None)
+            if fn is not None:
+                real_path_checks[name] = fn
+                setattr(os.path, name, _wrap_check(fn))
+
+        builtins.open = _wrap(real_open)
+        io.open = _wrap(real_io_open)
+        pathlib.Path.open = watched_path_open
+        os.stat = watched_stat
+
+        def watched_mkdir(path, *args, **kwargs):
+            tolerant, parents = mk_ctx[-1] if mk_ctx else (False, False)
+            try:
+                result = real_mkdir(path, *args, **kwargs)
+            except FileExistsError:
+                if tolerant:
+                    ledger.recreating_directory(path, parents=parents)  # 直跑也成功：等价结果
+                else:
+                    ledger.mkdir_collided(path)
+                raise
+            ledger.recreating_directory(path, parents=parents)  # 成功之后才给豁免
+            return result
+
+        def watched_makedirs(name, mode=0o777, exist_ok=False):
+            mk_ctx.append((bool(exist_ok), True))
+            try:
+                return real_makedirs(name, mode, exist_ok)
+            finally:
+                mk_ctx.pop()
+
+        def watched_path_mkdir(self_path, mode=0o777, parents=False, exist_ok=False):
+            # 3.10 的 `Path.mkdir` 走导入时绑定的 `self._accessor.mkdir`，看不到上面的 `os.mkdir` 包装——
+            # 这里自己按结果记账（3.11+ 内层 `os.mkdir` 包装也会记一次，重复记账无害）
+            mk_ctx.append((bool(exist_ok), bool(parents)))
+            try:
+                result = real_path_mkdir(self_path, mode, parents, exist_ok)
+            except FileExistsError:
+                if not exist_ok:
+                    ledger.mkdir_collided(self_path)
+                raise
+            finally:
+                mk_ctx.pop()
+            # 正常返回：目录此刻在（新建或 exist_ok 撞上）
+            ledger.recreating_directory(self_path, parents=parents)
+            return result
+
+        os.mkdir = watched_mkdir
+        os.makedirs = watched_makedirs
+        pathlib.Path.mkdir = watched_path_mkdir
+
+        def uninstall() -> None:
+            os.mkdir = real_mkdir
+            os.makedirs = real_makedirs
+            pathlib.Path.mkdir = real_path_mkdir
+            builtins.open = real_open
+            io.open = real_io_open
+            pathlib.Path.open = real_path_open
+            os.stat = real_stat
+            for name, fn in real_path_checks.items():
+                setattr(os.path, name, fn)
+
+        self._uninstall = uninstall
+        return uninstall
+
+    def uninstall(self) -> None:
+        if self._uninstall is not None:
+            self._uninstall()
+            self._uninstall = None
+
+
 def observed_local_modules(
     project_root: str, modules: dict, *, exclude_dir: str = ""
 ) -> list[dict]:
@@ -1850,6 +2371,8 @@ def install_relative_read_fallback(
         if real_ds_open is not None:
             datasource.open = real_ds_open
 
+    #: 账本比对用：这次只读 open 回退会改读哪条路径（None＝不改道）。与回退本身是同一个判据。
+    uninstall.resolve = _fallback_path
     return uninstall
 
 

@@ -75,7 +75,27 @@
   safe 档不带参数，出路是默认值或 `tavotto run`；argparse 的 usage 打在 stderr，
   `pool._attach_script_output` 把 worker.log 尾巴接到 traceback 前面，两条控制面
   同一处拼），否则 `script_exited`——都不再把 worker 带走。`ensure_built` 放行
-  `ProtocolError`，只把裸 `Exception` 归 `script_error`。probe 原样透传这两个码。`SystemExit`
+  `ProtocolError`，只把裸 `Exception` 归 `script_error`。probe 原样透传这两个码。
+  **守卫拦下的关键文件操作不洗成完整成功（P01a，`safe_file_operation_blocked`，AC-02）**：safe 的删除 /
+  改名 / `write_text` 守卫与 savefig 拦截靠「悄悄跳过」工作，脚本看不到异常——脚本 `os.replace` 缓存后读它，
+  拿到旧值 1（直接 Python 是 2）却 `ok`。守卫一字不动，另有一本带外账本 `figcapture.BlockedFileOps`
+  （`worker.BLOCKED_OPS`）：守卫每拦一次记「操作类别 + 影响的路径」，**最外层**（晚于输入观察器与相对读回退，看到的是脚本交出的原始路径，不是回退改写后的；沙盒档项目里有旧 `stage.png` 时
+  装在回退之下会永远对不上，#952 第三轮 P1）的 open / `os.stat` 包装在
+  **拦下之后**看到脚本打开（读，含 `r+`/`a+`）或 stat 了受影响路径，才算 material；脚本自己以 `w`/`x` 重写
+  该路径则清掉嫌疑（成功重写的后代同时记入「已重写」集合，目录级污点盖不到它——`rmtree` 后重建目录再写再读；目录重建**只在直跑也会得到同样成功结果之后**才记：`os.mkdir` 成功、或 `makedirs(exist_ok=True)` / `Path.mkdir(exist_ok=True)` 撞上守卫留下的目录（外层吞掉），豁免该目录自身的状态查询；非 `exist_ok` 的 `os.mkdir` 撞上还在的目录（直跑里它成功）抛 `FileExistsError` 是守卫造成的分叉，本身记为观察；被删目录之下没重建就 `open(...,'w')` 写子文件（直跑里 `FileNotFoundError`）也是分叉，不给「已重写」豁免、记为观察；`makedirs` / `mkdir(parents=True)` 建被删目录之内的子目录会连父目录一起重建，不带 `parents` 的算分叉；里面没被重写的文件仍受污点；后来的阻断撤销豁免）；相对只读读还要按回退的同一判据（`install_relative_read_fallback(...).resolve`）解析出实际会读的项目路径一并比对（绝对路径的阻断 + 沙盒里相对路径的回读）；守卫按签名取参，`dst=` / `src=` / `path=` 关键字与位置参数等价（**只在底层 open 成功返回之后清**；`x` 撞上被我们拦删而留下的旧文件抛 `FileExistsError` 时不清，且这次失败本身就是一次观察——直接运行里删除生效、`x` 会成功，不等回读；**只对直跑结果会让该路径不存在的事件**生效：删除、删除目录、改名/移动的源；被拦的写入、改名/移动的目的、savefig 目标直跑后同样存在，`x` 两边都失败，不走这条捷径），`shutil.move` 进已存在目录只记 `dst/basename(src)` 与源，不把整个目录记成受影响，被拦截的 `savefig` 目标记**有效目标名**（`figcapture.savefig_effective_names`：无后缀且无 `format=` 时**只**记补了 `rcParams["savefig.format"]`/`png` 后缀的名字、不记字面名（matplotlib 不会写它，否则同名无关旧文件被读会误判），`format=` 显式则字面名）、只认读内容、不认 `exists`（校验打印不判失败），先于拦截的读、读别的路径、从没回读（`test_workdir_mode` 那种顺手删过期输出）都不算。
+  material 非空时 build 以该 code 结束——脚本跑到末尾、`except Exception` 吞掉了异常、或因读不到而崩
+  （原因是守卫不是 `missing_input`）、或随后 `sys.exit` 非零，一律如此。载荷只有类别（`operations`）、
+  `required_execution="preserve_file_semantics"` 与 `adapter_available=false`，没有路径（message 会进
+  app.log）。**拦下超过 200 次也不丢**：事件账上限 `MAX_EVENTS=200`，超出的操作并入按 (op, kind) 的溢出路径集合
+  （去重；超 `MAX_SPILL_PATHS=2048` 粗化为父目录；目录也超则记「丢失」，此后任何观察都算命中），
+  所以清理几百个缓存再回读第 201+ 个路径照样判失败，拦下几百次但从不回读照旧成功；只有拦下上千个互不相干
+  的目录之后才会退化成「之后任何观察都算」，这是宁可误报不假成功的取舍。**状态查询入口**：除 `os.stat` 外，
+  `os.path.exists`/`lexists`/`isfile`/`isdir`/`islink` 逐个包装——Windows 3.12+ 它们是 C 实现、不经 `os.stat`，
+  不包就观察不到（CI Windows 腿抓到的 `os.remove` 后 `os.path.exists` 假成功）；被拦截的 savefig 目标仍只认读内容。
+  盲区写在明处：C 扩展直接 `fopen`、`os.open`、`listdir`/`glob`/`scandir`、`os.access` 等未包装的状态查询观察不到，
+  账本不宣称它们干净。pool 的镜像常量 `FILE_OPERATION_BLOCKED_CODE` 与
+  `file_operation_blocked_params`、HTTP `_worker_error_payload`、probe 透传同一份载荷。看护
+  `tests/test_worker_blocked_file_ops.py`。`SystemExit`
   的载荷若不是整数（`sys.exit("…")`）不进 message——那是用户的文字，message 会进 app.log
   再随诊断包出门；退出状态按 CPython 的规则记 1，文字只在 traceback 区的 `SystemExit: …`。**协议管道上的
   一行先判 UTF-8、再解析 JSON，两条控制面同一口径**：非 UTF-8 字节是「管道上有垃圾」

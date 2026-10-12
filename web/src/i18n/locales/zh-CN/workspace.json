@@ -892,6 +892,7 @@
       "depsRuntime": "运行时缺 {{module}}",
       "install": "要先安装缺少的组件",
       "needsArgs": "脚本要运行参数",
+      "fileOpsBlocked": "脚本改了项目里的文件又去读，安全运行不会真改，结果会不同，所以没有出图",
       "argsRejected_other": "脚本不认你填的 {{count}} 个参数",
       "inputUnanswered": "脚本中途要你回答，再运行一次就能答",
       "inputUnansweredSecret": "脚本要口令，再运行一次时输入（口令不会被记住）",

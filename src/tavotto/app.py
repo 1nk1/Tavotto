@@ -635,6 +635,9 @@ def _worker_error_payload(exc, stage: str = "") -> dict:
         # 脚本要输入（ADR 0099：提示原文 + 为什么没人能答，T08）/ 参数解析器退出（T03：个数与类别）：
         # 界面按 code 翻译，字段由错误转换合同 `pool.recovery_params` 统一给出（探测与准备会话同一份）
         body["params"] = engine_pool.recovery_params(exc)
+    if exc.code == engine_pool.FILE_OPERATION_BLOCKED_CODE:
+        # safe 守卫拦下了脚本的关键文件操作、脚本随后又观察了它（P01a）：只带操作类别与接入依据，没有路径
+        body["params"] = engine_pool.file_operation_blocked_params(getattr(exc, "extra", None))
     if getattr(exc, "module", ""):
         body["module"] = exc.module
     # 项目环境自动接手失败时的结构化原因（ADR 0018）：找不到 venv / venv 里

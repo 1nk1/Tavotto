@@ -74,6 +74,10 @@ ERROR_STEM_CONFLICT = "multiple_stem_conflict"
 #: `script_probe_failed` 会把出路（给默认值或 `tavotto run` / 去掉那句 exit）说丢。
 ERROR_NEEDS_ARGUMENTS = "script_needs_arguments"
 ERROR_SCRIPT_EXITED = "script_exited"
+#: safe 守卫拦下了脚本的关键文件操作、脚本随后又观察了它（P01a）：原样透传——出路（保留文件语义的执行路径）
+#: 归成通用的 `script_probe_failed` 会被说丢。**不**算「与入口无关」：被拦的操作可能只在某个入口函数里
+#: （`main()` 删缓存再读，而 `render()` 是干净的图入口），换下一个入口照旧要试；都失败时报的是第一次的这个码。
+ERROR_FILE_OPERATION_BLOCKED = pool.FILE_OPERATION_BLOCKED_CODE
 #: 脚本 `input()`（ADR 0099）：没人能答 / 等到超时脚本没接住 EOF。worker 原样透传。
 ERROR_NEEDS_INPUT = "script_needs_input"
 ERROR_INPUT_TIMEOUT = "script_input_timeout"
@@ -176,6 +180,13 @@ def _error_from_worker(
             exc.code,
             str(exc),
             params=pool.recovery_params(exc),
+            traceback_text=exc.traceback_text,
+        )
+    if exc.code == ERROR_FILE_OPERATION_BLOCKED:
+        return _err(
+            exc.code,
+            str(exc),
+            params=pool.file_operation_blocked_params(getattr(exc, "extra", None)),
             traceback_text=exc.traceback_text,
         )
     if exc.code in (ERROR_NEEDS_ARGUMENTS, ERROR_SCRIPT_EXITED):
