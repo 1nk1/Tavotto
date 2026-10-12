@@ -52,7 +52,9 @@ import { ScriptInputDialog } from '@/components/ScriptInputDialog'
 import { TooltipProvider } from '@/components/ui/Tooltip'
 import { useProjectPreparationStore } from '@/store/projectPreparationStore'
 import { renderKeyOf, useRenderStore } from '@/store/renderStore'
-import { useDocumentStore } from '@/store/documentStore'
+import { beginRestore, settleRestore, resetRestoreGateForTests, useDocumentStore } from '@/store/documentStore'
+import { deferUserEntry } from '@/store/documentRestore'
+import { emptyProject } from '@/types/document'
 import type { PanelObject } from '@/types/document'
 import { seedExactRender } from '@/test/renderFixtures'
 import { useScriptInputStore } from '@/store/scriptInputStore'
@@ -1092,6 +1094,66 @@ describe('执行结束、捕获到图、首次编辑渲染是三件事', () => {
     expect(panel().dataset.prepState).toBe('edit_opening')
     await act(async () => seedExactRender(target, { elements: [] } as never))
     expect(panel().dataset.prepState).toBe('edit_ready')
+  })
+})
+
+describe('进入编辑遇到上次的排版还没恢复好', () => {
+  afterEach(() => resetRestoreGateForTests())
+
+  it('blocked（需要用户先处理恢复）：什么都没放进去，卡片留着，不说已进入编辑', async () => {
+    await mount()
+    await openWith(report(STATES.completed))
+    vi.mocked(addRuntimePanelToCanvas).mockImplementation((() => null) as never)
+    vi.mocked(openFastEdit).mockImplementation((() => 'blocked') as never)
+    await act(async () => primary()!.click())
+    expect(useUiStore.getState().guideCard).not.toBe('closed')
+    expect(panel()).not.toBeNull()
+    expect(useDocumentStore.getState().doc.objects).toEqual([])
+  })
+
+  /** 真实的排队：openFastEdit 的替身走真 `deferUserEntry`，落地时放面板 */
+  const realDeferral = () => {
+    vi.mocked(addRuntimePanelToCanvas).mockImplementation((() => null) as never)
+    vi.mocked(openFastEdit).mockImplementation(((id: string) => {
+      const entry = deferUserEntry(() => void putPanel(id))
+      if (entry === 'run') {
+        putPanel(id)
+        return 'editing'
+      }
+      return entry === 'deferred' ? 'deferred' : 'blocked'
+    }) as never)
+  }
+
+  it('deferred（恢复在路上）：入口排队期间卡片留着；入口真的落地之后才收', async () => {
+    await mount()
+    await openWith(report(STATES.completed))
+    const token = beginRestore('pj-a')
+    realDeferral()
+    await act(async () => primary()!.click())
+    expect(useUiStore.getState().guideCard).not.toBe('closed')
+    await act(async () => {
+      settleRestore(token, { state: 'ready', reason: 'empty' })
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(useUiStore.getState().guideCard).toBe('closed')
+    expect(useDocumentStore.getState().doc.objects).toHaveLength(1)
+  })
+
+  it('deferred 后恢复被同项目里显式打开的别的排版取代，那份排版恰好也有这张图：入口被丢掉，卡片不收、不记编辑', async () => {
+    await mount()
+    await openWith(report(STATES.completed))
+    beginRestore('pj-a')
+    realDeferral()
+    await act(async () => primary()!.click())
+    const other = { ...emptyProject(), canvases: [{ ...emptyProject().canvases[0], objects: [panelFor('runtime:plot.py#a')] }] }
+    await act(async () => {
+      await useDocumentStore.getState().switchDocument(other, 'd_other') // 显式取代（同一个项目）
+      await Promise.resolve()
+      await Promise.resolve()
+    })
+    expect(useDocumentStore.getState().doc.objects.map((o) => o.id)).toEqual([panelFor('runtime:plot.py#a').id])
+    expect(useUiStore.getState().guideCard).not.toBe('closed')
   })
 })
 
