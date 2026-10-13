@@ -304,6 +304,40 @@ This section covers the website only. The Tavotto application does not contact
 the website; the download mirror `dl.tavotto.cn` used for update checks is a
 separate host and is described under "Update checks" above.
 
+## Supporting the project on tavotto.com
+
+Payments made through the support page <https://www.tavotto.com/support/> are
+made on Ko-fi or 爱发电 (afdian.com), under their own privacy policies; the
+website never sees card or account details. A Ko-fi payment is paid out directly
+to the maintainer's PayPal or Stripe account, so PayPal (the payer's name and
+email address) or Stripe (name, email address and part of the billing address)
+shows those details to the maintainer as the payment recipient, under PayPal's
+or Stripe's own policies. 爱发电 likewise shows the maintainer the supporter's
+爱发电 account and order. What follows is what the website itself receives and
+keeps.
+
+When a Ko-fi payment completes, Ko-fi notifies the website. The supporter's email
+address in that notification is used **once**, to send a single thank-you mail
+(through the website's mail provider) with a link for choosing how to appear on
+the supporters wall. The notification also carries the supporter's Ko-fi display
+name; it is only checked to recognise Ko-fi's own test notification and is then
+discarded. The address and that name are not stored, and neither are the amount
+or the message. What is kept is the Ko-fi transaction id, the month, whether it was
+a one-off payment or a membership (and the tier name), and, only if the
+supporter fills in the form, the display name and optional avatar they chose. A
+name or avatar appears on the page only after the supporter submitted it and the
+maintainer approved it; a supporter who stays anonymous is counted but never
+named.
+
+爱发电 sends no email address. When it reports an order, the website looks the
+order up through 爱发电's API to confirm it was paid, and keeps the order number,
+the month and whether the amount allows an avatar; the supporter's 爱发电 user id
+is kept only as a keyed hash, so that one person is counted once. To appear on
+the wall, the supporter enters the order number on the support page and gets the
+same form; the rest is as for Ko-fi above.
+
+To change or remove an entry, write to <hello@tavotto.com>.
+
 ## Changes and contact
 
 Changes to this policy will be recorded in the repository history. Privacy or
