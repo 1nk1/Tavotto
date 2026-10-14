@@ -1629,7 +1629,7 @@ export default interface Resources {
             "ui_trace": "最近的界面操作轨迹（只有操作类型）"
           },
           "listSeparator": "、",
-          "notIncluded": "默认不含：你的脚本源码、数据文件，也不含匿名统计用的标识。报错原文、日志里可能出现项目文件夹名和文件名。",
+          "notIncluded": "默认不含：你的脚本文件、数据文件，也不含匿名统计用的标识。报错原文、日志里可能出现项目文件夹名、文件名和脚本打印出的内容。",
           "noteAttached": "你在这里写的说明会原样随诊断包一起发送。",
           "noteCount": "{{count}} / {{max}}",
           "noteHint": "请不要填写姓名、邮箱、路径或数据内容。",
@@ -1658,8 +1658,8 @@ export default interface Resources {
           "saveFailed": "没能保存",
           "saved": "已保存",
           "send": "发送",
-          "sentence": "将发送诊断包，含报错详情和日志，不含你的脚本源码和数据文件。",
-          "sentenceExtras": "将发送诊断包，含报错详情和日志，并附带你勾选的：{{items}}。",
+          "sentence": "将发送诊断包，含报错详情和日志（日志里可能有脚本打印出的内容），不附带你的脚本文件和数据文件。",
+          "sentenceExtras": "将发送诊断包，含报错详情和日志（日志里可能有脚本打印出的内容），并附带你勾选的：{{items}}。",
           "sentenceItem": {
             "corrupt_sessions": "会话损坏副本的内容",
             "crash_reports": "系统崩溃报告（可能含打开着的文件的内容）",
@@ -5728,6 +5728,9 @@ export default interface Resources {
       "zoomSelection": "缩放到选中对象",
       "zoomValue": "缩放 {{percent}}%",
       "zoomValueInput": "缩放比例（%）"
+    },
+    "unexpectedError": {
+      "text": "Tavotto 出了点意外，可以把诊断发给我们"
     },
     "update": {
       "banner": "工具已更新，刷新后使用新版本",
