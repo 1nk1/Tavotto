@@ -17,6 +17,7 @@ import {
   type SnapEdge,
   type SnapKind,
   type SnapLine,
+  type SnapPick,
   type SnapLineCandidates,
   unrotateVecDeg,
   type Rect,
@@ -73,12 +74,14 @@ import {
   scaledRect,
   scaleFixedPoint,
   scaleSnapCandidates,
+  scaledAnchorRect,
   snapScaleNearest,
 } from '@/lib/scaleSnap'
 import { clamp } from '@/lib/units'
 import { setTxnAnchor, useDocumentStore } from '@/store/documentStore'
 import { registerPointerCancel } from '@/store/gestureCoordinator'
-import { useInteractionStore } from '@/store/interactionStore'
+import { useInteractionStore, type SnapFeedback } from '@/store/interactionStore'
+import { feedbackFor } from '@/lib/snapFeedback'
 import { displayedExactManifest } from '@/store/mountedSvgStore'
 import { exactPanelManifest, useRenderStore } from '@/store/renderStore'
 import { useSelectionStore } from '@/store/selectionStore'
@@ -428,6 +431,7 @@ export function startResizeDrag(e: ReactPointerEvent, objectId: string, dir: Res
       const tol = snapTolMm(t)
       const snapX: number[] = []
       const snapY: number[] = []
+      let feedback: SnapFeedback[] = []
       if (cands && !rot && !ev.metaKey && !ev.ctrlKey && !proportional) {
         if (dir.includes('e')) {
           const hit = snapEdge(next.x + next.w, cands.xs, tol)
@@ -469,12 +473,21 @@ export function startResizeDrag(e: ReactPointerEvent, objectId: string, dir: Res
           if (hit) {
             next = scaledRect(orig, dir, hit.s)
             ;(hit.axis === 'x' ? snapX : snapY).push(hit.line.v)
+            // 反馈：胜出锚点所属的框（外框锚点 = 外框，子图 / 色条锚点 = 那个元素），吸附后的位置
+            feedback = [
+              feedbackFor(
+                hit.axis,
+                hit.line,
+                scaledAnchorRect(hit.anchor, scaleSnap.fixed, hit.s),
+                objectId,
+              ),
+            ]
           }
         } else {
           scaleSnap.hold.held = null
         }
       }
-      interaction().setSnap(snapX, snapY)
+      interaction().setSnap(snapX, snapY, feedback)
 
       const placed = anchoredRect(orig, next, dir, rot)
       store.txnUpdate((d) => {
@@ -1377,6 +1390,13 @@ export interface InFigureMove {
   moving: (gid: string) => boolean
   /** 按住 / 松开 ⌘ / Ctrl 时要切换预览的那些被带着走的内容（`watchCarryKeys`） */
   carryPreview: CarriedItem[]
+  /**
+   * 累计位移在落点处被钳位后的**实际**位移（子图被钳在图框内）；缺省 = 不钳位。吸附反馈的自身框取它，
+   * 免得虚线框跑到子图实际够不着的线上
+   */
+  settle?: (dfx: number, dfy: number) => [number, number]
+  /** 落点会被钳在面板内（子图 / 色条平移）：吸附候选只留面板范围内的线 */
+  clampedToPanel?: boolean
   /** 预览到累计位移：只改 SVG DOM 与覆盖层，不写文档、不进历史、不发后端 */
   preview: (dfx: number, dfy: number, carry: boolean) => void
   /** 以累计位移提交：一条撤销、一次权威渲染。净位移为零时与取消同样处理，回 false */
@@ -1580,7 +1600,7 @@ function trackInFigureMove(
   let last: [number, number] = [0, 0]
   const unwatchKeys = watchCarryKeys(mv.carryPreview, () => last)
   const box0 = mv.snapBox
-  const snapper = box0 ? inFigureSnapper(panel, mv.moving, mv.snapKind) : null
+  const snapper = box0 ? inFigureSnapper(panel, mv.moving, mv.snapKind, mv.clampedToPanel) : null
 
   trackPointer(e, {
     onMove: (ev, dxPx, dyPx) => {
@@ -1594,6 +1614,8 @@ function trackInFigureMove(
         )
         dfx += sx
         dfy += sy
+        const [rx, ry] = mv.settle ? mv.settle(dfx, dfy) : [dfx, dfy]
+        snapper.report([box0[0] + rx, box0[1] + ry, box0[2], box0[3]])
       }
       last = [dfx, dfy]
       mv.preview(dfx, dfy, carriesContents(ev))
@@ -1848,7 +1870,11 @@ function contentDelta(panel: PanelObject, layout: { width: number; height: numbe
  * - 别的图里的同类元素——只在排版模式（快速编辑里别的图让开了）、且被拖的是单个元素（`selfKind`）；
  * - 页面参考线——「吸附到参考线」开着时（快速编辑里参考线照样画在画布上，所以照吸）。
  */
-function crossAndGuideLines(panel: PanelObject, selfKind?: SnapKind): SnapLineCandidates {
+function crossAndGuideLines(
+  panel: PanelObject,
+  selfKind: SnapKind | undefined,
+  clampToPanel: boolean,
+): SnapLineCandidates {
   const xs: SnapLine[] = []
   const ys: SnapLine[] = []
   if (selfKind && useWorkspaceStore.getState().mode !== 'fast_edit') {
@@ -1866,7 +1892,15 @@ function crossAndGuideLines(panel: PanelObject, selfKind?: SnapKind): SnapLineCa
     for (const g of doc().guides)
       (g.axis === 'x' ? xs : ys).push({ v: g.pos, kind: 'guide', edge: null })
   }
-  return { xs, ys }
+  // 只有会被钳在面板里的路径（子图 / 色条的平移与缩放手柄）才过滤：范围外的线它们够不着，吸附线与反馈不能指向它。
+  // 图例 / 标题 / 文字提交的是未钳位的锚点，够得着图外的参考线与相邻图的元素（Codex #1036），由调用方显式传，不按 kind 猜
+  if (!clampToPanel) return { xs, ys }
+  const full = panelFullRect(panel)
+  const within = (v: number, lo: number, size: number) => v >= lo - 1e-6 && v <= lo + size + 1e-6
+  return {
+    xs: xs.filter((l) => within(l.v, full.x, full.w)),
+    ys: ys.filter((l) => within(l.v, full.y, full.h)),
+  }
 }
 
 /**
@@ -1883,7 +1917,7 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
   const own = inFigureSnapCandidates(panel, manifest, underAny([element.gid]))
   if (!own) return null
   const selfKind = snapKindOf(element)
-  const extra = crossAndGuideLines(panel, selfKind)
+  const extra = crossAndGuideLines(panel, selfKind, true)
   const cands: SnapLineCandidates = { xs: [...own.xs, ...extra.xs], ys: [...own.ys, ...extra.ys] }
   const crossPair = crossFigurePair(selfKind, panel.id, cands.xs)
   const pair = (selfEdge: SnapEdge, line: SnapLine) => {
@@ -1898,10 +1932,13 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
   const full = panelFullRect(panel)
   const holdX = createSnapHold()
   const holdY = createSnapHold()
-  return (
+  // 本帧吸上的线；反馈要等调用方算出钳位后的最终框才能发（`report`）
+  let pending: { guideXs: number[]; guideYs: number[]; x?: SnapPick; y?: SnapPick } | null = null
+  const snapper = (
     pos: Rect4,
     ev: { metaKey: boolean; ctrlKey: boolean },
   ): [number, number] => {
+    pending = null
     if (ev.metaKey || ev.ctrlKey) {
       holdX.x = holdY.y = null
       interaction().setSnap([], [])
@@ -1912,6 +1949,8 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
     const guideYs: number[] = []
     let sx = 0
     let sy = 0
+    let lineX: SnapPick | undefined
+    let lineY: SnapPick | undefined
     if (dir.includes('e') || dir.includes('w')) {
       const e: SnapEdge = dir.includes('e') ? 2 : 0
       const f = e === 2 ? pos[0] + pos[2] : pos[0]
@@ -1923,6 +1962,7 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
       )
       sx = r.dx / full.w
       guideXs.push(...r.guideXs)
+      lineX = r.x ?? undefined
     }
     if (dir.includes('n') || dir.includes('s')) {
       // position 是左下角原点：上沿 = y + h，下沿 = y；换成页面（top-origin）
@@ -1936,10 +1976,29 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
       )
       sy = r.dy / full.h
       guideYs.push(...r.guideYs)
+      lineY = r.y ?? undefined
     }
-    interaction().setSnap(guideXs, guideYs)
+    pending = { guideXs, guideYs, x: lineX, y: lineY }
     return [sx, sy]
   }
+  /** 发吸附线与反馈：`rect` = 调用方钳位后的最终子图框（position，左下角原点） */
+  snapper.report = (rect: Rect4) => {
+    if (!pending) return
+    const self = fracBoxToMm(panel, flipY(rect))
+    const fb: SnapFeedback[] = []
+    let { guideXs, guideYs } = pending
+    // 被钳位够不着的轴：吸附线与反馈都不发
+    if (pending.x) {
+      if (reached(self, 'x', pending.x.selfEdge, pending.x.line.v)) fb.push(feedbackFor('x', pending.x.line, self, panel.id))
+      else guideXs = []
+    }
+    if (pending.y) {
+      if (reached(self, 'y', pending.y.selfEdge, pending.y.line.v)) fb.push(feedbackFor('y', pending.y.line, self, panel.id))
+      else guideYs = []
+    }
+    interaction().setSnap(guideXs, guideYs, fb)
+  }
+  return snapper
 }
 
 /**
@@ -1952,25 +2011,33 @@ function axesResizeSnapper(panel: PanelObject, element: ManifestElement, dir: Re
  * 与画布层一样，按住 ⌘ / Ctrl 临时不吸。shift 锁成水平 / 垂直时只在仍在走的那个轴上吸；
  * 锁成 45° 时修正沿锁定方向投影——否则一吸就把锁拆了。
  */
-function inFigureSnapper(panel: PanelObject, moving: (gid: string) => boolean, selfKind?: SnapKind) {
+function inFigureSnapper(
+  panel: PanelObject,
+  moving: (gid: string) => boolean,
+  selfKind?: SnapKind,
+  clampToPanel = false,
+) {
   const prefs = snapPrefs()
   if (!prefs?.objects) return null
   const manifest = exactPanelManifest(useRenderStore.getState(), panel)
   if (!manifest) return null
   const own = inFigureSnapCandidates(panel, manifest, moving)
   if (!own) return null
-  const extra = crossAndGuideLines(panel, selfKind)
+  const extra = crossAndGuideLines(panel, selfKind, clampToPanel)
   const cands: SnapLineCandidates = { xs: [...own.xs, ...extra.xs], ys: [...own.ys, ...extra.ys] }
   // 配对过滤只在有跨图候选时才需要；多选整组（selfKind 缺省）没有跨图线，本图线全收
   const pair = selfKind ? crossFigurePair(selfKind, panel.id, cands.xs) : undefined
   const full = panelFullRect(panel)
   // 吸住后保持（ADR 0128 §一）：一次手势一份，手势结束随闭包丢弃
   const hold = createSnapHold()
-  return (
+  // 本帧吸上的线；反馈要等调用方算出钳位后的最终框才能发（`report`，与子图缩放手柄同一做法）
+  let pending: { guideXs: number[]; guideYs: number[]; x?: SnapPick; y?: SnapPick } | null = null
+  const snapper = (
     box: Rect4,
     ev: { metaKey: boolean; ctrlKey: boolean; shiftKey: boolean },
     locked: [number, number],
   ): [number, number] => {
+    pending = null
     if (ev.metaKey || ev.ctrlKey) {
       hold.x = hold.y = null
       interaction().setSnap([], [])
@@ -1979,6 +2046,16 @@ function inFigureSnapper(panel: PanelObject, moving: (gid: string) => boolean, s
     const snap = perfSpan('snap.compute', () =>
       snapMoveNearest(fracBoxToMm(panel, box), cands, snapTolMm(getTransform()), { hold, pair }),
     )
+    const report = (
+      guideXs: number[],
+      guideYs: number[],
+      useX: boolean,
+      useY: boolean,
+      out: [number, number],
+    ) => {
+      pending = { guideXs, guideYs, x: useX ? (snap.x ?? undefined) : undefined, y: useY ? (snap.y ?? undefined) : undefined }
+      return out
+    }
     const sx = snap.dx / full.w
     const sy = snap.dy / full.h
     if (ev.shiftKey && locked[0] !== 0 && locked[1] !== 0) {
@@ -1995,16 +2072,47 @@ function inFigureSnapper(panel: PanelObject, moving: (gid: string) => boolean, s
         interaction().setSnap([], [])
         return [0, 0]
       }
-      interaction().setSnap(useX ? snap.guideXs : [], useX ? [] : snap.guideYs)
-      return [k * locked[0], k * locked[1]]
+      return report(useX ? snap.guideXs : [], useX ? [] : snap.guideYs, useX, !useX, [
+        k * locked[0],
+        k * locked[1],
+      ])
     }
     const freeX = !ev.shiftKey || locked[0] !== 0
     const freeY = !ev.shiftKey || locked[1] !== 0
     if (!freeX) hold.x = null
     if (!freeY) hold.y = null
-    interaction().setSnap(freeX ? snap.guideXs : [], freeY ? snap.guideYs : [])
-    return [freeX ? sx : 0, freeY ? sy : 0]
+    return report(freeX ? snap.guideXs : [], freeY ? snap.guideYs : [], freeX, freeY, [
+      freeX ? sx : 0,
+      freeY ? sy : 0,
+    ])
   }
+  /** 发吸附线与反馈：`finalBox` = 调用方钳位后实际落下的框（内容分数、top-origin） */
+  snapper.report = (finalBox: Rect4) => {
+    if (!pending) return
+    const self = fracBoxToMm(panel, finalBox)
+    const fb: SnapFeedback[] = []
+    let { guideXs, guideYs } = pending
+    // 被钳位够不着的轴：吸附线与反馈都不发
+    if (pending.x) {
+      if (reached(self, 'x', pending.x.selfEdge, pending.x.line.v)) fb.push(feedbackFor('x', pending.x.line, self, panel.id))
+      else guideXs = []
+    }
+    if (pending.y) {
+      if (reached(self, 'y', pending.y.selfEdge, pending.y.line.v)) fb.push(feedbackFor('y', pending.y.line, self, panel.id))
+      else guideYs = []
+    }
+    interaction().setSnap(guideXs, guideYs, fb)
+  }
+  return snapper
+}
+
+/**
+ * 吸附是否真的落在了最终框上：框的 `edge`（0/1/2 = 左中右 / 上中下）沿 `axis` 的位置与线重合。
+ * 元素被钳在图内时位移已被钳位，够不着的线不能再画吸附线 / 反馈（Codex #1036）。
+ */
+function reached(self: Rect, axis: 'x' | 'y', edge: SnapEdge, v: number): boolean {
+  const at = axis === 'x' ? self.x + (self.w * edge) / 2 : self.y + (self.h * edge) / 2
+  return Math.abs(at - v) <= 1e-6
 }
 
 /** `gid` 是 roots 之一或其后代 */
@@ -2059,6 +2167,8 @@ export function axesMove(panel: PanelObject, element: ManifestElement): InFigure
   return {
     snapBox: flipY(start),
     snapKind: snapKindOf(element),
+    settle: (dfx, dfy) => netDelta(rectAt(dfx, dfy)),
+    clampedToPanel: true,
     // 随行元素一起动，不出线
     moving: underAny([element.gid, ...(element.follow_gids ?? []), ...companions.map((c) => c.gid)]),
     carryPreview: [],
@@ -2169,6 +2279,7 @@ export function startAxesDrag(
       }
     }
     last = rect
+    snapper?.report(rect)
     // 只给覆盖层线框：缩放要 matplotlib 重排（刻度、字号、图例都不会跟着线性缩放），
     // 假装缩放只会画出一张必然被纠正的图——线框如实表达「框会变成这么大」，
     // 成图由权威渲染说了算

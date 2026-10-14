@@ -133,13 +133,25 @@
   渲染回来后下一次手势起手自然拿到。**只在排版模式**：`workspaceStore.mode === 'fast_edit'`
   不跨图（别的图让开了）；**多选整组平移不跨图**（`InFigureMove.snapKind` 缺省 = 只吸本图与参考线，
   整组没有「同类」可言）。「吸附到参考线」开着时 `doc().guides` 进候选（kind 'guide'，所有自身边都可配）——
-  快速编辑里参考线照样画在画布上，所以也吸。**子图缩放手柄现在吸**（`interactions.axesResizeSnapper`）：
+  快速编辑里参考线照样画在画布上，所以也吸。**会被钳在图内的路径（子图 / 色条平移 `axesMove.clampedToPanel`、子图缩放手柄）的跨图线与参考线只留落在正在编辑的面板范围内的**；图例 / 标题 / 文字提交的是未钳位的锚点，够得着图外的参考线与相邻图的同类元素，不过滤（`crossAndGuideLines(…, clampToPanel)` 由调用方显式传，不按 kind 猜）（页面 mm，x 线在 `[x, x+w]`、y 线在 `[y, y+h]`，含边界；
+  `crossAndGuideLines` 末尾过滤）——元素被钳在图内，范围外的线够不着，吸附线与反馈不能指向它；本图候选不动。图内拖动的反馈
+  `self` 取**钳位后**实际落下的框（`InFigureMove.settle`，子图被钳在图边时 ≠ 未钳位的 box + 吸附位移；`inFigureSnapper.report` 与
+  子图缩放手柄同一做法，等调用方钳位后才发）。`report` 按轴再核一次：最终框上吸上的那条 selfEdge（左中右 / 上中下，页面 mm）与线距离 > 1e-6 mm（被钳位 / 最小尺寸挡住，
+  够不着）时，这一轴的吸附线与反馈都不发（`interactions.reached`；位移照常被钳位）。**子图缩放手柄现在吸**（`interactions.axesResizeSnapper`）：
   只吸正在动的那条边（角柄两条）：本图其他子图 / 色条的同一条边、整图四边（不要中线）、别的图子图的
   同一条边、参考线；复用同一把容差、吸住后保持（x / y 各一份 hold）与 ⌘ / Ctrl 临时不吸；吸附只改最终框，
   写法仍是一条 position；锁宽高比的缩放是 PR3，这里没有。
+  ⑨ **吸附反馈（ADR 0128 §四，PR4）**：`interactionStore.snapFeedback`（`SnapFeedback`：axis / v / self /
+  可选 target，页面 mm）与 `snapXs/snapYs` 同一次 `setSnap`（第三参）写、同一次 `end()` 清，值相同不触发；
+  构造唯一出处 `lib/snapFeedback.feedbackFor`：`self` = 被拖元素**吸附后**此刻的框（图内拖动；⇧ 锁向没被
+  采用的轴不给；子图缩放手柄 = 调用方钳位后的最终框，所以 `axesResizeSnapper.report(rect)` 要等钳位完才发），
+  `target` 仅当胜出线来自**别的面板**且是子图 / 色条 / 图例等元素（带 `rect`，出身不是 frame / figure /
+  page / guide / grid）时给对方框。⌘ / Ctrl、旋转面板没有反馈；快速编辑里自身反馈照常显示（本图线、参考线吸上时同样有用），只是没有跨图候选，所以不会有对方框；画布对象平移与非等比缩放、端点拖动
+  不给反馈（`setSnap` 不带第三参 = 清空）。绘制在 `OverlaySvg.SnapFeedbackMark`。
   看护：`lib/snapNearest.test.ts`（挑法 / 保持 / 不来回跳 / 类型推断）、
   `canvas/inFigureDrag.test.tsx`「图内拖动：吸住后保持」、`lib/crossFigureSnap.test.ts`（候选出线规则与配对）、
-  `canvas/crossFigureDrag.test.tsx`（集成：跨图 / 参考线 / 缩放手柄）、`e2e/cross-figure-align.spec.ts`
+  `canvas/crossFigureDrag.test.tsx`（集成：跨图 / 参考线 / 缩放手柄 / 吸附反馈）、
+  `store/interactionStore.test.ts`（反馈生命周期）、`canvas/overlayGrammar.test.tsx`（反馈绘制）、`canvas/snapFeedbackOrder.test.tsx`（反馈画在选中框之上、手柄之下——图内编辑态的反馈在 `ElementBoxes` 里画，主层只画画布对象的）、`e2e/cross-figure-align.spec.ts`
   （功能 `figure.cross-figure-align`）。
 - **等比缩放吸附**（ADR 0128 §三）：画布对象锁比例的角柄 / ⇧ 强制等比（含形状）缩放也吸。
   纯函数与候选 / 锚点构造唯一出处 `lib/scaleSnap.ts`，`startResizeDrag` 只接线。
@@ -160,8 +172,11 @@
   **开关**：页面线始终参与、参考线 / 网格各看自己的开关（与 `snapCandidates` 一致）；自身子图 / 色条锚点
   （`scaleAnchorsFor` 第三参）与对象类候选归「吸附到对象」，关掉时只剩外框锚点与页面 / 参考线 / 网格候选。
   别的图子图 / 色条的中线以 axes / colorbar 身份出线，与之重合的 `'other'` 线去掉（并列时不让 `'other'` 抢先）。
+  ⑧ **反馈**：`ScaleAnchor.rect` 带锚点所属元素在 s=1
+  的页面 mm 框（外框锚点 = 起手外框，子图 / 色条锚点 = 那个元素），吸上时 `self = scaledAnchorRect(anchor,
+  F, s)`——靠子图锚点是子图框、靠外框锚点是外框；`target` 同图内拖动的规则（别的图的子图 / 色条框）。
   看护：`lib/scaleSnap.test.ts`（挑法 / 档位 / 保持 / 最小尺寸 / 裁剪窗）、
-  `canvas/proportionalScaleSnap.test.tsx`（集成 + 平移候选不变）、`e2e/proportional-scale-snap.spec.ts`。
+  `canvas/proportionalScaleSnap.test.tsx`（集成 + 平移候选不变 + 吸附反馈的 self / target）、`e2e/proportional-scale-snap.spec.ts`。
 - **子图的随行元素跟着一切平移手势走**（2026-09-25，用户：挪过「(a)」再拖主图，标签
   有时不跟）：被手动摆过的后代（带 pos_frac / loc_frac / endpoints_frac）与 manifest
   点名的随行 axes（`follow_gids`：色条、孪生轴），单个子图拖动由 `axesCompanions` 带着走；
