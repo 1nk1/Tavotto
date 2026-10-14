@@ -3179,6 +3179,7 @@ interface ProjectScoped {
 }
 
 export type ServerEvent =
+  | ({ kind: 'render.preparing'; id: string } & ProjectScoped)
   | ({ kind: 'render.started'; id: string; cost?: string; cold?: boolean } & ProjectScoped)
   | ({ kind: 'render.done'; id: string; rev?: number } & ProjectScoped)
   | ({ kind: 'render.failed'; id: string; error?: string } & ProjectScoped)
@@ -3308,6 +3309,7 @@ export interface AiRefreshOutcome {
 }
 
 const EVENT_KINDS = [
+  'render.preparing',
   'render.started',
   'render.done',
   'render.failed',
