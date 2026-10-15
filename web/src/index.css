@@ -716,6 +716,19 @@
   outline-offset: 2px;
 }
 
+/* 内凹焦点环：同一根 2px accent，但画在元素边框内侧（offset -2px）。给密排的列表 / 树行用——行左右各让 4px、
+   上下贴着邻行，外扩的环会盖到邻行并触到抽屉边（2026-10 UI 审计 G1）。对 selected 底合成后仍 ≥3:1（tokenContrast.test）。 */
+@utility focus-ring-inset {
+  outline: 2px solid var(--color-accent);
+  outline-offset: -2px;
+}
+
+/* 被拖行的淡化：拖动期间留在原位的那一行压到 60%（隐藏项 45%、禁用 40% 之上）。HTML5 DnD 的拖影在 dragstart
+   那一刻已经截好，所以拖影是实色、原位这一行淡下去——一眼分得出「在拿的」和「放哪儿」（2026-10 UI 审计 G11）。 */
+@utility opacity-dragging {
+  opacity: 0.6;
+}
+
 /* 层级工具类：值在 :root 的 --z-*（见上），组件只写名字 */
 @utility z-sticky {
   z-index: var(--z-sticky);
