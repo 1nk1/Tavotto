@@ -11,6 +11,8 @@ mod crash_dump;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod drop_paths;
 mod exit_marker;
+#[cfg(target_os = "macos")]
+mod fullscreen_observer;
 mod i18n;
 #[cfg(target_os = "macos")]
 mod native_drop;
@@ -54,6 +56,8 @@ struct AppState {
     engine_gen: AtomicU64,
     /// `restart_engine` 正在进行（重复点击幂等）。
     restarting: AtomicBool,
+    /// 主窗口上一次告诉页面的全屏状态（macOS，见 `window_chrome::FULLSCREEN_EVENT`）。
+    fullscreen: window_chrome::FullscreenTracker,
     /// 本次启动带进来的交接请求（`Tavotto --open <目录> [--stem <s>]`）。
     /// 首启走这条：项目交给 sidecar 的 `--figures`，stem 拼进落地 URL 的
     /// `?open=`。**第二次启动不走这里**——单实例插件会把 argv 转发给已经在
@@ -1415,6 +1419,53 @@ fn current_engine_exit(
     Ok(kind.map(exit_marker::EngineExit::as_str))
 }
 
+/// 主窗口此刻是否全屏（回读，防事件早于前端监听）。只有 macOS 有意义——别处恒 `false`，
+/// 因为只有 macOS 的红绿灯会随全屏收起、页面才需要知道。
+#[tauri::command]
+fn current_fullscreen(window: tauri::WebviewWindow) -> Result<bool, String> {
+    only_main_window(&window)?;
+    // 回读的是去重底账（按阶段算：观察者在位时 did-enter 才置 true），**不是** `is_fullscreen()`——
+    // 后者在进入动画期间就已是切换目标 true，那时红绿灯还在屏上，收回占位会压上去。底账与事件
+    // 同一出处，页面拿到的初值与之后的事件也就不会对不上（否则第一次退出的 false 会被当「没变」吞掉）。
+    Ok(cfg!(target_os = "macos")
+        && window
+            .app_handle()
+            .try_state::<AppState>()
+            .is_some_and(|state| state.fullscreen.get()))
+}
+
+/// 告诉主窗口的页面全屏状态；`FullscreenTracker` 去重，真变了才发 `tavotto:fullscreen`。
+#[cfg(target_os = "macos")]
+fn announce_fullscreen(app: &tauri::AppHandle, now: bool) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    if state.fullscreen.update(now) {
+        let _ = app.emit_to(
+            MAIN_WINDOW,
+            window_chrome::FULLSCREEN_EVENT,
+            serde_json::json!({ "fullscreen": now }),
+        );
+    }
+}
+
+/// 原生全屏通知（`fullscreen_observer`）到了：按 `phase_verdict` 该发就发。
+#[cfg(target_os = "macos")]
+pub(crate) fn on_fullscreen_phase(app: &tauri::AppHandle, phase: window_chrome::FullscreenPhase) {
+    if let Some(now) = window_chrome::phase_verdict(phase) {
+        announce_fullscreen(app, now);
+    }
+}
+
+/// `Resized` 兜底：与 `is_fullscreen()` 对账（观察者在位时只许报 false，见 `resize_may_report`）。
+#[cfg(target_os = "macos")]
+fn reconcile_fullscreen(window: &tauri::Window) {
+    let now = window.is_fullscreen().unwrap_or(false);
+    if window_chrome::resize_may_report(fullscreen_observer::installed(), now) {
+        announce_fullscreen(window.app_handle(), now);
+    }
+}
+
 /// 重新启动本机引擎：关旧句柄 → 重新 `Sidecar::start`（端口记忆）→ 新 nonce → 导航。
 /// 只在引擎确已意外退出时才动手；重复点击 / 正在重启时直接返回 `false`（幂等）。
 #[tauri::command]
@@ -1666,6 +1717,7 @@ fn main() {
         engine_exit: Mutex::new(None),
         engine_gen: AtomicU64::new(0),
         restarting: AtomicBool::new(false),
+        fullscreen: window_chrome::FullscreenTracker::default(),
         open: parse_open_args(&std::env::args().skip(1).collect::<Vec<_>>()),
         // 真正的初值在 build_menu 里按配置目录读；这里先摆默认档，
         // 免得 set_menu_locale 把「和现在一样」误判成需要重建。
@@ -1716,6 +1768,7 @@ fn main() {
             set_titlebar_colors,
             take_previous_exit,
             current_engine_exit,
+            current_fullscreen,
             restart_engine,
             rescue::rescue_status,
             rescue::rescue_retry,
@@ -1726,6 +1779,16 @@ fn main() {
             rescue::rescue_diag_save
         ])
         .on_window_event(|window, event| {
+            // macOS 全屏：主信号是原生的 will / did 通知（`fullscreen_observer`），这里只做对账兜底；
+            // 主窗口没了就摘掉观察者。
+            #[cfg(target_os = "macos")]
+            if window.label() == MAIN_WINDOW {
+                match event {
+                    tauri::WindowEvent::Resized(_) => reconcile_fullscreen(window),
+                    tauri::WindowEvent::Destroyed => fullscreen_observer::remove(),
+                    _ => {}
+                }
+            }
             // 事件回调是全局的：只看有关窗询问闸的那两个窗口。
             if !guarded_window(window.label()) {
                 return;
@@ -1817,6 +1880,20 @@ fn main() {
             {
                 let drop_handle = handle.clone();
                 let _ = win.with_webview(move |pw| native_drop::install(pw.inner(), drop_handle));
+                // 全屏的原生信号（红绿灯回来之前就要恢复占位）；装不上则 Resized 兜底全权负责
+                if let Ok(ns_window) = win.ns_window() {
+                    fullscreen_observer::install(ns_window, handle.clone());
+                }
+                // 观察者没装上时，底账由 `Resized` 兜底维护：按此刻的真实状态起步（窗口状态插件可能已把它
+                // 恢复成全屏）。观察者在位时**不**按 `is_fullscreen()` 起步——那可能是进入动画中的切换目标，
+                // 红绿灯还在；宁可等 did-enter（最坏是全屏里多留 88px 空位，不会压住红绿灯）。
+                if !fullscreen_observer::installed() {
+                    if let Some(state) = handle.try_state::<AppState>() {
+                        state
+                            .fullscreen
+                            .update(win.is_fullscreen().unwrap_or(false));
+                    }
+                }
             }
             let _ = win.set_focus();
             spawn_e2e_update_if_requested(handle.clone());
