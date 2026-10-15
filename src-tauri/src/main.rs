@@ -10,6 +10,8 @@ mod crash_dump;
 // 分派只有 macOS 的 native_drop 在用；别的平台上它只剩单测（分派规则各平台一样，照样跑）
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod drop_paths;
+#[cfg(test)]
+mod exit_guard_tests;
 mod exit_marker;
 #[cfg(target_os = "macos")]
 mod fullscreen_observer;
@@ -1360,11 +1362,12 @@ fn spawn_engine_monitor(app: tauri::AppHandle) {
         if state.engine_gen.load(Ordering::SeqCst) != generation {
             return;
         }
-        let exit = match state.sidecar.lock().unwrap().as_ref() {
+        // 变量名不叫 `exit`：退出看护（exit_guard_tests）把任何末段是 exit 的路径都当出口
+        let polled = match state.sidecar.lock().unwrap().as_ref() {
             Some(sc) => sc.poll_exit(),
             None => return,
         };
-        if let Some(kind) = exit {
+        if let Some(kind) = polled {
             on_engine_exited(&app, kind);
             return;
         }
@@ -1502,9 +1505,26 @@ fn restart_engine_blocking(app: &tauri::AppHandle) -> bool {
     if let Some(sc) = old {
         sc.shutdown();
     }
+    // 按代次清持久化的 engine_exit（ADR 0129）：重启开始只**记下**当前代次、不清——重启期间用户正常退出，旧崩溃仍会被提示；
+    // 成功后只清「这一代」，成功分支跑完前新一代若又崩了（代次已变）就保留它。
+    // 内存里的 previous_exit 不动——它正是「先重启再发」的那张卡，由新页面取走
+    let generation = state.marker.get().map(|m| m.engine_exit_generation());
+    // 内存里的退出状态属于刚收掉的旧引擎：在新引擎（与它的监视线程）起来**之前**清。成功后再清会把
+    // boot_engine 返回前新引擎就报上来的退出一并抹掉，新页面读 current_engine_exit 拿到 None、没有修复卡
+    let previous = state.engine_exit.lock().unwrap().take();
     let ok = boot_engine(app, false);
+    if !ok {
+        // 重启失败：旧页面还在、修复卡要能再点（restart_engine 以 engine_exit 非空为前提）——写回旧状态；
+        // 这期间新引擎若已报了自己的退出，以新的为准
+        let mut cur = state.engine_exit.lock().unwrap();
+        if cur.is_none() {
+            *cur = previous;
+        }
+    }
     if ok {
-        *state.engine_exit.lock().unwrap() = None;
+        if let (Some(m), Some(g)) = (state.marker.get(), generation) {
+            m.clear_engine_exit_if(g);
+        }
     }
     ok
 }
@@ -1921,10 +1941,9 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// 退出标记的看护（ADR 0129）：**绕过 `RunEvent::Exit` 的退出路径必须先写 `clean`**，否则
-    /// 每次升级 / e2e 更新之后都会误报「上次没有正常退出」。这里读源码结构而不是搜子串：
-    /// 生产代码里（测试模块之前）不许出现裸 `process::exit` / `.exit(` / `.restart()` /
-    /// `.updater_builder()`——只能经 `e2e_exit` / `mark_clean_exit` / `updater_builder` 三个出口。
+    /// 退出标记的看护（ADR 0129）：**绕过 `RunEvent::Exit` 的退出路径必须先写 `clean`**。
+    /// 「全部生产模块里只有允许名单上的出口」由 `exit_guard_tests.rs` 用 AST 扫描钉住；
+    /// 这里只钉 `main.rs` 里那几个出口函数**内部**的先后顺序。
     fn production_sources() -> Vec<(&'static str, String)> {
         let cut = |s: &'static str| {
             let end = s.find("#[cfg(test)]\nmod tests").unwrap_or(s.len());
@@ -1951,29 +1970,7 @@ mod tests {
 
     #[test]
     fn every_exit_that_skips_run_event_exit_writes_clean_first() {
-        let srcs = production_sources();
-        let main = &srcs[0].1;
-        for (name, src) in &srcs {
-            let allowed = if *name == "main.rs" { 1 } else { 0 };
-            // 注释里提到不算：只数代码行
-            let code = |needle: &str| {
-                src.lines()
-                    .filter(|l| !l.trim_start().starts_with("//"))
-                    .filter(|l| l.contains(needle))
-                    .count()
-            };
-            assert_eq!(code("process::exit("), allowed, "{name}: 裸 process::exit");
-            assert_eq!(
-                code(".updater_builder()"),
-                allowed,
-                "{name}: 裸 updater_builder"
-            );
-            assert_eq!(
-                code("app_handle.exit(") + code("handle.exit(") + code("app.exit("),
-                0,
-                "{name}: 裸 exit"
-            );
-        }
+        let main = &production_sources()[0].1;
         // 唯一的 process::exit 在 e2e_exit 里，且先写 clean
         let e2e = body_of(main, "fn e2e_exit(");
         assert!(e2e.find("mark_clean_exit(").unwrap() < e2e.find("process::exit(").unwrap());
@@ -1986,6 +1983,20 @@ mod tests {
         assert_eq!(restart_sites, 1, "新增了 restart() 调用：先加看护再放行");
         let at = main.find("handle.restart()").unwrap();
         assert!(main[..at].rfind("mark_clean_exit(&handle)").unwrap() + 80 > at);
+        // 允许名单里 rescue.rs 的那一处 restart（原生救援页「重新尝试」，ADR 0130）：同一函数里 mark_clean_exit 在 restart 之前
+        let rescue = &production_sources()
+            .into_iter()
+            .find(|(n, _)| *n == "rescue.rs")
+            .expect("rescue.rs")
+            .1;
+        let retry = body_of(rescue, "fn rescue_retry(");
+        assert_eq!(retry.matches(".restart()").count(), 1);
+        assert!(
+            retry
+                .find("crate::mark_clean_exit(")
+                .expect("rescue_retry 要先写 clean")
+                < retry.find(".restart()").unwrap()
+        );
         // 所有 UpdaterBuilder 都经助手
         assert!(!main.contains("|| handle.updater_builder()"));
         assert!(!main.contains("|| app.updater_builder()"));
@@ -2038,6 +2049,54 @@ mod tests {
             main.matches("app_update::run_install_expecting(").count(),
             1
         );
+    }
+
+    #[test]
+    fn engine_restart_clears_the_persisted_kind_by_generation_only_after_success() {
+        let main = &production_sources()[0].1;
+        let body = body_of(main, "fn restart_engine_blocking(");
+        let gen_at = body
+            .find("engine_exit_generation()")
+            .expect("重启开始要记代次");
+        let boot = body.find("boot_engine(").expect("boot_engine");
+        assert!(gen_at < boot, "代次在新 sidecar / 监视线程起来之前记下");
+        let ok = body.find("if ok {").expect("成功分支");
+        assert!(ok > boot, "清除只在成功分支");
+        assert_eq!(
+            body.matches("clear_engine_exit_if(").count(),
+            1,
+            "只允许成功分支里一处按代次清"
+        );
+        assert!(
+            body[ok..].contains("clear_engine_exit_if("),
+            "成功后按代次清"
+        );
+        // 内存里旧引擎的退出状态：恰好一处、在 boot_engine 之前清（成功后再清会抹掉新引擎的退出，#1070 r4280305203）
+        let mem_take = "state.engine_exit.lock().unwrap().take()";
+        assert_eq!(body.matches(mem_take).count(), 1, "内存退出状态只取走一处");
+        assert!(
+            body.find(mem_take).unwrap() < boot,
+            "内存退出状态要在 boot_engine 之前取走"
+        );
+        assert!(
+            !body.contains("engine_exit.lock().unwrap() = None"),
+            "不许无条件清内存退出状态"
+        );
+        // 重启失败要写回（修复卡还得能再点，#1070 r4280349114），且不覆盖新引擎已报的退出
+        let fail = body.find("if !ok {").expect("失败分支");
+        assert!(fail > boot);
+        let fail_body = &body[fail..fail + body[fail..].find("\n    }\n").expect("失败分支结尾")];
+        assert!(
+            fail_body.contains("cur.is_none()") && fail_body.contains("*cur = previous"),
+            "失败分支写回旧退出状态"
+        );
+        for banned in [
+            "take_engine_exit",
+            "restore_engine_exit",
+            "clear_engine_exit(",
+        ] {
+            assert!(!body.contains(banned), "{banned}：不能提前清或无条件清");
+        }
     }
 
     #[test]

@@ -42,7 +42,7 @@
   意外退出写标记、发 `tavotto:engine-exited`、`current_engine_exit` 回读；`restart_engine`（仅主窗口，远程窗口**无**）与首启共用 `boot_engine`
   （新 nonce，`AppState.port` 可变）。`app_config_dir()/session-state.json` 只含版本 / 时间 / running|clean / 退出类型闭集，不上传；
   `take_previous_exit` 取走即清空。**绕过 `RunEvent::Exit` 的退出路径必须先写 clean**：`std::process::exit` 只许经 `e2e_exit`，
-  `UpdaterBuilder` 只许经 `updater_builder()`（`on_before_exit`）——`main.rs` 的结构测试钉着，新增退出路径先加看护。
+  `UpdaterBuilder` 只许经 `updater_builder()`（`on_before_exit`）——`exit_guard_tests.rs` 用 syn 扫 `src/` 全部生产 `.rs` 的 AST（不做 `use` 别名解析：`use` 里出现 std 的 process 段或导入 exit 即 hit，任何末段是 exit 的路径也是 hit；宏体遍历 TokenTree 只看 Ident；`use` 按叶子逐个 hit；允许名单列到具体叶子,与实际命中按多重集精确相等），`main.rs` 的结构测试钉出口函数内部先写 clean 的顺序；新增退出路径先加看护。
 - **原生救援页**（ADR 0130，`src/rescue.rs` + `src/shell_report.rs` + `shell/error.html`）：sidecar 起不来时由壳自己检查修复版本、重新尝试、发送最小启动诊断。
   四条别改坏：① **只在「从未进入编辑态」时可用**——`RescueState.entered` 在 `boot_engine` 导航到应用页**之前**置位、永不复位，置位后七条 `rescue_*` 命令一律拒绝
   （`editing_state_unknown`），不靠超时推断干净；② **只许主窗口的壳自带 `error.html` 调用**（`rescue::decide` 查 label + 当前 URL，ACL 之外再查一道）；
