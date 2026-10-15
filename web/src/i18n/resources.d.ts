@@ -236,9 +236,7 @@ export default interface Resources {
     },
     "export": {
       "blockedTitle": "有阻断问题或无法核验的项。勾选确认后才能导出。",
-      "blockingGroupCount": "{{count}} 项",
       "blockingListLabel": "阻断性问题",
-      "blockingMore_other": "还有 {{count}} 条，在问题面板中查看",
       "cancelExport": "取消导出",
       "cancelFailed": "尚未确认取消，导出可能仍在继续。{{error}}",
       "cancelNotAccepted": "服务器未接受取消请求。请先检查导出状态和输出文件夹，再重试。",
@@ -250,6 +248,11 @@ export default interface Resources {
       "checkLabel": "检查",
       "checkScopeCanvas": "整个画布",
       "checkScopeFigure": "仅此图",
+      "checksMore_other": "还有 {{count}} 项 · 在问题面板中查看全部",
+      "chipError_other": "项要改",
+      "chipNotVerifiable_other": "项无法核验",
+      "chipSuggestion_other": "条建议",
+      "chipWarn_other": "项留意",
       "confirmBoth": "知悉上述 {{errors}} 条阻断问题与 {{notVerifiable}} 类无法核验的项，仍要导出",
       "confirmCheckFailed": "预检没完成，我已自行确认此图可以导出。",
       "confirmErrors": "知悉上述 {{errors}} 条阻断问题，仍要导出",
@@ -367,7 +370,6 @@ export default interface Resources {
         "source_stale": "这张图的源文件现在找不到了，暂时只能按画布导出。",
         "unknown_figure": "找不到这张图的信息，暂时只能按画布导出。"
       },
-      "severityCount": "{{count}} {{label}}",
       "showInFolder": "在文件夹中显示",
       "sizeDiskDiffers": "磁盘上的原文件为 {{dw}} × {{dh}} mm（脚本保存时已裁边），将按图幅 {{w}} × {{h}} mm 导出。",
       "sizeUnknownShort": "尺寸未知",
@@ -1165,8 +1167,7 @@ export default interface Resources {
       "summary": {
         "editable": "可编辑",
         "layoutOnly": "仅版面",
-        "pending": "待连接",
-        "total": "总计"
+        "pending": "待连接"
       },
       "title": "项目接入状态",
       "useScript": "用 {{script}}",
@@ -3021,6 +3022,7 @@ export default interface Resources {
       "none": "未发现问题",
       "noneEvidenceMulti_other": "按 {{specCount}} 套规范（{{specs}}）检查了 {{count}} 张图 · {{when}}",
       "noneEvidence_other": "按「{{spec}}」检查了 {{count}} 张图 · {{when}}",
+      "noneInCanvas": "画布「{{name}}」上没有问题",
       "noneInFilter": "当前筛选下没有问题",
       "noneInScope": "这张图上没有问题",
       "noneInScopeHint_other": "整份排版里还有 {{count}} 项问题。",
@@ -3035,6 +3037,9 @@ export default interface Resources {
       "rechecking": "正在重新检查…",
       "retry": "重新检查",
       "running": "正在检查…",
+      "scopeCanvas": "当前画布",
+      "scopeCanvasNamed": "画布「{{name}}」",
+      "scopeCanvasTip": "只看画布「{{name}}」的问题",
       "scopeCountAria": "{{label}}（{{count}} 项）",
       "scopeDocument": "整份排版",
       "scopeFigure": "当前图",
@@ -3780,7 +3785,7 @@ export default interface Resources {
       "transformCase": "转换大小写"
     },
     "identity": {
-      "problems_other": "{{count}} 个问题"
+      "problemsLabel_other": "个问题"
     },
     "kindSwitch": {
       "aria": "类型：{{name}}，点击更改",
