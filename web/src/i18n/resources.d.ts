@@ -380,8 +380,15 @@ export default interface Resources {
       "targetNoFigure": "当前没有图",
       "tiffHint": "位图 · 无损压缩",
       "title": "导出",
+      "toast": {
+        "conflict": "导出停在这里，等你决定同名文件怎么处理。",
+        "failed": "导出失败，没有写出文件。",
+        "partial": "导出只完成了一部分，有文件没能写出。",
+        "unknown": "找不到这次导出的作业，文件可能已写出。"
+      },
       "transparent": "透明背景（仅 PNG / TIFF）",
       "transparentNotForRaster": "这张图是照原样导出的，背景由它自己决定。",
+      "viewResult": "查看",
       "warningsIntro": "以下修改未能应用到重渲染的图上，成图可能与画布不一致："
     },
     "layout": {
@@ -5089,6 +5096,8 @@ export default interface Resources {
         "errorTruncated": "太长，只保留了最后一部分。",
         "installTo": "装到",
         "installs": "将安装",
+        "nativeFallback": "安全模式拦下了脚本的文件操作，已自动换成按真实文件运行。",
+        "nativeFallbackNoWriteback": "安全模式拦下了脚本的文件操作，已自动换成按真实文件运行。这样出的图，改动不会写回脚本。",
         "noFigureWhy": "没有调用 savefig，也没留下 Figure。",
         "parseKind": "参数问题",
         "parseKinds": {
@@ -5243,6 +5252,7 @@ export default interface Resources {
         "pending": "待准备",
         "pendingMany_other": "{{count}} 个绘图脚本待准备"
       },
+      "progress": "进行中",
       "rasterHint": {
         "line": "这个脚本是用 {{library}} 直接画成图片的，不是 Matplotlib 图",
         "why": "可以把它生成的图片文件加进来排版；想逐个元素编辑，需要改成用 Matplotlib 画。"
@@ -5448,6 +5458,7 @@ export default interface Resources {
         "cancelled": "已取消检查",
         "choose_target_other": "发现 {{count}} 个绘图脚本",
         "failed": "检查没有完成",
+        "lost": "没能读到检查进度",
         "nothing_found": "项目里还没有图和脚本",
         "scanning": "正在检查项目…",
         "static_source": "没有发现脚本，图可以直接排版",
