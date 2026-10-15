@@ -48,6 +48,7 @@
 from __future__ import annotations
 
 import argparse
+import filecmp
 import hashlib
 import json
 import os
@@ -314,6 +315,107 @@ def check_runtime_dir(
             "再把 packaging/runtime-lock.json 里该目标改成 shipped=true。"
         )
     return info
+
+
+def runtime_source_dir(repo_root: Path) -> Path:
+    """这次打包收的是哪一份 runtime：`TAVOTTO_RUNTIME_SRC` 覆盖，否则仓库根的 `runtime/`。
+
+    packaging/tavotto.spec（收进包）与 scripts/build_desktop.py（打包后逐字节核对）共用这一处——
+    两边各解析一次的话，覆盖了却核对了另一份，闸就空转了。相对路径的覆盖一律锚定到 `repo_root`
+    （而不是调用方此刻的 cwd）：PyInstaller 子进程在仓库根下跑，核对那一侧在哪儿起都得指向同一份。
+    """
+    override = os.environ.get("TAVOTTO_RUNTIME_SRC")
+    if not override:
+        return Path(repo_root) / "runtime"
+    p = Path(override)
+    return p if p.is_absolute() else Path(repo_root) / p
+
+
+def diff_collected_runtime(src: Path, dst: Path) -> list[str]:
+    """打包后的 runtime（`dst`）与构建时冒烟过的那一份（`src`）逐字节比，返回不一致的相对路径。
+
+    判据的主语是**发出去的字节**：spec 那一侧写对了不算数，要看 PyInstaller 真产出了什么——
+    哪天打包器又在别处改判 / 改写 / 重签，这里以「某个文件字节变了」直接报出来。
+    目标里**多出来**的文件同样算不一致（成员也要相同，不只是已有文件的字节）。
+
+    盲点：这里只看 `dst` 这棵树；runtime 的依赖被复制到它**外面**（`_internal/` 顶层）这一种，
+    由 spec 里的 `runtime_toc_problems()` 按 TOC 的来源路径拦。
+
+    符号链接三种落地形态都按内容判：保留为链接 → 目标字符串相同；拍平成文件（Tree / Tauri）→
+    与链接解析到的源文件逐字节相同；指向目录的链接被拍平成目录 → 下面每个文件逐字节比、也计入成员。
+    """
+    src, dst = Path(src), Path(dst)
+    bad: set[str] = set()
+    files: dict[str, str] = {}  # 相对路径 → 源文件（经链接解析后读的就是它的字节）
+    links: dict[str, str] = {}  # 相对路径 → 源链接的目标字符串
+    # followlinks=True：按「拍平之后」的样子枚举——与 Tree 跟随目录链接的行为一致
+    for dirpath, dirnames, filenames in os.walk(src, followlinks=True):
+        for name in dirnames + filenames:
+            s = os.path.join(dirpath, name)
+            rel = os.path.relpath(s, src)
+            if os.path.islink(s):
+                links[rel] = os.readlink(s)
+            if name in filenames and os.path.isfile(s):
+                files[rel] = s
+    for rel, target in links.items():
+        d = os.path.join(dst, rel)
+        if not os.path.lexists(d):
+            bad.add(f"{rel}（缺）")
+        elif os.path.islink(d) and os.readlink(d) != target:
+            bad.add(f"{rel}（链接目标不同）")
+    for rel, s in files.items():
+        d = os.path.join(dst, rel)
+        if not os.path.isfile(d):
+            bad.add(f"{rel}（缺）")
+        elif not filecmp.cmp(s, d, shallow=False):
+            bad.add(f"{rel}（字节不同）")
+    for dirpath, dirnames, filenames in os.walk(dst):
+        for name in dirnames + filenames:
+            d = os.path.join(dirpath, name)
+            rel = os.path.relpath(d, dst)
+            if os.path.islink(d):
+                if rel not in links:
+                    bad.add(f"{rel}（多出）")
+            elif name in filenames and rel not in files:
+                bad.add(f"{rel}（多出）")
+    return sorted(bad)
+
+
+def _is_under(path: str, root: str, pathmod=os.path) -> bool:
+    """`path` 是否在 `root` 之下（含相等）。不同盘符（Windows runner：仓库在 D:，打包 Python 在 C:）
+    时 `commonpath` 抛 ValueError——那当然不在 root 之下，不能让它把整个 spec 打崩。大小写不必另外
+    normcase：`commonpath` 按平台规则比较，返回的是第一个参数（root）的原样拼写。"""
+    try:
+        return pathmod.commonpath([root, path]) == root
+    except ValueError:
+        return False
+
+
+def runtime_toc_problems(toc, runtime_root: Path, prefix: str = "runtime") -> list[str]:
+    """PyInstaller 的 TOC 里，来源在 runtime 下的条目只许原样落进 `<prefix>/`、typecode=DATA。
+
+    packaging/tavotto.spec 在 Analysis 之后、COLLECT 之前对 `a.binaries + a.datas` 跑它。主语是
+    **TOC 条目的来源路径**：被依赖分析复制到 `_internal/` 顶层的 openblas / gfortran / tcl 副本，
+    来源正是 runtime 里的 `.dylibs/` 等（v0.18.0 macOS ≈ 48 MB），它们的落点在 `diff_collected_runtime()`
+    比对的那棵树外面、按名字又与冻结层自己的同名库（libcrypto 等）分不开，按来源判才分得开。
+    """
+    root = os.path.realpath(runtime_root)
+    bad: list[str] = []
+    for entry in toc:
+        dest, src, typecode = entry[0], entry[1], entry[2]
+        if typecode == "SYMLINK" or not src:
+            continue
+        real = os.path.realpath(src)
+        if not _is_under(real, root):
+            continue
+        parts = Path(dest).parts
+        if not parts or parts[0] != prefix:
+            bad.append(
+                f"{dest} ← {os.path.relpath(real, root)}（runtime 的文件落到了 {prefix}/ 外面）"
+            )
+        elif typecode != "DATA":
+            bad.append(f"{dest}（typecode={typecode}，会被改写）")
+    return sorted(bad)
 
 
 def pth_lines(stdlib_zip: str) -> list[str]:
