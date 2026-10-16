@@ -4808,7 +4808,6 @@ export default interface Resources {
       "noEditableTitle": "画布上还没有可编辑的图",
       "noMatch": "没有匹配的元素",
       "noPanelTitle": "选择一张可编辑的图以查看图内元素",
-      "openAssets": "打开素材",
       "readonly": "只读",
       "rowActions": "{{label}} 的操作",
       "rowAria": "{{label}}（{{role}}）",
