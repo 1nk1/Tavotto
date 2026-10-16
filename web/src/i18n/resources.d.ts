@@ -322,6 +322,7 @@ export default interface Resources {
       "openProblems": "在问题面板中查看",
       "operationFailed": "无法完成：{{error}}",
       "outputFailed": "无法导出 {{format}}：{{reason}}",
+      "partialSummary": "已保存 {{ok}} 个，{{failed}} 个失败",
       "pdfHint": "矢量",
       "phase": {
         "cancelled": "已取消",
@@ -378,6 +379,7 @@ export default interface Resources {
       "strictTitle": "按所选规范重新打开写好的文件核对；不合格或无法核验的文件不会保存。EPS 不核验。",
       "strictToggle": "严格核验产物",
       "targetNoFigure": "当前没有图",
+      "thumbNote": "缩略图仅为示意 · 非最终文件",
       "tiffHint": "位图 · 无损压缩",
       "title": "导出",
       "toast": {
