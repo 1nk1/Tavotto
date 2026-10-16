@@ -249,7 +249,7 @@ function ReadinessBody() {
   const probe = (script: string) => {
     if (preparationPanelEnabled()) {
       useProjectReadinessStore.getState().closeCenter()
-      void useProjectPreparationStore.getState().open(scriptTarget(script))
+      void useProjectPreparationStore.getState().open(scriptTarget(script, { reuse: true }), { run: true })
       return
     }
     void run(script, async () => {
