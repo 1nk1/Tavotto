@@ -7864,8 +7864,9 @@ def _session_target(ctx: "ProjectCtx", body: dict):
         "original_artifact": None,
         "original_path": None,
         **({"run": run} if run is not None else {}),
-        # P07：桌面拥有的 native（保留真文件语义、输入由界面作答）。省略 = safe，会话与计划逐字节不变
-        **({"execution": execution} if execution == engine_execspec.PROFILE_NATIVE else {}),
+        # P07：桌面拥有的 native（保留真文件语义、输入由界面作答）。显式 safe / native 原样带进目标（V2 PR2：显式 safe 不许被运行前路由覆盖）；
+        # 请求省略 = 让路由挑，显式写成 `auto` 带进目标（引擎层省略仍是 safe，与 main 相同）
+        "execution": execution if execution is not None else engine_preparation.EXECUTION_AUTO,
     }, None
 
 
@@ -7963,7 +7964,7 @@ def _finalize_script_attempt(ctx: "ProjectCtx", plan, result) -> dict:
     engine_launchctx.record_success(
         ctx.path,
         plan.script,
-        None if captured.get("failed_figures") else getattr(result, "receipt", None),
+        engine_launchctx.basis_of(result, plan, bool(captured.get("failed_figures"))),
         run=run,
         update_default=True,
     )
