@@ -5195,6 +5195,25 @@ def api_handoff_render_status():
     return jsonify(engine_handoffreceipt.query(project, stem, since))
 
 
+@app.post("/api/handoff/display-ack")
+def api_handoff_display_ack():
+    """重复交接命中已显示面板时，前端回一条「这张图当前的渲染状态」（ADR 0131 第六节修订 2026-10-18）。
+
+    只有会话 cookie / 完整 secret 能写（guard 的 scoped 只读 token 只认 GET render-status）；
+    结论按**当前时间**记进 `LEDGER`，键与形状同 `_note_handoff_render`，`verified` 仍由 `summarize` 判。
+    """
+    ack = engine_handoffreceipt.parse_ack(request.get_json(silent=True))
+    stem = _handoff_target_stem(ack["id"]) if ack else ""
+    if ack is None or not stem:
+        return jsonify({"error": "参数无效", "code": "bad_handoff_ack"}), 400
+    try:
+        registry_match = bool(current_registry().for_stem(stem))
+    except Exception:  # noqa: BLE001 —— 结论表是旁路，查不到注册表按不匹配（verified=false）
+        registry_match = False
+    engine_handoffreceipt.record_ack(current_ctx().path, stem, ack, registry_match=registry_match)
+    return jsonify({"ok": True})
+
+
 @app.post("/api/engine/render")
 def api_engine_render():
     """应用全量 override 列表并重渲染，返回新 manifest 与版本号。
@@ -5255,7 +5274,7 @@ def api_engine_render():
         worker, stem = _engine_worker(rel_id, **_artifact_kwargs(artifact_source))
         # 取会话的时间不在 worker 的 timings/build 里，单独保留原有计时。
         get_ms = round((time.perf_counter() - t_get) * 1000, 3)
-        info = current_registry().for_stem(Path(stem).stem) or {}
+        info = current_registry().for_stem(stem) or {}
         cold = not worker.built
     except Exception as exc:
         # worker 启动 / 环境解析失败（WorkerError）也是「那一次渲染」的失败结论：
@@ -5285,7 +5304,7 @@ def api_engine_render():
         )
     except engine_pool.WorkerError as exc:
         LOG.error("引擎渲染失败: %s: %s", stem, exc)
-        _note_handoff_render(Path(stem).stem, code=exc.code)
+        _note_handoff_render(stem, code=exc.code)
         # 按新改指表 build 过、只是图名变了（stems 由数据决定，`unknown_stem`）：注册表按这次 build 的真实
         # 产出重新登记，新图在素材库里出现（ADR 0106 §五）
         # 一张都没出（`unknown_stem` 被换成 `no_figures_captured*`）同样是按新表跑出的权威结果：旧 stems 要摘掉
@@ -5331,7 +5350,7 @@ def api_engine_render():
         raise
     sse_publish("render.done", {"pj": pj, "id": rel_id, "rev": worker.rev})
     _note_handoff_render(
-        Path(stem).stem,
+        stem,
         registry_match=bool(info),
         manifest_elements=len((resp.get("manifest") or {}).get("elements") or []),
     )
