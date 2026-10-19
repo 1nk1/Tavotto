@@ -15,6 +15,7 @@ on:
     paths:
       - '.github/workflows/compat-guardian.yml'
       - 'scripts/ci/compat_guardian*.py'
+      - 'scripts/ci/compat_explore*.py'
       - 'scripts/ci/guardian_exec_observer.py'
       - 'scripts/ci/compat_driver.py'
       - 'scripts/ci/compat_corpus.py'
@@ -28,6 +29,7 @@ on:
       - 'tests/support/compat_v2_scenarios.py'
       - 'tests/support/compatbench_v2.py'
       - 'tests/test_compat_guardian*.py'
+      - 'tests/test_compat_explore*.py'
       - 'tests/compat_guardian/**'
       - 'docs/ci/compat-guardian.md'
   workflow_dispatch:
@@ -77,7 +79,7 @@ jobs:
           python scripts/fetch_fonts.py
           python scripts/fetch_fonts.py --check
       - name: Guardian contract tests
-        run: python -m pytest -p no:cacheprovider -q tests/test_compat_guardian*.py
+        run: python -m pytest -p no:cacheprovider -q tests/test_compat_guardian*.py tests/test_compat_explore.py
       - name: Guardian engine suite (reviewed fixtures)
         timeout-minutes: 8
         shell: bash

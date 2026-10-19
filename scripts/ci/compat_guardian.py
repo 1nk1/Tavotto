@@ -1248,6 +1248,14 @@ def not_implemented(name: str) -> int:
     return EXIT_USAGE
 
 
+def positive_int(text: str) -> int:
+    """argparse type: a count of one or more (0 and negatives select nothing, never 'all')."""
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be a positive integer, got {value}")
+    return value
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     subs = ap.add_subparsers(dest="command", required=True)
@@ -1267,8 +1275,22 @@ def main(argv=None) -> int:
     promoter.add_argument("report")
     promoter.add_argument("--case", required=True)
     promoter.add_argument("--out", required=True)
-    for name in ("explore", "triage", "minimize"):
+    explorer = subs.add_parser(
+        "explore", help="derive candidates from reviewed parents and run them"
+    )
+    explorer.add_argument("--seed", type=int, required=True)
+    explorer.add_argument("--out", required=True)
+    explorer.add_argument(
+        "--limit", type=positive_int, help="family-balanced cap on executed candidates"
+    )
+    explorer.add_argument("--parent", help="comma-separated parent case ids")
+    explorer.add_argument("--static-only", action="store_true")
+    explorer.add_argument("--expected-sha")
+    explorer.add_argument("--timeout", type=float, default=240)
+    for name in ("triage", "minimize"):
         subs.add_parser(name, help="not implemented in CG-01")
+    hidden = subs.add_parser("_explore_execute", help=argparse.SUPPRESS)
+    hidden.add_argument("request")
     private = subs.add_parser("_execute", help=argparse.SUPPRESS)
     private.add_argument("request")
     args = ap.parse_args(argv)
@@ -1277,8 +1299,18 @@ def main(argv=None) -> int:
             if not math.isfinite(args.timeout) or args.timeout <= 0:
                 raise EvidenceError("timeout must be positive")
             return run(args)
-        if args.command in ("explore", "triage", "minimize"):
+        if args.command in ("triage", "minimize"):
             return not_implemented(args.command)
+        if args.command == "explore":
+            import compat_explore
+
+            if not math.isfinite(args.timeout) or args.timeout <= 0:
+                raise EvidenceError("timeout must be positive")
+            return compat_explore.explore(args)
+        if args.command == "_explore_execute":
+            import compat_explore
+
+            return compat_explore.private_main(args.request)
         if args.command == "summarize":
             summary = SM.summarize([SM.load_report(Path(r)) for r in args.reports])
             markdown = SM.render_markdown(summary)
