@@ -5137,6 +5137,7 @@ export default interface Resources {
         "argsReused_other": "沿用上次成功的 {{count}} 个参数",
         "errorFull": "完整错误信息",
         "errorTruncated": "太长，只保留了最后一部分。",
+        "failedFigures": "没画出来的图：{{names}}（{{codes}}）。其余的图可以照常编辑。",
         "history": {
           "attempt": "第 {{n}} 次",
           "declined": {
@@ -5226,6 +5227,7 @@ export default interface Resources {
         "checkFailed": "没能开始检查",
         "checking": "正在检查…",
         "completedNoList": "跑完了，图在素材库",
+        "completedPartial": "只画好了 {{done}}/{{total}} 张图，{{names}} 没画出来",
         "completed_other": "画好了 {{count}} 张图",
         "depsCancelled": "安装已停止",
         "depsFailed": "没装好，原有文件没动",
@@ -5339,6 +5341,7 @@ export default interface Resources {
       "row": {
         "attention": "需要处理",
         "cancelled": "已停止",
+        "capturedPartial": "只捕获 {{done}}/{{total}} 张图",
         "captured_other": "已捕获 {{count}} 张图",
         "checking": "检查中",
         "input": "等你回答",
