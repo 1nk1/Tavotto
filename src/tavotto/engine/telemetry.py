@@ -191,21 +191,13 @@ EVENTS: dict[str, dict[str, dict]] = {
     # 教程：只有步骤 id（开发者写死的闭集，`web/src/lib/onboarding/stepIds.ts`）
     # 与流程版本号；教程项目 / 文档 id、提示记录一个都不发。
     "tutorial_started": {
-        "source": _enum("picker", "help", "settings", "palette", "canvas"),
+        "source": _enum("picker", "help", "settings", "palette", "canvas", "replay"),
         "tutorial_version": _int(1000),
     },
     "tutorial_step_completed": {
-        "step_id": _enum(
-            "open_fast_edit",
-            "select_text",
-            "change_typography",
-            "locate_problem",
-            "export_original",
-            "add_to_layout",
-            "multi_select_align",
-            "export_canvas",
-            "done",
-        ),
+        # 2026-10-19（ADR 0136）：三步原生教程；v2 的八个 coachmark 步骤只在代理侧作为
+        # LEGACY 收（已发布的旧客户端还会发），客户端不再发
+        "step_id": _enum("demo_import", "demo_move_legend", "demo_change_title", "done"),
         "tutorial_version": _int(1000),
     },
     "tutorial_completed": {"tutorial_version": _int(1000)},
