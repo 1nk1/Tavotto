@@ -10,7 +10,20 @@ import sys
 
 import pytest
 
-from tavotto.engine import patchspec, pool, runtime, workerd_client
+from tavotto.engine import executionfact, patchspec, pool, runtime, workerd_client
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pending_retirements(monkeypatch):
+    """未确认的退役登记是进程级全局（`MAX_ALIVE` 条就拒绝一切冷启动）：用例之间不许漏到别的文件。"""
+    monkeypatch.setattr(pool, "_pending_retirements", {})
+
+
+def _command_payload(payload):
+    """Check the request-bound observation token separately from command semantics."""
+    payload = dict(payload)
+    assert executionfact.valid_watch(payload.pop("execution_watch"))
+    return payload
 
 
 # ------------------------------ 选路 ------------------------------
@@ -444,8 +457,12 @@ def test_the_pool_method_names_map_to_the_v1_command_names(monkeypatch, tmp_path
     ops = [op for op, _ in client.calls]
     assert ops == ["open_session", "build", "render", "render_png", "preview_png"]
     payloads = {op: kw["payload"] for op, kw in client.calls}
-    assert payloads["render_png"] == {"width": 800}
-    assert payloads["preview_png"] == {"patches": [], "width": 400, "tag": "hist3"}
+    assert _command_payload(payloads["render_png"]) == {"width": 800}
+    assert _command_payload(payloads["preview_png"]) == {
+        "patches": [],
+        "width": 400,
+        "tag": "hist3",
+    }
     assert w.rev == 1  # render 之后前端缓存穿透用的版本 +1
 
 
@@ -467,7 +484,11 @@ def test_png_snapshot_preserves_the_edit_ledger(monkeypatch, tmp_path, edited):
     assert w.built
     assert (w.rev, w.last_patch_hash_by_stem) == before
     assert result["png"] == "cG5n" and result["manifest"] == {"elements": []}
-    assert client.calls[-1][1]["payload"] == {"patches": [], "width": 800, "with_manifest": True}
+    assert _command_payload(client.calls[-1][1]["payload"]) == {
+        "patches": [],
+        "width": 800,
+        "with_manifest": True,
+    }
 
 
 def test_the_cache_layout_is_identical_to_the_python_pool(monkeypatch, tmp_path):
@@ -642,6 +663,7 @@ def test_explicit_invalidation_fences_acquisition_until_workerd_force_close(monk
 
 
 def test_explicit_invalidation_refuses_an_unconfirmed_supervisor_close(monkeypatch, tmp_path):
+    monkeypatch.setattr(pool, "_pending_retirements", {})
     worker, _client = _worker(
         monkeypatch,
         tmp_path,
@@ -656,6 +678,8 @@ def test_explicit_invalidation_refuses_an_unconfirmed_supervisor_close(monkeypat
         pool.invalidate("fig.py", str(tmp_path), force=True)
     assert caught.value.code == "session_dead"
     assert pool._workers[key] is worker  # Retry must still be able to retire the old session.
+    assert pool._pending_retirements[key] == [worker]
+    assert pool.is_fenced(worker)
 
 
 def _unconfirmed_close():

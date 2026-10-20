@@ -1,7 +1,7 @@
 import { ArtifactValidationError, validationFromSource, type ArtifactRequestFields } from '@/lib/artifactValidation'
 import { apiUrl, apiUrlFor, currentProjectId, withProject, withProjectFor } from '@/lib/session'
 import { formatMessage, i18n, literal, msg, t, type UiMessage } from '@/i18n'
-import type { FigureDocument, ProjectDocument } from '@/types/document'
+import type { FigureDocument, FigureSnapshot, ProjectDocument } from '@/types/document'
 import type { ManifestFrame } from '@/lib/figureFrame'
 import type { PreviewMetadata } from '@/lib/previewBudget'
 import type { ScriptArgsSchema } from '@/lib/scriptArgsForm'
@@ -852,6 +852,10 @@ export async function fetchLayout(name: string): Promise<FetchedLayout> {
 }
 
 export interface SavedLayout {
+  /** Layout saved, but these exact source edits have no durable SVG snapshot. */
+  svg_snapshot_warnings?: string[]
+  /** Complete verified snapshot map for candidate panel object IDs; absent means old backend. */
+  figure_snapshots?: Record<string, FigureSnapshot>
   ok: boolean
   revision: string | null
   /** 落盘的文件名（去掉 `.json`，经后端净化）；旧后端不给 */
@@ -921,6 +925,10 @@ export const REVISION_ABSENT = 'absent'
  * `owner_unknown` = 这次请求的项目身份已失效，归属没记。旧后端不发 = `undefined`（不知道，不当 `ok`）。
  */
 export interface PutAutosaveResult {
+  /** Nonblocking source snapshot warnings; the layout body was saved successfully. */
+  svg_snapshot_warnings?: string[]
+  /** Complete verified snapshot map for candidate panel object IDs; absent means old backend. */
+  figure_snapshots?: Record<string, FigureSnapshot>
   ok: boolean
   saved_at: number
   revision: string | null
@@ -1668,6 +1676,7 @@ interface ExportBox {
 export type ExportObject =
   | (ExportBox & ArtifactRequestFields & {
       type: 'panel'
+      figure_snapshot?: FigureSnapshot
       id: string
       overrides?: { gid: string; prop: string; value: unknown }[]
       /** 0–1 归一化、top-origin，与 PanelObject.crop 同构，原样直传 */
@@ -1754,6 +1763,7 @@ export interface ExportRequest {
   /** `scope=original`：那一张图自己。**没有 x/y/w/h，也没有页面尺寸** */
   original?: ArtifactRequestFields & {
     figure_id: string
+    figure_snapshot?: FigureSnapshot
     overrides?: { gid: string; prop: string; value: unknown }[]
     w_mm?: number | null
     h_mm?: number | null
@@ -2450,6 +2460,7 @@ export interface Manifest {
 }
 
 export interface EngineRenderResponse {
+  figure_snapshot_invalidation?: FigureSnapshotInvalidation
   artifact_source?: unknown
   /** 无 source_policy 的 PNG 渲染：产物未与已存字节核对（#1145，只标记不拒绝） */
   source_unverified?: { reason: string; kind: string }
@@ -2498,6 +2509,7 @@ export interface EngineRenderResponse {
 }
 
 export class EngineError extends Error {
+  figureSnapshotInvalidation?: FigureSnapshotInvalidation
   params?: Record<string, unknown>
   retryable?: boolean
   traceback: string
@@ -2549,6 +2561,7 @@ export class EngineError extends Error {
     projectEnv?: ProjectEnvFailure,
     dependencyRepair?: DependencyRepairOffer,
     extra?: {
+      figureSnapshotInvalidation?: FigureSnapshotInvalidation
       params?: Record<string, unknown>
       retryable?: boolean
       installRoute?: string
@@ -2559,6 +2572,7 @@ export class EngineError extends Error {
     },
   ) {
     super(message)
+    this.figureSnapshotInvalidation = extra?.figureSnapshotInvalidation
     this.params = extra?.params
     this.retryable = extra?.retryable
     this.installRoute = extra?.installRoute
@@ -2645,6 +2659,7 @@ export async function engineRender(
       body.project_env as ProjectEnvFailure | undefined,
       body.dependency_repair as DependencyRepairOffer | undefined,
       {
+        figureSnapshotInvalidation: body.figure_snapshot_invalidation as FigureSnapshotInvalidation | undefined,
         params: body.params as Record<string, unknown> | undefined,
         retryable: body.retryable as boolean | undefined,
         installRoute: body.install_route as string | undefined,
@@ -3408,6 +3423,7 @@ interface ProjectScoped {
 }
 
 export type ServerEvent =
+  | ({ kind: 'figure.snapshot_invalidated'; pj: string } & FigureSnapshotInvalidation)
   | ({ kind: 'render.preparing'; id: string } & ProjectScoped)
   | ({ kind: 'render.started'; id: string; cost?: string; cold?: boolean } & ProjectScoped)
   | ({ kind: 'render.done'; id: string; rev?: number } & ProjectScoped)
@@ -3551,6 +3567,7 @@ export interface AiRefreshOutcome {
 }
 
 const EVENT_KINDS = [
+  'figure.snapshot_invalidated',
   'render.preparing',
   'render.started',
   'render.done',
@@ -5362,6 +5379,16 @@ export const scanRegistry = () =>
     scripts: Record<string, RegistryEntry>
   }>('/api/registry/scan', { method: 'POST' })
 
+/** Backend-witnessed execution retires this owner's previous output set, even on partial failure. */
+export interface FigureSnapshotInvalidation {
+  scope: 'owner' | 'sources'
+  script: string
+  run_config: string | null
+  source_ids: string[]
+  receipt_ids?: string[]
+  execution_id: string
+}
+
 /** 一张捕获 Figure 的结构化描述（`engine/figcapture.py` 的唯一实现，原样透传） */
 export interface CapturedFigureDescriptor {
   asset_id: string
@@ -5427,6 +5454,7 @@ export interface ProbeError {
 }
 
 export interface ProbeResult {
+  figure_snapshot_invalidation?: FigureSnapshotInvalidation
   script: string
   entry: string | null
   stems: string[]
@@ -5733,6 +5761,7 @@ export type PreparationAttemptRecord = PreparationAttempt
 
 /** 会话报告（`SessionService.report`）：前端只保存这份投影，不另算「能不能跑」 */
 export interface PreparationReport {
+  figure_snapshot_invalidation?: FigureSnapshotInvalidation
   session_version: number
   session_id: string
   project_id: string
@@ -6179,6 +6208,7 @@ export interface NativePending {
 
 /** 一条 native 会话对外的全部状态（`NativeSession.public_state()` 原样）。 */
 export interface NativeSessionInfo {
+  figure_snapshot_invalidation?: FigureSnapshotInvalidation
   session_id: string
   project_root: string
   interpreter: string
@@ -6226,6 +6256,7 @@ export interface NativePendingInput {
 
 /** 一次 build 的结果：stems + 描述符 + （如实报的）冲突。 */
 export interface NativeBuildResult {
+  figure_snapshot_invalidation?: FigureSnapshotInvalidation
   session: NativeSessionInfo
   stems: Record<string, unknown>
   descriptors: CapturedFigureDescriptor[]
@@ -6255,7 +6286,7 @@ export const fetchNativePending = (nativeId: string) =>
  * （「请求体不能替换 invocation」由后端用例看护）。
  */
 export const approveNativePending = (nativeId: string, remember: boolean) =>
-  jsonFetch<{ session: NativeSessionInfo }>(
+  jsonFetch<{ session: NativeSessionInfo; pj?: string | null }>(
     `/api/native/pending/${encodeURIComponent(nativeId)}/approve`,
     {
       method: 'POST',

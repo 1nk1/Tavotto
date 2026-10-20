@@ -135,6 +135,8 @@
     "sizeUnknownShort": "size unknown",
     "start": "Export",
     "targetNoFigure": "No current figure",
+    "svgHint": "Vector · text outlines by default",
+    "svgNote": "SVG uses text outlines by default, so text won’t remain editable in Office. Unsupported sources are reported as export failures.",
     "thumbNote": "Thumbnail is a sketch · not the final file",
     "tiffHint": "Raster · lossless",
     "title": "Export",
