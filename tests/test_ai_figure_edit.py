@@ -210,6 +210,44 @@ def test_nonzero_exit_discards_the_copy(env):
     assert ai_history.get(sid)["error"] == "agent_exit_nonzero"
 
 
+def test_begin_registered_failure_closes_the_registered_row_and_spawns_nothing(env, monkeypatch):
+    """#1232：登记行已写、`begin_registered` 抛——行当场收成 failed（带真实原因），不 spawn，运行表里不留任务。"""
+    ai_bridge.reset_spawn_mark()
+    spawned = []
+    real_popen = ai_bridge._popen
+    monkeypatch.setattr(
+        ai_bridge, "_popen", lambda *a, **k: spawned.append(a) or real_popen(*a, **k)
+    )
+
+    def boom(task_id, envelope, **kw):
+        raise RuntimeError("begin boom")
+
+    monkeypatch.setattr(ai_tasks, "begin_registered", boom)
+    with pytest.raises(RuntimeError, match="begin boom"):
+        _run(env)
+    assert spawned == []
+    assert ai_tasks._RUNNING == {}
+    (row,) = ai_history.list_sessions(str(env["figs"].resolve()))["sessions"]
+    assert row["status"] == "failed" and "begin boom" in row["error"] and row["ended_ms"]
+    assert not ai_bridge.spawn_started()
+    assert _project_text(env) == SCRIPT
+
+
+def test_spawn_failure_after_begin_registered_leaves_no_running_task(env, monkeypatch):
+    """`begin_registered` 已挂上、spawn 抛：运行表里的任务一并摘下（否则 cancel 永远对着一个不会跑的任务返回 True）。"""
+    ai_bridge.reset_spawn_mark()
+
+    def no_spawn(*a, **k):
+        raise OSError("no spawn")
+
+    monkeypatch.setattr(ai_bridge, "_popen", no_spawn)
+    with pytest.raises(OSError):
+        _run(env)
+    assert ai_tasks._RUNNING == {}
+    (row,) = ai_history.list_sessions(str(env["figs"].resolve()))["sessions"]
+    assert row["status"] == "failed"
+
+
 def test_cancel_while_running_commits_nothing_and_frees_the_script(env):
     env["code"] = EDIT + "; time.sleep(30)"
     sid, _ = _run(env)
