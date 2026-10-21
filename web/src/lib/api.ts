@@ -3446,6 +3446,7 @@ interface ProjectScoped {
 export type ServerEvent =
   | ({ kind: 'figure.snapshot_invalidated'; pj: string } & FigureSnapshotInvalidation)
   | ({ kind: 'render.preparing'; id: string } & ProjectScoped)
+  | ({ kind: 'render.progress'; id: string } & ProjectScoped)
   | ({ kind: 'render.started'; id: string; cost?: string; cold?: boolean } & ProjectScoped)
   | ({ kind: 'render.done'; id: string; rev?: number } & ProjectScoped)
   | ({ kind: 'render.failed'; id: string; error?: string } & ProjectScoped)
@@ -3601,6 +3602,7 @@ export interface AiRefreshOutcome {
 const EVENT_KINDS = [
   'figure.snapshot_invalidated',
   'render.preparing',
+  'render.progress',
   'render.started',
   'render.done',
   'render.failed',

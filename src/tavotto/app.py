@@ -3250,6 +3250,22 @@ def sse_publish(event: str, data: dict) -> None:
             pass
 
 
+@contextlib.contextmanager
+def _relay_build_progress(worker, pj: str, rel_id: str):
+    """这条渲染请求在等 build 的期间，把引擎的「日志仍在增长」转成 `render.progress`（#1207）。
+
+    前端看门狗按它续期。**等锁的重试也在这里登记**：build 线程扇出给所有订阅者，
+    所以排在同一把 `w.lock` 后面的请求同样收得到，不会因为自己没出声而再超时一次。
+    事件只带 pj + id（与 `render.preparing` 同一种关联）——build 是文件级的，没有变体维度。
+    """
+    progress = getattr(worker, "progress", None)
+    if progress is None:  # 测试替身 / 没有进度通道的 worker
+        yield
+        return
+    with progress.listen(lambda: sse_publish("render.progress", {"pj": pj, "id": rel_id})):
+        yield
+
+
 #: 此刻连着的、声明能答脚本 `input()` 的事件流（ADR 0099 §五）：流 id → 它**此刻**在看的项目 id（还没说 = None）。
 #: 只有主界面带 `answers=1`；它是同一条 `/api/events` 的查询参数，认证与普通事件流完全相同（ADR 0008），不是新通道。
 #: **按项目认**：界面开着 A 时，B 的后台 / MCP 渲染问到 input 必须立即 `script_needs_input`——A 的界面按 `pj`
@@ -6499,13 +6515,30 @@ def _origin_display(worker, context):
 
 
 def _engine_attempt(
-    rel_id: str, worker, stem: str, action, *, safe_only: bool = False, artifact_source=None
+    rel_id: str,
+    worker,
+    stem: str,
+    action,
+    *,
+    safe_only: bool = False,
+    artifact_source=None,
+    progress_pj: str | None = None,
 ):
-    """Run on the admitted source; a dependency retry carries the identical context."""
+    """Run on the admitted source; a dependency retry carries the identical context.
+
+    `progress_pj` 给了（画布渲染，#1207）就在**整次尝试**——admission + action——外登记
+    build 进度监听：带 artifact_source 的冷渲染，build 恰恰发生在 `_admit_artifact` 里。
+    换环境重试拿到的新 worker 在下一轮循环里重新登记。其它调用方没有 SSE 关联键，不传。
+    """
     for attempt in range(2):
         try:
-            _admit_artifact(worker, stem, artifact_source)
-            result = action(worker, stem)
+            with (
+                _relay_build_progress(worker, progress_pj, rel_id)
+                if progress_pj is not None
+                else contextlib.nullcontext()
+            ):
+                _admit_artifact(worker, stem, artifact_source)
+                result = action(worker, stem)
             _assert_artifact_current(artifact_source)
             execution = _svg_execution_result(worker)
             if isinstance(result, dict):
@@ -6839,6 +6872,7 @@ def api_engine_render():
                 st, body.get("patches", []), preview_dpi, inline_svg=inline_svg
             ),
             artifact_source=artifact_source,
+            progress_pj=pj,
         )
     except engine_pool.WorkerError as exc:
         LOG.error("引擎渲染失败: %s: %s", stem, exc)
