@@ -150,6 +150,10 @@ function canValidateOriginalSource(figureId: string, panel?: PanelObject | null)
  * * `canvas_scope`：画布合成走 RenderCore（PDF / PNG / TIFF），给不出 EPS；
  * * `no_script`：这张图在注册表里没有脚本（runtime 素材天生有），引擎没法重画。
  *
+ * 前端只判「有没有脚本」这一条；SVG 素材的 EPS 另需后端的字节绑定证明（`_produce_svg_asset_eps`，#1185），
+ * 前端拿不到这个事实，**不预先禁用**——后端逐项失败并给真实原因（`eps_source_unverified` /
+ * `eps_needs_live_figure`），界面显示逐项失败。
+ *
  * 与后端 `_serialize_figure()` 的前提逐条对应：runtime id 放行，磁盘面板看
  * 素材清单里的 `script`（那正是「注册表声明了映射没有」）。**不可用时不隐藏
  * 选项、不静默丢掉它**：禁用并说原因，发出去的请求里也不带它。
