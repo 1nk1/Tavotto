@@ -161,7 +161,24 @@
   **启动清理 `mark_interrupted_running` 只标属主已死的行**，不碰共用同一数据目录的另一个仍活着的服务进程里的会话。spawn 失败仍保留 `failed` 记录（同 rid 去重到它，明确没执行；前端换新 id 重发）。看护 `tests/test_ai_drafts.py`。
   **读路径也收尾属主已死的 open 行**（#1113 的一半）：`api_ai_history?status=open` 与 `ai_bridge.get()` 先调 `ai_history.reap_dead_owners`
   （与启动清理共用 `_close_dead_owner_rows`；先无写锁探测，有死属主才 `_immediate` 持锁重读；**读路径不收本进程 pid 的行**——
-  `record_start` 与进 `SESSIONS` 之间隔着一次 Popen）。跨进程取消仍未做：别的进程里的会话，本进程 `cancel` 仍回 `False`。看护 `tests/test_ai_owner_reap.py`。
+  `record_start` 与进 `SESSIONS` 之间隔着一次 Popen）。看护 `tests/test_ai_owner_reap.py`。
+  **跨进程取消（#1113 主体，`tests/test_ai_cross_process_cancel.py`）= 持久取消意图 + 属主执行，B 从不对 A 的子进程发信号**（pid / pgid 会被复用，
+  不能按 pid 杀）。`sessions` 追加五列（`_ADDED_COLUMNS`，看列在不在，不建库、不动 `user_version`，老行全 NULL）：`owner_token`（`ai_history.OWNER_TOKEN`，
+  进程启动随机生成、只在内存；`record_start` 登记本进程会话时写入，替别的进程登记不冒充）、`owner_beat_ms`、`cancel_requested_ms`、`cancel_token`
+  （写意图时观察到的 owner_token）、`cancel_result`（`ok` / `refused_committing` / `gone` / `owner_gone`）。`POST /api/ai/sessions/<sid>/cancel` 现在**按请求者的项目隔离**
+  （不属于当前项目的会话一律回 `{ok:false,reason:"not_found"}`，与不存在的 sid 同一个回答）；响应 `{ok, mode?, reason?}`：`ok` 含义不变（取消请求被接受），
+  `mode: "local"` = 已在本进程终止，`mode: "owner"` = 已转交持有它的另一个服务进程（≤ `OWNER_TICK_S`，终态以会话详情的 `final` 为准；详情多一个 `cancel_requested`）。
+  `ai_bridge.cancel_detailed(sid, project)`：在 `SESSIONS` 里 → 原 `_cancel_local`（先问 `ai_tasks.cancel`，进入提交后不接受——`ai_tasks` 仍是唯一权威）；不在 →
+  `ai_history.request_cancel`，**一个 `_immediate` 事务**读-判-写：属主已死（pid 不在 / **心跳过期**）→ 不写意图、就地走 `_close_dead_owner_rows` 收尾（`reason: owner_gone`）；
+  老行无 token 且属主活着 → `owner_unsupported`（对方不会轮询，写了只会悬挂）；`phase='committing'` → `committing`；已有意图 → 幂等不重写；否则
+  `UPDATE … WHERE owner_token=<先前观察到的>` 做 **CAS**（pid 复用的新属主 / 换代的行不被写，回 `stale`）。属主侧：`ai_bridge.run` 在登记之前 `ensure_owner_loop()`，
+  守护线程 `ai-owner-loop` 每 `OWNER_TICK_S`（2 s）调 `ai_history.owner_tick()`——对本进程 token 名下 open 行写 `owner_beat_ms`（无 open 行不拿写锁），并收取
+  **`cancel_token` 等于本进程 token** 的意图，走进程内同一条 `_cancel_local`，结果记 `cancel_result`。**属主死活只有一个判据 `ai_history.row_owner_alive`**
+  （忙碌判定 / 启动清理 / 读路径收尾 / `final` 共用）：pid 存活，且（有 token+beat 的行）心跳不超过 `OWNER_BEAT_DEAD_MS`（10 分钟，只兜 pid 复用：复用 pid 的新进程不会续心跳）；无 token / 无 beat 的老行按原语义
+  （pid + 24 h）。**两个阈值分开**：`request_cancel` 另看 `OWNER_BEAT_STALE_MS`（30 s，tick 的 15 倍）——属主活着但心跳超过它 = `owner_unresponsive`（`ok:false`），不写会悬挂的意图、
+  **不收尾、不改行**：高负载下心跳线程被饿住很常见，此时 pid 活着、CLI 可能仍在写脚本，不能把行收成终态。**登记与入内存之间的窗口**：`record_start` 提交之后、`SESSIONS[sid]` 放进去之前（隔着 Popen / `begin_registered`），别的进程已能写意图——tick 遇到"属本进程 token、仍 running、不在 `SESSIONS`"**不消费意图**（不写 `cancel_result`），`run()` 放进内存后立刻 `_execute_cancel_intent`（与 tick 同一函数；`_INTENT_LOCK` 只护"重查 + 标记执行中"，**取消在锁外做**——`_terminate` 会 spawn 子进程（Windows 的 taskkill 是一次 Popen），持锁取消会被任何重入自锁；重入 / 并发的第二个入口被 `_INTENT_RUNNING` 挡住，锁序 `_REQUEST_LOCK` → `_INTENT_LOCK`）补查一次；spawn 失败 / 会话自己先收尾时意图随终态记 `failed` / `finished`。属主死亡时尚未执行的意图：收尾把 `running` 行转 `cancelled`（用户要的是取消）而不是 `interrupted`。
+  **盲区**：pid 复用后最长 `OWNER_BEAT_DEAD_MS` 内仍按活着算（忙碌判定会多挡一阵）；属主真卡死而 pid 活着时，行一直开到判死线；这两条与启动清理一样只改状态、不杀孤儿 CLI。
+  取消延迟最坏 ≈ `OWNER_TICK_S`。
 - 会话历史在 `engine/ai_history.py`（SQLite `cache/ai_history.sqlite3`，
   按 project 列过滤）；启动时 running→interrupted + purge(180d，pinned 豁免)；
   历史 API：list（分页/搜索/筛选）/delete/pin。前端默认只显示人类可读目标，
