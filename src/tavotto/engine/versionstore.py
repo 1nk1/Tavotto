@@ -1,9 +1,9 @@
-"""版本时间线的新存储：每版一个自描述信封文件 + 一份小索引（ADR 0140，**尚未接线**）。
+"""版本时间线的新存储：每版一个自描述信封文件 + 一份小索引（ADR 0140）。
 
-现行存储（`app._load_versions` / `_save_versions`）把一份文档的全部历史放在一个
+旧存储（`app._load_versions` / `_save_versions`）把一份文档的全部历史放在一个
 `<doc_id>.json` 里，追加 = 读整份 → 追加 → 裁 → 整写（issue #263）。本模块是它的
-替身：追加只写**一个信封 + 22 KB 左右的索引**，与历史长度无关。D1a 只交付模块与测试，
-`app.py` 不调用它，现有行为一字不变。
+替身：追加只写**一个信封 + 22 KB 左右的索引**，与历史长度无关。D1b 起 `app.py` 经
+`_Timeline` 读写它（读兼容新旧；写入走哪边见 `app.VERSIONS_WRITE_NEW`）。
 
 布局（`versions_dir` 是 `…/versions/`，与旧文件、`thumbs/` 同级）::
 
@@ -50,15 +50,16 @@ STORE_SUFFIX = ".vx"
 #: 所以进来的每个 id 都过这一道，不合形状的拒收——绝不拼出越界路径。
 VERSION_ID_RE = re.compile(r"^v[0-9a-f]+-[0-9a-f]+$")
 
-# ---- 现行裁剪策略的镜像（D1 保持语义逐字不变；换存储与调策略分开评审，ADR 0140 §六）----
-#: 与 `app.VERSION_KEEP_AUTO` / `VERSION_KEEP_TOTAL` / `VERSION_KEEP_BYTES` / `VERSION_MOMENTS`
-#: 严格同源。D1b 接线时 app 侧改为消费这里，此刻两份靠 `test_constants_mirror_app` 与
-#: `test_legacy_policy_matches_save_versions` 对拍。
+# ---- 现行裁剪策略（D1/D2 保持语义逐字不变；换存储与调策略分开评审，ADR 0140 §六）----
+#: **这里是唯一出处。** `app.VERSION_KEEP_AUTO` / `VERSION_KEEP_TOTAL` / `VERSION_KEEP_BYTES` /
+#: `VERSION_MOMENTS` / `_VERSION_ID_RE` 只是对这些对象的别名（测试按 `is` 钉死，
+#: `tests/test_versionstore.py::test_app_constants_are_aliases_of_the_single_source`），
+#: 旧单文件与新存储共用同一份策略与判据。
 KEEP_AUTO = 60
 KEEP_TOTAL = 120
 KEEP_BYTES = 24 * 1024 * 1024
 MOMENTS = frozenset({"export", "writeback", "open", "close", "before_restore", "save"})
-_DEFAULT_NAME = re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}$")
+DEFAULT_NAME = re.compile(r"^\d{2}-\d{2} \d{2}:\d{2}$")
 
 #: 一次裁剪策略：`(索引条目列表, 受护 id) -> 保留的条目列表`（保持顺序）。
 Policy = Callable[[list[dict], "str | None"], list[dict]]
@@ -203,27 +204,46 @@ def has_store(versions_dir: Path, doc_id: str) -> bool:
     """新存储是否已是这份文档的权威（读侧据此决定读哪边）。
 
     索引在 → 是；索引不在但有信封、且**没有未完成的迁移记录** → 是（索引丢了，重建）；
-    其余（含「迁移进行中被打断」）→ 否，旧文件仍是权威。"""
+    其余（含「迁移进行中被打断」）→ 否，旧文件仍是权威。
+
+    **三态：确定没有 / 确定有 / 判不了。** 判不了（权限变化、网络文件系统的瞬时 I/O 错误……
+    `.vx` 在而读不了）抛 `IndexUnreadable`——绝不折成「没有」：折成「没有」调用方就会退回
+    旧格式写，`.vx` 恢复后新存储重新成为权威，刚确认的检查点就消失了。"""
     root = store_dir(versions_dir, doc_id)
-    if _index_path(root).exists():
+    if _exists(_index_path(root)):
         return True
     if _migration_pending(root):
         return False
     return _has_envelopes(root)
 
 
+def _exists(path: Path) -> bool:
+    """确定有 / 确定没有；其余错误（`PermissionError` 等）= 判不了 → `IndexUnreadable`。"""
+    try:
+        os.stat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as exc:
+        raise IndexUnreadable(str(exc)) from exc
+    return True
+
+
 def _has_envelopes(root: Path) -> bool:
     try:
-        return any((root / ENVELOPE_DIR).glob("*.json"))
-    except OSError:
+        return any(n.endswith(".json") for n in os.listdir(root / ENVELOPE_DIR))
+    except (FileNotFoundError, NotADirectoryError):
         return False
+    except OSError as exc:
+        raise IndexUnreadable(str(exc)) from exc
 
 
 def _migration_record(root: Path) -> dict | None:
     try:
         rec = json.loads((root / MIGRATION_NAME).read_bytes())
-    except (OSError, ValueError):
+    except (FileNotFoundError, NotADirectoryError, ValueError):
         return None
+    except OSError as exc:  # 记录在而读不了：判不了「迁移是否进行中」，不当作没有
+        raise IndexUnreadable(str(exc)) from exc
     return rec if isinstance(rec, dict) else None
 
 
@@ -378,7 +398,54 @@ def read(versions_dir: Path, doc_id: str, vid: str) -> dict | None:
     head, rest = _parse_envelope(raw, what=vid)
     if meta.get("_doc_sha") != head["doc_sha"]:
         raise EnvelopeCorrupt(f"信封与索引不符: {vid}")
-    return {**head["entry"], "doc": documents.loads_document(rest)}
+    # 元信息的权威在索引（改名先写信封、后写索引，两步之间被杀时信封头比索引新）
+    return {**public_entry(meta), "doc": documents.loads_document(rest)}
+
+
+def read_all(versions_dir: Path, doc_id: str) -> tuple[dict, list[dict]] | None:
+    """整条时间线（含 `doc`）一次读出：`(索引, [旧条目形状…])`；没有新存储返回 `None`。
+
+    只读、不要求持锁。坏信封只赔掉自己：那一条没有 `doc`（`{}`），带 `_damaged: True`，
+    其余照常。信封缺失可能只是和别的进程的裁剪赛跑（索引已换、信封刚删），所以缺失时
+    重读一次索引再试，仍缺才算坏。"""
+    root = store_dir(versions_dir, doc_id)
+    for attempt in (0, 1):
+        idx = _load_index(root, 0, write=False)
+        if idx is None:
+            return None
+        out: list[dict] = []
+        raced = False
+        for meta in idx["entries"]:
+            vid = meta.get("id")
+            entry = public_entry(meta)
+            try:
+                # 按索引的 _gen 读生效的那一代
+                head, rest = _parse_envelope(_meta_path(root, meta).read_bytes(), what=vid)
+                if meta.get("_doc_sha") != head["doc_sha"]:
+                    raise EnvelopeCorrupt(vid)
+                out.append({**entry, "doc": documents.loads_document(rest)})
+            except FileNotFoundError:
+                raced = True
+                out.append({**entry, "doc": {}, "_damaged": True})
+            except (EnvelopeCorrupt, ValueError, VersionStoreError):
+                out.append({**entry, "doc": {}, "_damaged": True})
+        if not raced or attempt:
+            return idx, out
+    raise AssertionError("unreachable")
+
+
+def legacy_size_with_entry(meta: dict, new_entry: dict) -> int:
+    """`meta` 这一版把条目换成 `new_entry` 之后在旧文件里占的字节（正文不变）。"""
+    return (
+        meta["_legacy_bytes"]
+        - len(atomicio.dumps_json(public_entry(meta)))
+        + len(atomicio.dumps_json(new_entry))
+    )
+
+
+def legacy_file_size(metas: list[dict]) -> int:
+    """这些条目按旧文件算法拼出来的文件字节数（外壳 + 分隔符 + 每条）。"""
+    return 14 + 2 + sum(m["_legacy_bytes"] for m in metas) + 2 * max(len(metas) - 1, 0)
 
 
 # ---------------------------------------------------------------- 写
@@ -391,9 +458,16 @@ def _commit(
     dropped: Iterable[dict],
     now: int,
     stale: Iterable[Path] = (),
+    out_index: dict | None = None,
 ) -> None:
-    """先写索引（提交点），后删被裁的信封与被取代的旧一代。"""
-    _write_index(root, {**idx, "entries": kept}, now)
+    """先写索引（提交点），后删被裁的信封与被取代的旧一代。
+
+    `out_index` 给了就把刚提交的索引放进去：调用方不必为了拿到它再读一次盘
+    （写已经持久化之后的额外读取失败，不该让请求报错）。"""
+    written = _write_index(root, {**idx, "entries": kept}, now)
+    if out_index is not None:
+        out_index.clear()
+        out_index.update(written)
     _checkpoint("after_index")
     for path in [*(_meta_path(root, m) for m in dropped), *stale]:
         try:
@@ -418,6 +492,7 @@ def append(
     now: int,
     policy: Policy | None = None,
     keep_id: str | None = None,
+    out_index: dict | None = None,
 ) -> dict:
     """追加一版（`version` 是旧条目形状，含 `doc`）。返回新条目的公开形状（无 `doc`）。
 
@@ -443,7 +518,9 @@ def append(
     metas = [*idx["entries"], meta]
     kept = _apply_policy(metas, policy, keep_id)
     kept_ids = {m["id"] for m in kept}
-    _commit(root, idx, kept, [m for m in metas if m["id"] not in kept_ids], now)
+    _commit(
+        root, idx, kept, [m for m in metas if m["id"] not in kept_ids], now, out_index=out_index
+    )
     return public_entry(meta)
 
 
@@ -460,6 +537,7 @@ def update(
     now: int,
     remove: Iterable[str] = (),
     policy: Policy | None = None,
+    out_index: dict | None = None,
 ) -> dict | None:
     """改名 / 改说明 / 转正等元信息改动：`changes` 并入条目，`remove` 里的键删掉。
 
@@ -475,7 +553,11 @@ def update(
         return None
     old = idx["entries"][pos]
     old_path = _meta_path(root, old)
-    head, rest = _parse_envelope(old_path.read_bytes(), what=vid)
+    try:
+        raw_old = old_path.read_bytes()
+    except FileNotFoundError as exc:  # 索引有、信封没了：与 `read()` 一致，只赔这一条
+        raise EnvelopeCorrupt(f"信封缺失: {vid}") from exc
+    head, rest = _parse_envelope(raw_old, what=vid)
     gone = set(remove)
     entry = {k: v for k, v in head["entry"].items() if k not in gone}
     entry.update(changes)
@@ -489,13 +571,23 @@ def update(
     kept = _apply_policy(metas, policy, vid)
     kept_ids = {m["id"] for m in kept}
     dropped = [m for m in metas if m["id"] not in kept_ids]
-    _commit(root, idx, kept, [m for m in dropped if m["id"] != vid], now, stale=[old_path])
+    _commit(
+        root,
+        idx,
+        kept,
+        [m for m in dropped if m["id"] != vid],
+        now,
+        stale=[old_path],
+        out_index=out_index,
+    )
     if vid in {m["id"] for m in dropped}:  # 自己被裁（策略没护住）：新一代也要收
         _meta_path(root, meta).unlink(missing_ok=True)
     return public_entry(meta)
 
 
-def delete(versions_dir: Path, doc_id: str, vid: str, *, now: int) -> bool:
+def delete(
+    versions_dir: Path, doc_id: str, vid: str, *, now: int, out_index: dict | None = None
+) -> bool:
     """删一版：**先写索引，后删信封**。索引里没有返回 `False`。"""
     root = store_dir(versions_dir, doc_id)
     idx = _load_index(root, now, write=True)
@@ -504,12 +596,20 @@ def delete(versions_dir: Path, doc_id: str, vid: str, *, now: int) -> bool:
     kept = [m for m in idx["entries"] if m.get("id") != vid]
     if len(kept) == len(idx["entries"]):
         return False
-    _commit(root, idx, kept, [m for m in idx["entries"] if m.get("id") == vid], now)
+    _commit(
+        root, idx, kept, [m for m in idx["entries"] if m.get("id") == vid], now, out_index=out_index
+    )
     return True
 
 
 def prune(
-    versions_dir: Path, doc_id: str, policy: Policy, *, now: int, keep_id: str | None = None
+    versions_dir: Path,
+    doc_id: str,
+    policy: Policy,
+    *,
+    now: int,
+    keep_id: str | None = None,
+    out_index: dict | None = None,
 ) -> list[str]:
     """对现有索引单独过一遍策略，返回被裁的 id。"""
     root = store_dir(versions_dir, doc_id)
@@ -520,7 +620,7 @@ def prune(
     kept_ids = {m["id"] for m in kept}
     dropped = [m for m in idx["entries"] if m["id"] not in kept_ids]
     if dropped:
-        _commit(root, idx, kept, dropped, now)
+        _commit(root, idx, kept, dropped, now, out_index=out_index)
     return [m["id"] for m in dropped]
 
 
@@ -766,7 +866,7 @@ def is_named(v: dict) -> bool:
     if v.get("auto"):
         return False
     name = str(v.get("name") or "").strip()
-    return bool(name) and not _DEFAULT_NAME.match(name)
+    return bool(name) and not DEFAULT_NAME.match(name)
 
 
 def kind(v: dict) -> str:
@@ -789,26 +889,39 @@ def sacrifice_order(metas: list[dict], keep_id: str | None = None) -> list[int]:
     return tiers["auto"] + tiers["moment"] + tiers["manual"]
 
 
-def legacy_policy(metas: list[dict], keep_id: str | None = None) -> list[dict]:
+def legacy_policy(
+    metas: list[dict],
+    keep_id: str | None = None,
+    *,
+    keep_auto: int | None = None,
+    keep_total: int | None = None,
+    keep_bytes: int | None = None,
+) -> list[dict]:
     """现行「两条条数上限 + 24 MB 字节」策略，逐条对拍 `app._save_versions`
     （`tests/test_versionstore.py::test_legacy_policy_matches_save_versions`）。
 
     字节账按旧文件的算法：外壳 + 分隔符 + 每条 `_legacy_bytes`，所以 D1 的保留结果与
-    现行完全相同；换存储不换策略。"""
-    excess = sum(1 for v in metas if kind(v) == "auto") - KEEP_AUTO
+    现行完全相同；换存储不换策略。
+
+    三个上限默认取本模块的常量；调用方（`app`）按调用时刻的 `VERSION_KEEP_*` 显式传入，
+    于是 `app` 侧的常量既是别名也仍是可被测试 monkeypatch 的旋钮。"""
+    keep_auto = KEEP_AUTO if keep_auto is None else keep_auto
+    keep_total = KEEP_TOTAL if keep_total is None else keep_total
+    keep_bytes = KEEP_BYTES if keep_bytes is None else keep_bytes
+    excess = sum(1 for v in metas if kind(v) == "auto") - keep_auto
     if excess > 0:
         autos = [i for i in sacrifice_order(metas, keep_id) if kind(metas[i]) == "auto"]
         drop = set(autos[:excess])
         metas = [v for i, v in enumerate(metas) if i not in drop]
     unnamed = sum(1 for v in metas if not is_named(v))
-    if unnamed > KEEP_TOTAL:
-        drop = set(sacrifice_order(metas, keep_id)[: unnamed - KEEP_TOTAL])
+    if unnamed > keep_total:
+        drop = set(sacrifice_order(metas, keep_id)[: unnamed - keep_total])
         metas = [v for i, v in enumerate(metas) if i not in drop]
     head, sep, tail = 14, 2, 2  # b'{"versions": [' / b", " / b"]}"
     size = head + tail + sum(v["_legacy_bytes"] for v in metas) + sep * max(len(metas) - 1, 0)
     dropped: set[int] = set()
     for i in sacrifice_order(metas, keep_id):
-        if size <= KEEP_BYTES:
+        if size <= keep_bytes:
             break
         dropped.add(i)
         size -= metas[i]["_legacy_bytes"] + sep
