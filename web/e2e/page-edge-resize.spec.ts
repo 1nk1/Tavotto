@@ -88,56 +88,82 @@ test('单图编辑里没有拖边', async ({ app, page }) => {
   await expect(page.locator('[data-page-edge]')).toHaveCount(0)
 })
 
-// 读数（无框、锚在被拖边的画布内侧）：不与标尺相交；拖动过程中锚点稳定（只跟着边走）
-for (const [edge, axis] of [['r', 'x'], ['b', 'y']] as const) {
-  test(`拖${edge === 'r' ? '右' : '下'}边：读数不压标尺、锚点不抖、没有白底框`, async ({ app, page }) => {
+// 机械制图式尺寸标注（画布内）：横向尺寸线在页面上方、竖向在页面左侧，数字居中于尺寸线可见段中点、写在线与页面之间，
+// 无边框无底色，不与标尺相交，拖动时只随页面边走
+type Box = { x: number; y: number; width: number; height: number }
+const overlap = (a: Box, b: Box) =>
+  Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x) > 0 && Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y) > 0
+
+for (const [edge, axis] of [['r', 'x'], ['l', 'x'], ['b', 'y'], ['t', 'y']] as const) {
+  test(`拖${{ r: '右', l: '左', b: '下', t: '上' }[edge]}边：尺寸数字在线中点、页面一侧，无框无底，不压标尺、不抖`, async ({ app, page }) => {
     const a = await app()
     await toLayout(page, a.baseURL)
     const eb = (await page.locator(`[data-page-edge="${edge}"]`).boundingBox())!
     const x = eb.x + eb.width / 2
     const y = eb.y + eb.height / 2
+    const sign = edge === 'r' || edge === 'b' ? 1 : -1
     await page.mouse.move(x, y)
     await page.mouse.down()
-    const rulers = async () => ({
-      top: (await page.locator('[data-ruler="x"]').boundingBox())!,
-      left: (await page.locator('[data-ruler="y"]').boundingBox())!,
-    })
-    const samples: { rb: { x: number; y: number; width: number; height: number }; eb: { x: number; y: number; width: number; height: number } }[] = []
+    type Sample = { num: Box; line: Box; sheet: Box }
+    const samples: Record<'width' | 'height', Sample[]> = { width: [], height: [] }
+    const stageBox = (await page.locator('[data-canvas-stage]').boundingBox())!
+    const rulers = [(await page.locator('[data-ruler="x"]').boundingBox())!, (await page.locator('[data-ruler="y"]').boundingBox())!]
     for (let i = 1; i <= 8; i++) {
-      await page.mouse.move(axis === 'x' ? x + i * 9 : x, axis === 'y' ? y + i * 9 : y)
-      const readout = page.locator('[data-dim-readout]')
-      await expect(readout).toHaveCount(1)
-      const rb = (await readout.boundingBox())!
-      const cur = (await page.locator(`[data-page-edge="${edge}"]`).boundingBox())!
-      const r = await rulers()
-      for (const k of [r.top, r.left]) {
-        const w = Math.min(rb.x + rb.width, k.x + k.width) - Math.max(rb.x, k.x)
-        const h = Math.min(rb.y + rb.height, k.y + k.height) - Math.max(rb.y, k.y)
-        expect(w > 0 && h > 0, `读数与标尺相交 (${JSON.stringify(rb)} vs ${JSON.stringify(k)})`).toBe(false)
+      await page.mouse.move(axis === 'x' ? x + sign * i * 9 : x, axis === 'y' ? y + sign * i * 9 : y)
+      await expect(page.locator('[data-page-dims]')).toHaveCount(1)
+      await page.waitForTimeout(350) // 吸上栏宽时数字会滚（宽度在过渡）：等它落定再量中心
+      const sheet = (await page.locator('[data-page-sheet]').first().boundingBox())!
+      for (const [kind, dim] of [['width', 'w'], ['height', 'h']] as const) {
+        const num = (await page.locator(`[data-dim-readout="${kind}"]`).boundingBox())!
+        // 尺寸线几何取 SVG 的 x1/y1/x2/y2（boundingBox 会把两端箭头 marker 的不对称外延算进去）
+        const line: Box = await page.locator(`[data-dim="${dim}"] line`).last().evaluate((el) => {
+          const r = (el as SVGLineElement).ownerSVGElement!.getBoundingClientRect()
+          const n = (k: string) => Number(el.getAttribute(k))
+          const [x1, x2, y1, y2] = [n('x1'), n('x2'), n('y1'), n('y2')]
+          return { x: r.x + Math.min(x1, x2), y: r.y + Math.min(y1, y2), width: Math.abs(x2 - x1), height: Math.abs(y2 - y1) }
+        })
+        samples[kind].push({ num, line, sheet })
+        // 页面离舞台边够远（尺寸线没被贴边下限 14 px 夹住）时，数字必须落在线与页面之间
+        const nearEdge = kind === 'width' ? sheet.y - stageBox.y >= 40 : sheet.x - stageBox.x >= 40
+        // 不与标尺相交
+        for (const r of rulers) expect(overlap(num, r), `${kind} 数字压到标尺`).toBe(false)
+        if (kind === 'width') {
+          // 数字中心 = 尺寸线可见段中点；在线下方（线与页面之间），离线 2–4 px
+          expect(Math.abs(num.x + num.width / 2 - (line.x + line.width / 2))).toBeLessThanOrEqual(1)
+          const gap = num.y - line.y
+          expect(gap).toBeGreaterThanOrEqual(2)
+          expect(gap).toBeLessThanOrEqual(4)
+          if (nearEdge) expect(num.y + num.height).toBeLessThanOrEqual(sheet.y + 0.5)
+        } else {
+          expect(Math.abs(num.y + num.height / 2 - (line.y + line.height / 2))).toBeLessThanOrEqual(1)
+          const gap = num.x - line.x
+          expect(gap).toBeGreaterThanOrEqual(2)
+          expect(gap).toBeLessThanOrEqual(4)
+          if (nearEdge) expect(num.x + num.width).toBeLessThanOrEqual(sheet.x + 0.5)
+        }
       }
-      samples.push({ rb, eb: cur })
     }
-    // 没有白底框：读数自己没有边框 / 底色
-    const style = await page.locator('[data-dim-readout]').evaluate((el) => {
-      const cs = getComputedStyle(el)
-      return { border: cs.borderTopWidth, bg: cs.backgroundColor }
-    })
-    expect(style.border).toBe('0px')
-    expect(style.bg).toBe('rgba(0, 0, 0, 0)')
-    // 锚点稳定：读数盒的宽高恒定；读数相对被拖边的偏移恒定（页面没被夹取时）、垂直于边的另一轴坐标恒定
-    const stage = (await page.locator('[data-canvas-stage]').boundingBox())!
-    for (const s of samples) {
-      expect(s.rb.width).toBeCloseTo(samples[0].rb.width, 1)
-      expect(s.rb.height).toBeCloseTo(samples[0].rb.height, 1)
-      // 读数夹在舞台内（页面比舞台大时贴着舞台边 8px）：夹住的帧不比偏移，没夹住的帧偏移必须恒定
-      const clampedAt = (r: { x: number; y: number; width: number; height: number }) =>
-        axis === 'x' ? Math.abs(stage.x + stage.width - (r.x + r.width) - 8) < 1 : Math.abs(stage.y + stage.height - (r.y + r.height) - 8) < 1
-      const off = (q: typeof s) =>
-        axis === 'x' ? q.rb.x + q.rb.width - (q.eb.x + q.eb.width / 2) : q.rb.y + q.rb.height - (q.eb.y + q.eb.height / 2)
-      if (axis === 'x') expect(s.rb.y).toBeCloseTo(samples[0].rb.y, 1)
-      else expect(s.rb.x).toBeCloseTo(samples[0].rb.x, 1)
-      if (!clampedAt(s.rb) && !clampedAt(samples[0].rb)) expect(off(s)).toBeCloseTo(off(samples[0]), 1)
+    // 无边框、无底色
+    for (const kind of ['width', 'height']) {
+      const st = await page.locator(`[data-dim-readout="${kind}"]`).evaluate((el) => {
+        const cs = getComputedStyle(el)
+        return { b: [cs.borderTopWidth, cs.borderRightWidth, cs.borderBottomWidth, cs.borderLeftWidth], bg: cs.backgroundColor, num: cs.fontVariantNumeric }
+      })
+      expect(st.b).toEqual(['0px', '0px', '0px', '0px'])
+      expect(st.bg).toBe('rgba(0, 0, 0, 0)')
+      expect(st.num).toContain('tabular-nums')
+    }
+    // 相邻帧无额外跳动：被拖那一维的数字中心位移 = 线段中点位移；另一轴（贴线的那一轴）位置不变
+    const dragged = axis === 'x' ? 'width' : 'height'
+    const ss = samples[dragged]
+    for (let i = 1; i < ss.length; i++) {
+      const c = (s: Sample) => (axis === 'x' ? s.num.x + s.num.width / 2 : s.num.y + s.num.height / 2)
+      const m = (s: Sample) => (axis === 'x' ? s.line.x + s.line.width / 2 : s.line.y + s.line.height / 2)
+      expect(Math.abs(c(ss[i]) - c(ss[i - 1]) - (m(ss[i]) - m(ss[i - 1])))).toBeLessThanOrEqual(1)
+      if (axis === 'x') expect(ss[i].num.y).toBeCloseTo(ss[i - 1].num.y, 1)
+      else expect(ss[i].num.x).toBeCloseTo(ss[i - 1].num.x, 1)
     }
     await page.mouse.up()
+    await expect(page.locator('[data-page-dims]')).toHaveCount(0)
   })
 }

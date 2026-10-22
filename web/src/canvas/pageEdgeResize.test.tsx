@@ -23,7 +23,7 @@ import { useProfileStore } from '@/store/profileStore'
 import type { ProfileRecord } from '@/lib/api'
 import { startPageSizeFit } from '@/store/pageFit'
 import { startPageEdgeResize } from './pageEdgeDrag'
-import { readoutBox } from './pageEdgeReadout'
+import { dimSpan } from './pageEdgeReadout'
 
 /** 会滚的数字换成探针：只关心传下去的 duration（0 = 即时换，undefined = 默认时长会滚） */
 vi.mock('@sfinterface/numbers', () => ({
@@ -112,6 +112,15 @@ const mount = () =>
       </TooltipProvider>,
     )
   })
+// jsdom 里舞台量不到尺寸（ResizeObserver 是空的，挂载后 viewW/viewH 回 0）：要看尺寸线的数字位置时补上可视区
+const giveView = async () => {
+  act(() => useViewportStore.setState({ viewW: 4000, viewH: 3000 }))
+  // 舞台有了尺寸会起一次「适应画布」的取景补间（真实应用里也是）：等它走完再把视口钉回测试的基准，免得拖动中 px↔mm 漂移
+  await act(async () => {
+    await new Promise((r) => setTimeout(r, 600))
+  })
+  act(() => useViewportStore.setState({ zoom: 2, panX: 100, panY: 80 }))
+}
 
 describe('拖页面边（手势）', () => {
   it('拖右边改宽：对象不动；松手只记一步撤销，撤销回到原宽', () => {
@@ -328,6 +337,7 @@ describe('画布上的拖边命中区与标注', () => {
 
   it('拖动中出现尺寸标注，松手后消失；标注不进文档', async () => {
     await mount()
+    await giveView()
     expect(container.querySelector('[data-page-dims]')).toBeNull()
     const docBefore = JSON.stringify(useDocumentStore.getState().doc.objects)
     act(() => startPageEdgeResize(down(0, 0), 'r'))
@@ -335,6 +345,8 @@ describe('画布上的拖边命中区与标注', () => {
     const dims = container.querySelector('[data-page-dims]')
     expect(dims).not.toBeNull()
     expect(dims!.querySelector('[data-dim-readout="width"] [data-numbers]')?.getAttribute('data-value')).toBe('200')
+    expect(dims!.querySelector('[data-dim-readout="height"] [data-numbers]')?.getAttribute('data-value')).toBe('120') // 两条线各写各的数
+    expect(dims!.querySelectorAll('svg [data-dim]')).toHaveLength(2) // 画布内的两条蓝色箭头尺寸线
     act(() => fire('pointerup', 20 * PX_PER_MM(), 0))
     expect(container.querySelector('[data-page-dims]')).toBeNull()
     expect(JSON.stringify(useDocumentStore.getState().doc.objects)).toBe(docBefore)
@@ -342,73 +354,72 @@ describe('画布上的拖边命中区与标注', () => {
 
   it('标注读数：逐 mm 拖动即时换（duration 0），吸上栏宽 / ⌥ 跳变时才滚', async () => {
     await mount()
+    await giveView()
+
     const dur = () =>
-      [...container.querySelectorAll('[data-dim-readout] [data-numbers]')].map((n) => n.getAttribute('data-duration'))
+      [...container.querySelectorAll('[data-dim-readout="width"] [data-numbers]')].map((n) => n.getAttribute('data-duration'))
     const mm = (v: number) => v * PX_PER_MM()
+    // 有舞台尺寸时页面一变视口会被重新取景（jsdom 里没有真实布局）：每一帧后把视口钉回基准，px ↔ mm 才对得上
+    const step = (...a: Parameters<typeof fire>) => {
+      fire(...a)
+      useViewportStore.setState({ zoom: 2, panX: 100, panY: 80 })
+    }
     act(() => startPageEdgeResize(down(0, 0), 'r'))
-    act(() => fire('pointermove', mm(-10), 0)) // 170：连续
+    act(() => step('pointermove', mm(-10), 0)) // 170：连续
     expect(dur()).toEqual(['0'])
-    act(() => fire('pointermove', mm(-11), 0)) // 169：连续
+    act(() => step('pointermove', mm(-11), 0)) // 169：连续
     expect(dur()).toEqual(['0'])
-    act(() => fire('pointermove', mm(-29), 0)) // 151 → 吸到 150：跳变
+    act(() => step('pointermove', mm(-29), 0)) // 151 → 吸到 150：跳变
     expect(page().w).toBe(150)
     expect(dur()).toEqual(['roll'])
-    act(() => fire('pointermove', mm(-29.2), 0)) // 仍吸着：回到连续
+    act(() => step('pointermove', mm(-29.2), 0)) // 仍吸着：回到连续
     expect(dur()).toEqual(['0'])
-    act(() => fire('pointermove', mm(-29.2), 0, true)) // ⌥ 按下：跳变
+    act(() => step('pointermove', mm(-29.2), 0, true)) // ⌥ 按下：跳变
     expect(dur()).toEqual(['roll'])
-    act(() => fire('pointerup', mm(-29.2), 0))
+    act(() => step('pointerup', mm(-29.2), 0))
   })
 
-  it('读数不画白底框：没有 border / bg-surface，只出被拖那一维', async () => {
+  it('数字无框无底色，宽高两条尺寸线各有数字，数字在线的页面一侧、离线留间隙', async () => {
     await mount()
+    await giveView()
     act(() => startPageEdgeResize(down(0, 0), 'b'))
     act(() => fire('pointermove', 0, 10 * PX_PER_MM()))
     expect(container.querySelector('[data-dim-chip]')).toBeNull()
     const readouts = [...container.querySelectorAll<HTMLElement>('[data-dim-readout]')]
-    expect(readouts.map((r) => r.dataset.dimReadout)).toEqual(['height'])
-    expect(readouts[0].className).not.toMatch(/\bborder\b|bg-surface/)
-    expect(readouts[0].className).toContain('type-number') // tabular-nums
+    expect(readouts.map((r) => r.dataset.dimReadout).sort()).toEqual(['height', 'width'])
+    for (const r of readouts) {
+      expect(r.className).not.toMatch(/\bborder\b|\bbg-/)
+      expect(r.className).toContain('type-number')
+      expect(r.closest('[data-ruler-dim]')).toBeNull() // 不在标尺里
+    }
+    const v = useViewportStore.getState()
+    const w = readouts.find((r) => r.dataset.dimReadout === 'width')!
+    const h = readouts.find((r) => r.dataset.dimReadout === 'height')!
+    // 宽度数字在横线之下（页面一侧）：横线 y = panY - 26，数字顶 = y + 3
+    expect(parseFloat(w.style.top)).toBeCloseTo(Math.max(14, v.panY - 26) + 3, 3)
+    expect(parseFloat(w.style.top)).toBeLessThan(v.panY)
+    // 高度数字转 -90°，在竖线之右（页面一侧）
+    expect(h.style.transform).toContain('rotate(-90deg)')
+    expect(parseFloat(h.style.left)).toBeGreaterThan(Math.max(14, v.panX - 26))
+    expect(parseFloat(h.style.left)).toBeLessThan(v.panX)
     act(() => fire('pointerup', 0, 10 * PX_PER_MM()))
   })
 
-  it('读数位置固定锚定：位置只由「边的屏幕位置」决定（与数值位数无关），盒子宽高固定、不进舞台外的标尺区', async () => {
+  it('数字居中于尺寸线可见段中点，逐帧只随页面边走', async () => {
+    act(() => useViewportStore.setState({ zoom: 1 }))
     await mount()
-    act(() => useViewportStore.setState({ viewW: 1200, viewH: 800 })) // 舞台量到的尺寸在 jsdom 里是 0：挂载后补上
+    await giveView()
     const mm = (v: number) => v * PX_PER_MM()
-    const box = () => {
-      const r = container.querySelector<HTMLElement>('[data-dim-readout]')!
-      return { left: parseFloat(r.style.left), top: parseFloat(r.style.top), w: parseFloat(r.style.width), h: parseFloat(r.style.height) }
+    act(() => startPageEdgeResize(down(0, 0), 'r'))
+    for (const dx of [1, 1.3, 7, 20, 31.4]) {
+      act(() => fire('pointermove', mm(dx), 0))
+      const vp = useViewportStore.getState()
+      const left = vp.panX
+      const right = vp.panX + page().w * PX_PER_MM()
+      const w = container.querySelector<HTMLElement>('[data-dim-readout="width"]')!
+      expect(parseFloat(w.style.left)).toBeCloseTo(dimSpan(left, right, 4000)!.center, 3)
     }
-    // 每一帧都拿「同一帧的页面矩形」套同一个纯函数：位置不依赖文字，也就没有逐帧抖动的来源
-    const expected = () => {
-      const v = useViewportStore.getState()
-      const k = mmToWorld(1) * v.zoom
-      return readoutBox('b', { left: v.panX, top: v.panY, w: page().w * k, h: page().h * k }, { w: v.viewW, h: v.viewH })
-    }
-    act(() => startPageEdgeResize(down(0, 0), 'b'))
-    const sizes = new Set<string>()
-    for (const dy of [1, 1.3, -0.3, -30, -45.55, -60]) {
-      act(() => fire('pointermove', 0, mm(dy)))
-      const b = box()
-      const e = expected()
-      expect(b.left).toBeCloseTo(e.left, 3)
-      expect(b.top).toBeCloseTo(e.top, 3)
-      sizes.add(`${b.w}x${b.h}`)
-    }
-    expect(sizes.size, '盒子宽高固定，不随数值变').toBe(1)
-    act(() => fire('pointerup', 0, mm(-60)))
-    // 四条边的读数盒都在舞台 [0, view] 内：标尺在舞台之外，读数不会压到标尺
-    for (const edge of ['l', 'r', 't', 'b'] as const) {
-      act(() => startPageEdgeResize(down(0, 0), edge))
-      act(() => fire('pointermove', 5, 5))
-      const b = box()
-      expect(b.left, edge).toBeGreaterThanOrEqual(0)
-      expect(b.top, edge).toBeGreaterThanOrEqual(0)
-      expect(b.left + b.w, edge).toBeLessThanOrEqual(1200)
-      expect(b.top + b.h, edge).toBeLessThanOrEqual(800)
-      act(() => fire('pointerup', 5, 5))
-    }
+    act(() => fire('pointerup', mm(31.4), 0))
   })
 
   it('图内编辑子状态（排版里双击某张图进图内）没有拖边，退出后回来', async () => {

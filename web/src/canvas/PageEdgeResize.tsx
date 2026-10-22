@@ -9,13 +9,14 @@ import { useUiStore } from '@/store/uiStore'
 import { mmToWorld, useViewportStore } from '@/store/viewportStore'
 import { cn } from '@/lib/utils'
 import { startPageEdgeResize } from './pageEdgeDrag'
-import { READOUT_H, READOUT_W, readoutBox } from './pageEdgeReadout'
+import { DIM_INSET, dimSpan } from './pageEdgeReadout'
 
 /** 命中区的屏幕宽度（px）：跟缩放倍率无关，永远是这么宽（命中区在屏幕空间画，不在世界层里） */
 const HIT_PX = 10
 /** 尺寸标注离页面的距离（px）与标注条的贴边下限 */
 const DIM_GAP = 26
 
+const MM_SUFFIX = '\u00a0mm'
 const mmText = (v: number) => String(Math.round(v * 10) / 10)
 
 /**
@@ -87,11 +88,19 @@ export function PageEdgeHandles() {
   )
 }
 
+/** 数字（11px）与尺寸线之间的间隙（px）、数字盒的厚度 */
+const TEXT_GAP = 3
+const TEXT_H = 14
+
 /**
- * 拖边时的机械制图式尺寸标注：两端引出线 + 双箭头，外加被拖那一维的无框读数「宽 N mm」/「高 N mm」（数字跟着文档里的页面尺寸实时变；读数在页面内侧，不压标尺），
- * 吸上栏宽时在宽度标注上方写栏宽名。**画布叠加层**：不进文档、不进导出、不碰 SVG 预览平面；
+ * 拖边时的机械制图式尺寸标注：页面上方一条横向、左侧一条竖向、两端带箭头的尺寸线（引出线 + 双箭头），
+ * 数字写在**尺寸线中点、线与页面之间**（横线的数字在线下方，竖线的数字转 -90° 在线右侧），离线 `TEXT_GAP` px，
+ * 不压线、不断线、**无框无底色**；宽、高两条线都显示各自的数字，被拖那一维的线实心、另一条淡。
+ * 页面边超出可视区时线段夹在可视区内、数字居中于可见段（`pageEdgeReadout.dimSpan`）。
+ * 吸上栏宽时栏宽名跟在宽度数字后面。**画布叠加层**：不进文档、不进导出、不碰 SVG 预览平面；
  * 只在拖动中挂（平时不挂 `<svg>`——e2e 有「舞台里第一个 svg」这类等渲染的定位）。
- * 颜色是 `--color-dim`（亮暗两套）。
+ * 颜色是 `--color-dim`（亮暗两套）。数字是会滚的（与顶栏缩放读数同一条规矩）：逐 mm 连续拖动即时换（duration 0），
+ * 吸上 / 离开栏宽、⌥ 按下 / 松开这类离散跳变才滚。
  */
 function PageDimensions() {
   const { t, i18n } = useTranslation('workspace')
@@ -111,70 +120,96 @@ function PageDimensions() {
   const y = Math.max(14, T - DIM_GAP)
   const x = Math.max(14, L - DIM_GAP)
   const showW = pageEdge.edge === 'l' || pageEdge.edge === 'r'
-  // 读数（2026-10-22 用户反馈：白底框跳动、压在标尺线 / 刻度数字上）：无框的轻量文字，锚在被拖那条边的画布内侧，
-  // 盒子宽高固定、数字 tabular-nums、位置只随边走（`pageEdgeReadout.readoutBox`），夹在舞台内所以不会碰到舞台外的标尺。
-  // 只出被拖那一维的数（拖宽出宽、拖高出高）；文字外沿一圈画布色描边保证压在图上也读得清。
-  // 数字是会滚的（与顶栏缩放读数同一条规矩）：逐 mm 的连续拖动即时换（duration 0，否则永远在半路），
-  // 吸上 / 离开栏宽、⌥ 按下 / 松开这类离散跳变才滚（默认时长）
-  const kind = showW ? 'width' : 'height'
-  const mm = showW ? pageW : pageH
-  const box = readoutBox(pageEdge.edge, { left: L, top: T, w: W, h: H }, { w: viewW, h: viewH })
-  const readout = (
-    <div
-      data-dim-readout={kind}
-      data-readout-edge={pageEdge.edge}
-      className="type-number absolute whitespace-nowrap font-medium text-dim [text-shadow:0_0_2px_var(--color-canvas),0_0_2px_var(--color-canvas),0_0_4px_var(--color-canvas)]"
-      style={{
-        left: box.left,
-        top: box.top,
-        width: READOUT_W,
-        height: READOUT_H,
-        lineHeight: `${READOUT_H}px`,
-        textAlign: box.align,
-      }}
-    >
+  const gw = dimSpan(L, L + W, viewW)
+  const gh = dimSpan(T, T + H, viewH)
+  const number = (kind: 'width' | 'height', mm: number) => (
+    <>
+      <span aria-hidden>{t(`pageEdge.${kind}Prefix`).replace(/\s+$/, '\u00a0')}</span>
       <Numbers
         value={Math.round(mm * 10) / 10}
-        prefix={t(`pageEdge.${kind}Prefix`)}
-        suffix=" mm"
         duration={pageEdge.rolls ? undefined : 0}
         format={{ useGrouping: false, maximumFractionDigits: 1 }}
         locale={i18n.language}
         label={t(`pageEdge.${kind}`, { mm: mmText(mm) })}
       />
-    </div>
+      <span aria-hidden>{MM_SUFFIX}</span>
+    </>
   )
-  const arrow = (x1: number, y1: number, x2: number, y2: number) => (
-    <line x1={x1} y1={y1} x2={x2} y2={y2} stroke="currentColor" strokeWidth={1} markerStart="url(#page-dim-arrow)" markerEnd="url(#page-dim-arrow)" />
-  )
+  const textBase = 'type-number absolute whitespace-nowrap font-medium text-dim'
+  const arrow = (a: number, b: number, at: number, horiz: boolean, startArrow: boolean, endArrow: boolean) => {
+    // 两端对称内缩 4 px（线段中点 = 可见段中点，数字就居中在线的中点）；被夹到可视区边缘的那一端不是页面真正的边：不画箭头
+    const [x1, y1, x2, y2] = horiz ? [a, at, b, at] : [at, a, at, b]
+    return (
+      <line
+        x1={x1}
+        y1={y1}
+        x2={x2}
+        y2={y2}
+        stroke="currentColor"
+        strokeWidth={1}
+        markerStart={startArrow ? 'url(#page-dim-arrow)' : undefined}
+        markerEnd={endArrow ? 'url(#page-dim-arrow)' : undefined}
+      />
+    )
+  }
   return (
-    <div data-page-dims="" className="pointer-events-none absolute inset-0">
-    <svg
-      aria-hidden
-      className="pointer-events-none absolute inset-0 h-full w-full overflow-visible text-dim"
-    >
-      <defs>
-        <marker id="page-dim-arrow" viewBox="0 0 10 10" refX={5} refY={5} markerWidth={9} markerHeight={9} orient="auto-start-reverse">
-          <path d="M0 1.5L10 5L0 8.5" fill="none" stroke="currentColor" strokeWidth={1.4} />
-        </marker>
-      </defs>
-      <g data-dim="w" opacity={showW ? 1 : 0.45}>
-        <line x1={L} y1={T - 4} x2={L} y2={y - 8} stroke="currentColor" strokeWidth={0.8} />
-        <line x1={L + W} y1={T - 4} x2={L + W} y2={y - 8} stroke="currentColor" strokeWidth={0.8} />
-        {arrow(L + 4, y, L + W - 4, y)}
-        {pageEdge.snapLabel && showW && (
-          <text data-dim-snap="" x={L + W / 2} y={y - 16} textAnchor="middle" className="fill-dim" fontSize={11} fontWeight={500}>
-            {t('pageEdge.snapTo', { name: pageEdge.snapLabel })}
-          </text>
-        )}
-      </g>
-      <g data-dim="h" opacity={showW ? 0.45 : 1}>
-        <line x1={L - 4} y1={T} x2={x - 8} y2={T} stroke="currentColor" strokeWidth={0.8} />
-        <line x1={L - 4} y1={T + H} x2={x - 8} y2={T + H} stroke="currentColor" strokeWidth={0.8} />
-        {arrow(x, T + 4, x, T + H - 4)}
-      </g>
-    </svg>
-      {readout}
+    <div data-page-dims="" className="pointer-events-none absolute inset-0 overflow-hidden">
+      <svg aria-hidden className="pointer-events-none absolute inset-0 h-full w-full overflow-visible text-dim">
+        <defs>
+          <marker id="page-dim-arrow" viewBox="0 0 10 10" refX={5} refY={5} markerWidth={9} markerHeight={9} orient="auto-start-reverse">
+            <path d="M0 1.5L10 5L0 8.5" fill="none" stroke="currentColor" strokeWidth={1.4} />
+          </marker>
+        </defs>
+        <g data-dim="w" opacity={showW ? 1 : 0.45}>
+          <line x1={L} y1={T - 4} x2={L} y2={y - 8} stroke="currentColor" strokeWidth={0.8} />
+          <line x1={L + W} y1={T - 4} x2={L + W} y2={y - 8} stroke="currentColor" strokeWidth={0.8} />
+          {gw && arrow(gw.a + DIM_INSET, gw.b - DIM_INSET, y, true, gw.startArrow, gw.endArrow)}
+        </g>
+        <g data-dim="h" opacity={showW ? 0.45 : 1}>
+          <line x1={L - 4} y1={T} x2={x - 8} y2={T} stroke="currentColor" strokeWidth={0.8} />
+          <line x1={L - 4} y1={T + H} x2={x - 8} y2={T + H} stroke="currentColor" strokeWidth={0.8} />
+          {gh && arrow(gh.a + DIM_INSET, gh.b - DIM_INSET, x, false, gh.startArrow, gh.endArrow)}
+        </g>
+      </svg>
+      {gw && (
+        <div
+          data-dim-readout="width"
+          data-readout-edge={pageEdge.edge}
+          className={textBase}
+          style={{
+            left: gw.center,
+            top: y + TEXT_GAP,
+            height: TEXT_H,
+            lineHeight: `${TEXT_H}px`,
+            transform: 'translateX(-50%)',
+            opacity: showW ? 1 : 0.45,
+          }}
+        >
+          {number('width', pageW)}
+          {pageEdge.snapLabel && showW && (
+            <span data-dim-snap="" className="ml-1">
+              · {pageEdge.snapLabel}
+            </span>
+          )}
+        </div>
+      )}
+      {gh && (
+        <div
+          data-dim-readout="height"
+          data-readout-edge={pageEdge.edge}
+          className={textBase}
+          style={{
+            left: x + TEXT_GAP + TEXT_H / 2,
+            top: gh.center,
+            height: TEXT_H,
+            lineHeight: `${TEXT_H}px`,
+            transform: 'translate(-50%, -50%) rotate(-90deg)',
+            opacity: showW ? 0.45 : 1,
+          }}
+        >
+          {number('height', pageH)}
+        </div>
+      )}
     </div>
   )
 }
