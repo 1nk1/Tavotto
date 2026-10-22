@@ -73,6 +73,28 @@
     常量相对目标认成**探路证据**；只在脚本目录找得到 → 结论 `script_parent` → 首开问
     （`script_dir_evidence`，推荐 `project`），沙盒那档的 `found` 不列探路目标。列 cwd 本身
     （`listdir()`）只记脚本目录那档。用户选「继续沙盒」后盲区如实保留，走上面的零张图路径。
+    **运行时证据（#1254，ADR 0084 §运行时证据）**：模式是参数、不是写在调用里的常量时（`def read_parts(pattern):
+    glob.glob(pattern)`），静态探测认不出。沙盒会话里 worker 多装一层**只记不改**的观察
+    （`figcapture.install_probe_observer`，装在改指之后、账本之前，cwd 已是脚本目录 / 项目根时不装）：
+    `glob.glob|iglob` / `os.listdir|scandir` / `os.path.exists|isfile|isdir` / `Path.glob|rglob|iterdir|exists|is_file|is_dir`
+    在沙盒 cwd 下回空 / 目录不存在 / 为假、目标是相对路径时记 `{kind, target, recursive, hidden}`
+    （去重、`MAX_PROBE_MISSES=16`；stdlib 内部的逐段探路不记；`scandir` 的迭代器不包，只记目录不存在；列 cwd 本身不记）。
+    **返回值逐项不变**（迭代器换成逐项转发的生成器，元素与异常原样），这一条是硬约束。build 失败（`script_error`）、
+    没出图（`no_figures_captured*`）、先判空再 exit（`script_exited`）时，记录随错误 `extra.probe_misses` 到父进程
+    （build 响应在有记录时也带 `probe_misses`），`workdir.probe_hint` 拿**首开同一把尺子**（`databinding._probe_hit`，项目外不看、
+    glob 有预算）按脚本目录再判，至少一条找得到才在错误上挂 **`workdir_hint`**——载荷与首开确认框同形
+    （`reason = script_dir_evidence`、推荐 `project`，多 `source = "runtime"`）。**它不是 `confirmation`**：后者是起会话前要先答的门，
+    所有入口见到都会停下；`workdir_hint` 只诊断，码与消息一字不变，不自动切换。HTTP 错误体与试运行错误（`_attach_workdir_hint`）
+    各带一份，不新造错误码。**C++ 读取器也算运行时证据**：错误的 `extra.enoent`（`filename`，或 pyarrow 那种整条消息就是路径的 `named`）
+若是相对路径（cwd 之内的绝对路径换回相对），`pool.workdir_hint_for` 把它当一条 `path` 证据并进同一次判定——脚本目录里找得到就出引导；
+**不放宽 ADR 0110 的 `native_miss` 候选**，码与 `missing_input` 不动。前端（`ApiError.workdirHint` / `PanelRender.workdirHint` /
+素材库 `run.error.workdir_hint`）不论错误码都把它交给既有的 `WorkdirChooseButton`（同一个确认框，不新造组件和文案）。
+**build 成功但图是空的**（`ax.plot(glob(...))` 回空，一条空线、不报错——静默的错误结果）：build 响应的 `probe_misses` 存在
+`worker.last_build_probe_misses`，渲染成功响应（`/api/engine/render`）与试运行成功结果各挂同形 `workdir_hint`（`pool.workdir_hint_of_build`）；
+**成功路径只认 `glob`**（`exists("out")` / `isdir("cache")` 这类先判再建的常规写法在沙盒里为假、脚本目录里却有同名目录，成功的图不该被提示），
+出图结果、状态码不变。前端走通知轨（`lib/workdirHintNotice`：胶囊、同面板同证据只提醒一次、`decided` 后不再提醒），不是横条。
+看护 `tests/test_runtime_probe_hint.py`、`web/src/components/workdirHint.test.tsx`、`web/src/store/workdirHintSuccess.test.tsx`（观察层返回值逐项不变 / 只记沙盒里的相对落空 / 判据 /
+    真 worker 沙盒带引导、脚本目录模式出图、两种试运行形状）。
     结论只看**找得到**（`found`）：glob 预算用完的 `unjudged` 只记在候选里、**不驱动结论、不会问**。
     别名按 import 认（`import glob as g` / `from glob import glob as gg` / `Path as P`）；名字在别处
     被重新绑定过（参数、赋值、`for` …）时不做作用域解析，按模块 glob 与 `Path.glob` 的并集匹配

@@ -22,6 +22,7 @@ import {
 import { engineTransport } from '@/lib/engineTransport'
 import { pngManifestOf, useMountedPngStore } from '@/store/mountedPngStore'
 import { currentProjectId } from '@/lib/session'
+import { noticeWorkdirHint, workdirHintOwner, type WorkdirHintNoticeDeps } from '@/lib/workdirHintNotice'
 import { captureProjectEpoch } from '@/lib/projectEpoch'
 import { observeFigureExecution } from '@/lib/figureExecutionEvents'
 import { resolvePreview, VECTOR_PREVIEW, type PreviewMetadata } from '@/lib/previewBudget'
@@ -133,6 +134,8 @@ export interface PanelRender {
   dependencyPreparation: DependencyPreparationOffer | null
   /** 数据找不到（ADR 0106）时「指认数据位置」的载荷（同上：留着，关了对话框还能从错误块再开） */
   missingInput: MissingInputOffer | null
+  /** 沙盒里落空、脚本目录里找得到时的「在脚本目录里运行」引导（#1254）；码不变，错误块据此多给一个入口 */
+  workdirHint: WorkdirConfirmation | null
   traceback: string
   warnings: string[]
   /** 最近一次成功渲染的阶段计时（毫秒，键见 api.ts）；暂不做 UI */
@@ -169,6 +172,7 @@ const EMPTY: PanelRender = {
   confirmation: null,
   dependencyPreparation: null,
   missingInput: null,
+  workdirHint: null,
   traceback: '',
   warnings: [],
   timings: {},
@@ -218,6 +222,13 @@ function prepareSvg(text: string): string {
  * （后端按 `rel_id` 发 started / done / failed 三件套），toast 上显示的短名不唯一（`a/Fig1.pdf` 与
  * `b/Fig1.pdf` 都叫 Fig1），不能拿它认主人。
  */
+/** 通知轨提醒（`lib/workdirHintNotice`）要的两个 store 句柄：由持有它们的这一层递进去，lib 不 import store */
+export const workdirHintDeps = (): WorkdirHintNoticeDeps => ({
+  ui: useUiStore.getState(),
+  decided: useEnvStore.getState().env?.project?.workdir?.decided,
+  request: (hint, projectId) => useEnvStore.getState().requestWorkdirConfirmation(hint, projectId),
+})
+
 export const renderFailureOwner = (pj: string | null | undefined, id: string) =>
   `render.failed:${pj ?? ''}:${id}`
 
@@ -737,6 +748,7 @@ export const useRenderStore = create<RenderState>((set, get) => ({
             confirmation: null,
             dependencyPreparation: null,
             missingInput: null,
+            workdirHint: res.workdir_hint ?? null,
             traceback: '',
             warnings: res.warnings ?? [],
             timings: res.timings ?? {},
@@ -744,6 +756,8 @@ export const useRenderStore = create<RenderState>((set, get) => ({
             lastPatches: JSON.stringify(current),
             previewDpi: dpi ?? null,
           }
+          // 沙盒里 glob 回空、脚本目录里有文件（图可能缺数据，#1254）：通知轨一条胶囊，同一份证据只提醒一次
+          noticeWorkdirHint(workdirHintOwner(projectAtStart, key), res.workdir_hint, projectAtStart, workdirHintDeps())
           // 二道闸（ADR 0022）：后端的 pre-read 闸才是第一道保护，这里拦的是
           // 「字节已经进了浏览器进程」之后的那一步——绝不 prepareSvg + 存进
           // store + 塞进 DOM。判据收在 `resolvePreview` 一处。
@@ -884,6 +898,7 @@ export const useRenderStore = create<RenderState>((set, get) => ({
             confirmation,
             dependencyPreparation,
             missingInput,
+            workdirHint: err instanceof EngineError ? (err.workdirHint ?? null) : null,
             error: watchdog.timedOut()
               ? msg('render.timeout', { minutes: watchdog.minutes() }, 'errors')
               // code 有文案时按当前语言包装（worker 的 error 原文是中文，
@@ -932,7 +947,9 @@ export const useRenderStore = create<RenderState>((set, get) => ({
           // 指认了数据位置 / 改写了脚本里的路径之后（ADR 0106 / 0110）：「找不到数据」那些面板重排——
           // 带载荷的都算（C++ 读取器是 script_error、先判空再 exit 是 script_exited）
           v.code === MISSING_INPUT_CODE ||
-          v.missingInput != null)
+          v.missingInput != null ||
+          // 沙盒里落空、脚本目录里找得到的引导（#1254）：换了运行目录之后这些面板同样值得重排
+          v.workdirHint != null)
       ) {
         ids.add(v.fileId)
       }

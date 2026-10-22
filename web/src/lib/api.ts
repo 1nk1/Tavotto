@@ -2477,6 +2477,8 @@ export interface Manifest {
 }
 
 export interface EngineRenderResponse {
+  /** build 成功、但沙盒里 glob 回空而脚本目录里有文件（图可能缺数据，#1254）；出图结果与状态码不变 */
+  workdir_hint?: WorkdirConfirmation
   figure_snapshot_invalidation?: FigureSnapshotInvalidation
   artifact_source?: unknown
   /** 来源驱动策略（`script-backed-figure-v1`）的准入结论：状态、重画摘要、差异度量（ADR 0139） */
@@ -2572,6 +2574,11 @@ export class EngineError extends Error {
    * 此刻哪儿都找不到的路径——一次「指认数据位置」的对话框（`MissingInputDialog`），不是错误文字。
    */
   missingInput?: MissingInputOffer
+  /**
+   * 沙盒里 glob / listdir / exists / C++ 读取器落空、同一个相对目标在脚本目录里找得到（#1254，ADR 0084 运行时证据）：
+   * 与首开确认框同形的「在脚本目录里运行」引导。只诊断——不是 `confirmation`（那是起会话前要先答的门），码不变。
+   */
+  workdirHint?: WorkdirConfirmation
   constructor(
     message: string,
     traceback = '',
@@ -2588,6 +2595,7 @@ export class EngineError extends Error {
       explicit?: ExplicitInterpreterFailure
       dependencyPreparation?: DependencyPreparationOffer
       missingInput?: MissingInputOffer
+      workdirHint?: WorkdirConfirmation
     },
   ) {
     super(message)
@@ -2604,6 +2612,7 @@ export class EngineError extends Error {
     this.explicit = extra?.explicit
     this.dependencyPreparation = extra?.dependencyPreparation
     this.missingInput = extra?.missingInput
+    this.workdirHint = extra?.workdirHint
   }
 }
 
@@ -2689,6 +2698,7 @@ export async function engineRender(
           | DependencyPreparationOffer
           | undefined,
         missingInput: body.missing_input as MissingInputOffer | undefined,
+        workdirHint: body.workdir_hint as WorkdirConfirmation | undefined,
       },
     )
   }
@@ -4168,6 +4178,8 @@ export interface WorkdirConfirmation {
   reads: string[]
   /** 探路调用的目标（glob 模式 / 列的目录 / 问的路径，ADR 0084）；老后端没有这个字段 */
   probes?: string[]
+  /** `runtime` = 运行时证据（#1254，`workdir_hint`）；首开的确认框载荷没有这个字段 */
+  source?: 'runtime'
 }
 
 /**
@@ -5691,10 +5703,14 @@ export interface ProbeError {
   confirmation?: WorkdirConfirmation
   /** 数据找不到（ADR 0106）：与渲染入口同一份「指认数据位置」载荷（`missing_input` / 没出图时可能有） */
   missing_input?: MissingInputOffer
+  /** 沙盒里落空、脚本目录里找得到（#1254）：与渲染入口同一份「在脚本目录里运行」引导 */
+  workdir_hint?: WorkdirConfirmation
 }
 
 export interface ProbeResult {
   figure_snapshot_invalidation?: FigureSnapshotInvalidation
+  /** 跑通且有图，但沙盒里 glob 回空而脚本目录里有文件（图可能缺数据，#1254） */
+  workdir_hint?: WorkdirConfirmation
   script: string
   entry: string | null
   stems: string[]
@@ -5894,6 +5910,11 @@ export type PreparationRequirement =
   | { id: 'dependencies'; kind: 'dependency_scope_choice'; code: string; payload: Record<string, unknown> }
   | { id: 'dependencies'; kind: 'dependency_pinned'; code: string; payload: { source?: string; variable?: string } }
   | { id: 'data'; kind: 'input_location'; code: string; origin: 'last_attempt'; blocking: false; payload: MissingInputOffer }
+  /**
+   * 沙盒里 glob / listdir / exists / C++ 读取器落空、脚本目录里找得到（#1254）：上一次尝试留下的不阻塞引导，
+   * 载荷与首开确认框同形（`source: 'runtime'`）。卡片复用 `WorkdirChooseButton`，不改 phase、不改错误码
+   */
+  | { id: 'data'; kind: 'workdir_hint'; code: string; origin: 'last_attempt'; blocking: false; payload: WorkdirConfirmation }
   /** 脚本源码里有弹窗选文件 / 询问的写法（`engine/dialogscan`）：不阻塞的提示，运行照样可用 */
   | { id: 'interaction'; kind: 'gui_dialog'; code: string; blocking: false; payload: GuiDialogPayload }
   | {

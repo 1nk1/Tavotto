@@ -693,6 +693,9 @@ class WorkerError(RuntimeError):
         self.extra: dict = {}
         #: 数据找不到（ADR 0106）时弹窗的结构化载荷（`inputremap.payload_for`）；没有就是 None。
         self.missing_input: dict | None = None
+        #: 沙盒 cwd 下运行时落空的相对探路调用、而脚本目录里找得到（#1254）：「在脚本目录里运行」的引导载荷
+        #: （`workdir.probe_hint`，与首开的确认框同形）。只诊断：不是 `confirmation`（那是起会话前要先答的门）。
+        self.workdir_hint: dict | None = None
         #: 缺依赖的去向（`INSTALL_ROUTE_*`），只在 `missing_dependency` 时有意义。这里（池层）认得出
         #: 「标准库缺了 / 不支持当前系统」；「装得了 / 装不了」要查可信解析，由 app 层 / 准备会话补上。空 = 池层不知道。
         self.install_route = ""
@@ -921,7 +924,85 @@ def file_operation_blocked_params(extra: dict | None) -> dict[str, str]:
 SCRIPT_ERROR_CODE = "script_error"
 
 
+#: 沙盒里落空的探路调用能引到「在脚本目录里运行」的错误码：脚本自己的失败、「没出图」、先判空再 exit（#1254）。
+_WORKDIR_HINT_CODES = frozenset(
+    {NO_FIGURES_CODE, NO_FIGURES_SILENT_CODE, SCRIPT_EXITED_CODE, SCRIPT_ERROR_CODE}
+)
+
+
+def _enoent_probe(enoent) -> dict | None:
+    """C++ 读取器的「文件不存在」事实（`extra.enoent`）→ 一条运行时证据：它点名的路径若是相对的（或是 cwd 之内、
+    换回相对的），就等于脚本在沙盒 cwd 下问了「这个路径存在吗」。绝对路径不依赖 cwd，不算。"""
+    if not isinstance(enoent, dict):
+        return None
+    raw = enoent.get("filename") or enoent.get("named")
+    if not isinstance(raw, str) or not raw:
+        return None
+    cwd = enoent.get("cwd") if isinstance(enoent.get("cwd"), str) else ""
+    item = {"kind": "path", "target": inputremap._as_written(raw, cwd)}
+    probe = figcapture.ProbeMisses()
+    probe.note(**{"kind": item["kind"], "target": item["target"]})
+    return probe.items[0] if probe.items else None
+
+
+def workdir_hint_for(
+    script_name: str, figures_dir, probe_misses, enoent=None, *, kinds=None
+) -> dict | None:
+    """worker 记下的沙盒里落空的相对探路调用（外加 C++ 读取器点名的那条相对路径，`enoent`）→ `workdir.probe_hint`；
+    任何读不出来的情形都回 None（只是少一条引导）。码与 ADR 0110 的 `native_miss` 候选都不动。"""
+    observed = list(probe_misses) if isinstance(probe_misses, list) else []
+    extra = _enoent_probe(enoent)
+    if extra is not None and extra not in observed:
+        observed.append(extra)
+    if not script_name or not figures_dir or not observed:
+        return None
+    try:
+        return workdir.probe_hint(figures_dir, script_name, observed, kinds=kinds)
+    except (OSError, ValueError) as exc:
+        LOG.info("脚本目录引导拼不出来（%s）: %s", type(exc).__name__, script_name)
+        return None
+
+
+#: build **成功**时只有 glob 回空算「图可能缺数据」的证据：`exists("out")` / `isdir("cache")` 这类先判再建的
+#: 常规写法在沙盒里为假、脚本目录里却有同名目录，成功的图不该因此被提示（错误上才放开全部种类）。
+SUCCESS_HINT_KINDS = frozenset({figcapture.PROBE_GLOB})
+
+
+def workdir_hint_of_build(worker) -> dict | None:
+    """build 成功之后的引导：脚本在沙盒里 glob 回空却没报错（`ax.plot([])` 画出一条空线），脚本目录里同一个模式
+    有文件 → 同形的 `workdir_hint`（`source = "runtime"`）。出图结果、状态码都不改（#1254）。"""
+    return workdir_hint_for(
+        getattr(worker, "script_name", ""),
+        getattr(worker, "figures_dir", None),
+        getattr(worker, "last_build_probe_misses", None),
+        kinds=SUCCESS_HINT_KINDS,
+    )
+
+
+def _offer_workdir_hint(err: "WorkerError", script_name: str, figures_dir) -> "WorkerError":
+    """脚本在沙盒 cwd 下 `glob` / `listdir` / `exists` 落空、而同一个相对目标在脚本目录里找得到（运行时证据，ADR 0084）：
+    给失败 / 没出图的错误挂上 `workdir_hint`（与首开同形的「在脚本目录里运行」引导）。码与消息一字不变。"""
+    if err.code not in _WORKDIR_HINT_CODES or getattr(err, "missing_input", None) is not None:
+        return err  # 已经有更具体的指认了（缺的文件），不叠第二个引导
+    extra = err.extra or {}
+    hint = workdir_hint_for(
+        script_name, figures_dir, extra.get("probe_misses"), extra.get("enoent")
+    )
+    if hint is not None:
+        err.workdir_hint = hint
+    return err
+
+
 def _offer_missing_input(err: "WorkerError", script_name: str, figures_dir) -> "WorkerError":
+    """`_offer_missing_input_payload` + 运行时的脚本目录引导（`workdir_hint`）。三处调用方不变。"""
+    return _offer_workdir_hint(
+        _offer_missing_input_payload(err, script_name, figures_dir), script_name, figures_dir
+    )
+
+
+def _offer_missing_input_payload(
+    err: "WorkerError", script_name: str, figures_dir
+) -> "WorkerError":
     """数据找不到（ADR 0106）：给错误挂上弹窗载荷 `missing_input`。
 
     `missing_input`（worker 说得出缺的是哪一串）与「脚本跑完没出图」/「脚本自己 exit 了」
@@ -977,7 +1058,10 @@ def missing_stem_error(worker, stem: str, known) -> "WorkerError | None":
         return None
     script_name = getattr(worker, "script_name", "") or ""
     err = WorkerError(f"stem 不存在: {stem}", "", code="unknown_stem")
-    err.extra = {"known": known}
+    # 沙盒里落空的探路调用也带上（#1254）：准备流程是默认的主流程，动态 glob 扫空 → 没捕获到图，
+    # 不带的话 `_offer_workdir_hint` 看不到证据，用户只剩一句笼统的「没出图」
+    misses = getattr(worker, "last_build_probe_misses", None)
+    err.extra = {"known": known, **({"probe_misses": misses} if misses else {})}
     err.script_name = script_name
     try:
         tail = worker._log_tail()
@@ -2491,6 +2575,8 @@ class EngineWorker:
     last_build_source_sha256: str | None = None
     #: 最近一次 build 每一问的去向计数（`inputbroker.InputFacts`）与它绑定的执行转录（只有 id 与计数）。
     last_input_facts: dict | None = None
+    #: 最近一次 build 响应里沙盒落空的探路调用（#1254）：build 成功但图可能是空的时，渲染 / 试运行据此挂 `workdir_hint`
+    last_build_probe_misses: list | None = None
     last_input_transcript: dict | None = None
 
     def alive(self) -> bool:
@@ -2866,6 +2952,8 @@ class EngineWorker:
             figcapture.clear_preview_poison(self.out_dir)
         self.last_build_descriptors = list(resp.get("descriptors") or [])
         self.last_build_runtime = _runtime_of(resp)
+        misses = resp.get("probe_misses")
+        self.last_build_probe_misses = misses if isinstance(misses, list) else None
         self.last_build_execution_id = resp.get("execution_id")
         self.last_build_artifact_probe = resp.get("artifact_probe")
         self.last_build_script_inputs = _script_inputs_of(resp)
@@ -3207,6 +3295,8 @@ class WorkerdWorker:
     #: 没 build / build 失败 / 老 worker 没带 = None。TAF 改图验证比的是它，不是 spawn 时采样的 `script_sha1`。
     last_build_source_sha256: str | None = None
     last_input_facts: dict | None = None
+    #: 最近一次 build 响应里沙盒落空的探路调用（#1254）：build 成功但图可能是空的时，渲染 / 试运行据此挂 `workdir_hint`
+    last_build_probe_misses: list | None = None
     last_input_transcript: dict | None = None
 
     def __init__(
@@ -3583,6 +3673,8 @@ class WorkerdWorker:
             figcapture.clear_preview_poison(self.out_dir)
         self.last_build_descriptors = list(resp.get("descriptors") or [])
         self.last_build_runtime = _runtime_of(resp)
+        misses = resp.get("probe_misses")
+        self.last_build_probe_misses = misses if isinstance(misses, list) else None
         self.last_build_execution_id = resp.get("execution_id")
         self.last_build_artifact_probe = resp.get("artifact_probe")
         self.last_build_script_inputs = _script_inputs_of(resp)
