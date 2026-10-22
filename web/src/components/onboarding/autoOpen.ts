@@ -1,13 +1,41 @@
 import { useEffect } from 'react'
+import { ackReinstallMarker, fetchReinstallMarker } from '@/lib/api'
+import { isDesktop } from '@/lib/desktop'
 import { useOnboardingStore } from '@/store/onboardingStore'
 import { useProjectStore } from '@/store/projectStore'
 
 /** 一次页面会话里只判一次（App 的两个分支各挂一份，换分支会重挂） */
 let autoChecked = false
 
+/** 卸载记号一次页面会话里只问一次 */
+let reinstallChecked = false
+
 /** 测试用：让下一次挂载重新判 */
 export function resetTutorialAutoOpenForTest(): void {
   autoChecked = false
+  reinstallChecked = false
+}
+
+/**
+ * Windows 卸载后重装（NSIS 卸载记号，ADR 0136 修订 2026-10-21）：卸载不删 WebView 的 localStorage，
+ * 重装后前端仍记得「教程已完成」。后端看到记号就回 true → 这里把 onboarding 迁回新手态（与升级迁移同一状态），
+ * 再 ack 让后端删记号。先改状态再 ack：处理中途失败记号还在，下次启动接着来；应用内更新不写记号，永远是 false。
+ * 取不到（旧后端 / 非 Windows 恒 false）一律当没有，不打扰。
+ * **只有桌面客户端（`isDesktop()`，壳拉起的本机 sidecar）消费**：同一个 `%APPDATA%\Tavotto` 记号浏览器模式的后端也读得到，
+ * 浏览器里（pip / 源码安装、远程实例窗口）取了或 ack 了，会把记号耗掉而真正重装的桌面 WebView 拿到 false（Codex #1272）——
+ * 所以浏览器不取、不 ack、不重置。
+ */
+async function applyReinstallMarker(): Promise<void> {
+  if (!isDesktop()) return
+  try {
+    const { reinstalled } = await fetchReinstallMarker()
+    if (!reinstalled) return
+    useOnboardingStore.getState().resetToNewcomer()
+    autoChecked = false // 让下面的 effect（订阅了 status / welcomeSeenAt）按新手态重判一次
+    await ackReinstallMarker()
+  } catch {
+    /* 没拿到就当没有；记号留着，下次启动再试 */
+  }
 }
 
 /**
@@ -25,6 +53,14 @@ export function resetTutorialAutoOpenForTest(): void {
 export function useAutoOpen(): void {
   const phase = useProjectStore((s) => s.phase)
   const listsLoaded = useProjectStore((s) => s.listsLoaded)
+  // 订阅这两项：重装重置把它们改回新手态后，下面的判定要重跑
+  const status = useOnboardingStore((s) => s.status)
+  const welcomeSeenAt = useOnboardingStore((s) => s.welcomeSeenAt)
+  useEffect(() => {
+    if (reinstallChecked) return
+    reinstallChecked = true
+    void applyReinstallMarker()
+  }, [])
   useEffect(() => {
     if (autoChecked || phase === 'loading') return
     const ob = useOnboardingStore.getState()
@@ -37,5 +73,5 @@ export function useAutoOpen(): void {
     autoChecked = true
     if (phase !== 'none' || ob.status !== 'not_started' || ob.welcomeSeenAt !== null) return
     ob.openWelcome()
-  }, [phase, listsLoaded])
+  }, [phase, listsLoaded, status, welcomeSeenAt])
 }
