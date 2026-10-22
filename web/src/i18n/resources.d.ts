@@ -2918,6 +2918,9 @@ export default interface Resources {
       "repairManagedUnavailableHint": "需要 Python {{min}}–{{max}}；如果已经装过，可以在下面指定它。",
       "repairModifiesEnv": "会修改项目的 Python 环境。",
       "repairNeedsNetwork": "需要联网下载",
+      "repairNotFoundNamed": "软件源里找不到 {{name}}。",
+      "repairNotFoundNamedFrom": "软件源里找不到 {{name}}（来自 {{source}}）。",
+      "repairNotPipInstallable": "{{name}} 不能用 pip 安装，要在装有它的 Python 环境里运行。",
       "repairPackageAria": "要安装的包名",
       "repairPackagePlaceholder": "例如 my-lab-tools 或 my-lab-tools>=2.1",
       "repairPinnedBody": "渲染用的 Python 被固定为 {{python}}（{{source}}），在取消固定前，为这个项目装的或选的环境都不会被使用。",
@@ -5419,6 +5422,8 @@ export default interface Resources {
         "detail": {
           "alternatives": "有几个包都能提供它，先按 {{distribution}} 装；想换别的，请改用你自己的 Python 环境。",
           "listIntro": "这些库的来源还没法确定，Tavotto 不会替你装：",
+          "localMissing": "找不到本地模块 {{name}}（脚本把 {{dirs}} 加进了搜索路径，请确认这个文件夹在）。",
+          "notPip": "这个脚本需要 {{name}}，内置 Python 装不了，请用装有它的环境。",
           "trustNote": "你填的包名不算可信来源：Tavotto 没法核实它们，所以装之前会让你再确认一次。",
           "userSpecifiedBadge": "用户指定，未经核实"
         },

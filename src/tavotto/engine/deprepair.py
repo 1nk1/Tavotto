@@ -858,6 +858,17 @@ def supported_python_range() -> dict:
     return {"min": f"{lo[0]}.{lo[1]}", "max": f"{hi[0]}.{hi[1]}"}
 
 
+def _not_pip_of(module: str, requirement: "depresolve.DependencyRequirement | None") -> dict | None:
+    """这个缺的 import / 解析出的发行包是「已知装不了」表里的吗？是则回 `{label, hint}`（与联合计划同一张表、同一口径）。
+
+    单包兜底路径（`offer` / `create_plan`）也要查：声明 `root`、`import ROOT` 时联合计划已把它从 missing 里摘掉，
+    执行后撞 import 失败才落到这里——这时 `depresolve.resolve()` 仍会解出一个「可装」的 `root`（Codex #1276 P1）。"""
+    hit = depresolve.not_pip_installable(module)
+    if hit is None and requirement is not None and requirement.distribution:
+        hit = depresolve.not_pip_for_distribution(requirement.distribution)
+    return {"label": hit["label"], "hint": hit["hint"]} if hit else None
+
+
 def offer(project: str | Path, script: str, module: str, project_env: dict | None = None) -> dict:
     """缺 `module` 时「能怎么修」——**只读判断，不装任何东西**。
 
@@ -963,6 +974,13 @@ def offer(project: str | Path, script: str, module: str, project_env: dict | Non
         for r in projectenv.rejected_system_candidates(system)
     ]
 
+    not_pip = _not_pip_of(module, requirement)
+    if not_pip is not None:
+        # 点名「需要自己的环境」：不给安装需求，也不给任何装进 Tavotto 管的环境的目标（上面采用已有环境的目标照旧）
+        out["requirement"] = None
+        out["not_pip_installable"] = not_pip
+        out["code"] = ERROR_UNRESOLVED
+        return out
     if requirement is None or not requirement.installable:
         out["code"] = ERROR_UNRESOLVED
         return out
@@ -1081,6 +1099,13 @@ def create_plan(
         requirement = depresolve.resolve(root, module, script)
         if requirement is None:
             raise RepairError(ERROR_UNRESOLVED, f"无法确定 {module} 对应哪个安装包")
+    not_pip = _not_pip_of(module, requirement)
+    if not_pip is not None:
+        raise RepairError(
+            ERROR_UNRESOLVED,
+            f"{not_pip['label']} 不在 PyPI 上，需要有它的自己的环境",
+            not_pip_installable=not_pip,
+        )
     if not requirement.installable:
         raise RepairError(ERROR_REQUIREMENT_INVALID, "这个需求不可安装")
 
@@ -1809,6 +1834,57 @@ def classify_pip_failure(text: str) -> str:
     if "could not find a version" in low or "no matching distribution" in low:
         return ERROR_NOT_FOUND if "from versions: none" in low else ERROR_REQUIRES_BUILD
     return ERROR_FAILED
+
+
+_NOT_FOUND_NAME_RES = (
+    re.compile(r"no matching distribution found for\s+([A-Za-z0-9][A-Za-z0-9._-]*)", re.I),
+    re.compile(
+        r"could not find a version that satisfies the requirement\s+([A-Za-z0-9][A-Za-z0-9._-]*)",
+        re.I,
+    ),
+)
+
+
+def not_found_detail(
+    out: str, record: tuple[dict, ...] | list[dict], project: str | Path, script: str
+) -> dict:
+    """pip 报「找不到」时点名：是哪个分发名、来自哪个声明文件 / 哪个 import（ADR 0061 修订 2026-10-21）。
+
+    `{name, import_name, source}`；认不出名字回 `{}`（界面退回通用句，不猜）。声明文件按 `depresolve.declared_intents`
+    重新读（只读），不在 `record` 里加字段（`record` 进回执与指纹）。"""
+    name = ""
+    for rx in _NOT_FOUND_NAME_RES:
+        m = rx.search(out or "")
+        if m:
+            name = m.group(1)
+            break
+    if not name:
+        return {}
+    key = depresolve.normalize_distribution(name)
+    import_name = next(
+        (
+            str(r.get("import_name") or "")
+            for r in record or ()
+            if depresolve.normalize_distribution(str(r.get("distribution") or "")) == key
+        ),
+        "",
+    )
+    source = ""
+    try:
+        for it in depresolve.declared_intents(project, script):
+            if it.declared and it.name == key and it.source:
+                source = it.source
+                break
+    except Exception:  # noqa: BLE001 - 点名是锦上添花，读不了声明不能让失败变形
+        source = ""
+    return {"name": key, "import_name": import_name, "source": source}
+
+
+def _not_found_extra(code: str, out: str, record, project, script) -> dict:
+    if code != ERROR_NOT_FOUND:
+        return {}
+    detail = not_found_detail(out, record, project, script)
+    return {"not_found": detail} if detail else {}
 
 
 def pip_install_argv(
@@ -2556,9 +2632,15 @@ def _emit(
     pinned: dict | None = None,
     impact: dict | None = None,
     dist_reasons: list[str] | None = None,
+    not_found: dict | None = None,
 ) -> dict:
     with _lock:
         rec = dict(_progress.get(plan_id) or {"log": ""})
+        if not_found:
+            # pip 找不到的那个包（点名：分发名 / 来自哪个 import / 哪份声明文件）：界面一句话说「找不到 X（来自 Y）」
+            rec["not_found"] = {
+                k: str(v) for k, v in not_found.items() if k in ("name", "import_name", "source")
+            }
         rec.update(
             plan_id=plan_id, state=state, code=code, error=error, result=result or rec.get("result")
         )
@@ -4574,6 +4656,7 @@ def _prepare_guarded(
             code=exc.code,
             error=str(exc),
             dist_reasons=dist_reasons_of(exc),
+            not_found=(exc.extra or {}).get("not_found"),
         )
     except Exception as exc:  # noqa: BLE001
         LOG.exception("联合准备线程异常")
@@ -4718,7 +4801,11 @@ def _run_joint_in_place(plan: JointRepairPlan, on_event, cancel_ev: threading.Ev
         )
         return {"ok": False, "code": ERROR_CANCELLED, **detail}
     if code:
-        raise RepairError(code, _sanitize(out)[-800:])
+        raise RepairError(
+            code,
+            _sanitize(out)[-800:],
+            **_not_found_extra(code, out, plan.record, plan.project, plan.script),
+        )
     _emit(plan.plan_id, STATE_VERIFYING, on_event, joint=plan)
     _verify_imports(python, plan.needed_imports)
     provided = _verify_distributions(
@@ -4993,7 +5080,11 @@ def _run_generation_locked(job: _GenerationJob, cancel_ev: threading.Event, key:
         managedenv.mark_generation(
             project, generation, managedenv.GEN_STATE_INCOMPLETE, f"安装失败: {code}"
         )
-        raise RepairError(code, _sanitize(out)[-800:])
+        raise RepairError(
+            code,
+            _sanitize(out)[-800:],
+            **_not_found_extra(code, out, job.record, job.project, job.script),
+        )
     if job.attempted:
         # pip 跑成了：从这里起「再装一遍同一个需求」改变不了任何东西（验证没过也一样），
         # 防循环的黑名单这时才登记——与项目 venv 那条路 `_run_install` 的登记点同一语义
