@@ -506,6 +506,39 @@ describe('输出范围', () => {
     await click(button('开始导出')!)
     expect(exportBodies).toHaveLength(1)
     expect(exportBodies[0].scope, '内部改按画布导').toBe('canvas')
+    // 退路按图框裁掉页面白边：请求的页面尺寸 = 预览显示的 80 × 60 mm
+    expect((exportBodies[0].canvas as { page_w_mm: number }).page_w_mm).toBe(80)
+    expect((exportBodies[0].canvas as { page_h_mm: number }).page_h_mm).toBe(60)
+  })
+})
+
+describe('单图退路裁白边：检查 / proof report / 请求吃同一份裁后文档', () => {
+  it('页面 180 × 120、图 80 × 60 摆在 (30, 20)：请求与报告的页面都是 80 × 60，对象坐标平移到 (0, 0)', async () => {
+    await setup(8, { w: 180, h: 120 }) // 8pt → error，报告必出
+    useDocumentStore.getState().commit(literal('挪'), (d) => {
+      d.objects = d.objects.map((o) => ({ ...o, x: 30, y: 20 }))
+    })
+    useAssetStore.setState({ byId: {} } as never)
+    useWorkspaceStore.setState({ mode: 'fast_edit', activePanelId: 'p1' })
+    await act(async () => {
+      useUiStore.getState().setExportOpen(false)
+    })
+    await act(async () => {
+      useUiStore.getState().setExportOpen(true)
+    })
+    expect(document.body.querySelector('[data-export-preview-size]')?.textContent).toContain('80 × 60 mm')
+    await click(button('开始导出')!)
+    expect(exportBodies).toHaveLength(1)
+    const canvas = exportBodies[0].canvas as {
+      page_w_mm: number
+      page_h_mm: number
+      objects: { x_mm: number; y_mm: number }[]
+    }
+    expect([canvas.page_w_mm, canvas.page_h_mm]).toEqual([80, 60])
+    expect([canvas.objects[0].x_mm, canvas.objects[0].y_mm]).toEqual([0, 0])
+    const report = exportBodies[0].style_check_report as { page_mm: { w: number; h: number } }
+    expect(report.page_mm.w).toBe(80)
+    expect(report.page_mm.h).toBe(60)
   })
 })
 
