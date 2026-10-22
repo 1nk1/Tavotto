@@ -104,6 +104,26 @@
   `~/.codex/config.toml`**（cc-switch 是改文件的，那对它合理，对我们是越权：
   用户在别的终端里跑 claude/codex 必须还是他自己那套）。密钥存用户配置
   （目录权限收到 0700），接口一律只回「有没有 + 尾四位」。
+  **协议：Codex 只认 `wire_api = "responses"`**（新版 codex 读到 `"chat"` 直接整个启动失败）。
+  `WIRE_APIS` 只剩 responses，`_clean` 默认 responses，`spawn_overrides` 结构上永远不产出 chat，
+  预设里没有任何 chat 条目。**按协议分流，不是「国产一律走 Claude Code」**：只有 Anthropic 兼容端点的
+  厂商（Kimi 开放平台 / 智谱 / MiniMax / 百炼按量 / 百炼 Coding Plan）经 Claude Code 接入；**原生支持
+  Responses 的厂商可留在 Codex**——目前是 DeepSeek 与 Kimi Code 会员。DeepSeek（预设 `deepseek-codex`，base_url `https://api.deepseek.com`
+  无结尾斜杠、Codex 其后拼 `/responses`，模型 `deepseek-flash` / `deepseek-v4-pro`；依据 DeepSeek 官方 Codex 集成文档，
+  Claude 版 `deepseek` 预设并存）；Kimi Code（预设 `kimi-code-codex`，`https://api.kimi.com/coding/v1`，模型 `k3-256k` / `k3`；
+  依据 Kimi Code 官方 Codex 集成文档，Claude 版 `kimi-code` 并存）。百炼的 Responses 地址带用户的 WorkspaceId、我们推不出，**不加 Codex 预设**。
+  codex 侧预设只有官方、DeepSeek、Kimi Code 会员与「自定义（OpenAI Responses 兼容）」——**界面名不带执行器后缀**：预设按执行器分页列出（只列该执行器能接的），选中后名字原样成为接口名，带「（Codex）」只会多余又难看。预设的模型名会过时，界面可编辑。
+  **已存的旧 codex + `wire_api="chat"` 记录既不静默坏、也不静默改执行器**：判据只在
+  `ai_providers.incompatibility()`（`public()` 回 `incompatible: "codex_chat_removed"` + `migratable`），
+  它被选为当前接口时 `ai_bridge.run` 在 spawn 之前以 409 `ai_endpoint_incompatible` 拒绝——**这个检查放在
+  `client_request_id` 去重查找之后**（ADR 0132：已受理请求的重发得到既有会话，不能被事后的接口变化变成 409）；
+  前端只消费这两个字段，行内一句话 + 一个主按钮。可迁移的由 `migration_kind()` 按主机名精确匹配分流，
+  `POST /api/ai/endpoints/<id>/migrate`（统一入口 `ai_providers.migrate`）：`migratable == "codex_responses"`
+  （`api.deepseek.com`）**原地**改成 Codex Responses（换 base_url、wire_api=responses、**保留 id / 密钥 / 作为
+  codex 当前接口的激活状态**，已退役的 `deepseek-chat` / `deepseek-reasoner` 换成新型号）；`"claude"`
+  （`dashscope.aliyuncs.com`）走 `migrate_to_claude`：新建 claude 记录（Anthropic 端点、**保留原密钥**、
+  模型换成新预设，id 撞车则加 `-2`，绝不覆盖用户已有记录）、删旧记录（codex 当前接口随之清回官方登录），
+  **不替用户激活 claude 那边**；对不上的自定义记录（`null`）只给「编辑」。看护：`tests/test_ai_endpoint_presets.py`。
 - **codex 模型清单读 `$CODEX_HOME/config.toml`（默认 `~/.codex`）的 `model` +
   `[profiles.*].model`，绝不在源码里写模型名**——OpenAI 换代后旧名会被服务端
   直接拒收（400 `The 'gpt-5' model is not supported when using Codex with a

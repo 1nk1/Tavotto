@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from urllib.parse import urlparse
 
 from . import ai_agents, config
 
@@ -32,7 +33,9 @@ from . import ai_agents, config
 CODEX_PROVIDER_ID = "tavotto"
 CODEX_KEY_ENV = "TAVOTTO_CODEX_API_KEY"
 
-WIRE_APIS = ("responses", "chat")
+#: Codex 新版已移除 `wire_api = "chat"`（读到就整个启动失败），所以只剩 Responses。
+#: 这里**结构上**不再有 chat：预设、`_clean`、`spawn_overrides` 都不可能产出它。
+WIRE_APIS = ("responses",)
 
 #: 协议族 → 该族的注入方式。**不再自己列一份 agent 名单**：谁支持接第三方
 #: 接口由 `ai_agents.AGENT_REGISTRY` 的 `endpoint_family` 说了算，这里只认族。
@@ -52,6 +55,8 @@ def _family(agent: str) -> str | None:
     return rec.endpoint_family if rec else None
 
 
+DEEPSEEK_CODEX_ID = "deepseek-codex"
+
 # 内置预设只提供「接口地址 + 协议 + 常见模型名」，绝不含任何密钥。
 # 模型名会过时，所以在界面上可自由编辑——预设只是省去查文档。
 PRESETS: list[dict] = [
@@ -63,26 +68,79 @@ PRESETS: list[dict] = [
         "models": ["sonnet", "opus", "haiku"],
         "note": "留空 = 用 claude CLI 自己的登录态",
     },
+    # 国产厂商多数只有 Anthropic 兼容端点（没有 OpenAI Responses 协议），经 Claude Code
+    # 接入；Codex 只认 Responses 协议（见 WIRE_APIS），目前只有 DeepSeek 官方明确原生支持
+    # Responses（api-docs.deepseek.com/quick_start/agent_integrations/codex/），所以它同时有
+    # 两条预设。base_url 不带结尾斜杠：`_clean` 一律 rstrip("/")，Codex 在其后拼 `/responses`。
     {
         "id": "deepseek",
         "label": "DeepSeek",
         "agent": "claude",
         "base_url": "https://api.deepseek.com/anthropic",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
+        "models": ["deepseek-v4-pro", "deepseek-flash"],
+    },
+    {
+        "id": DEEPSEEK_CODEX_ID,
+        "label": "DeepSeek",
+        "agent": "codex",
+        "base_url": "https://api.deepseek.com",
+        "wire_api": "responses",
+        "models": ["deepseek-flash", "deepseek-v4-pro"],
     },
     {
         "id": "moonshot",
-        "label": "Kimi（月之暗面）",
+        "label": "Kimi 开放平台",
         "agent": "claude",
         "base_url": "https://api.moonshot.cn/anthropic",
-        "models": ["kimi-k2-turbo-preview", "kimi-k2-0905-preview"],
+        "models": ["kimi-k3", "kimi-k2.7-code"],
+    },
+    {
+        "id": "kimi-code",
+        "label": "Kimi Code 会员",
+        "agent": "claude",
+        "base_url": "https://api.kimi.com/coding/",
+        "models": ["kimi-for-coding"],
+        "note": "Kimi Code 会员专属 Key，与开放平台 Key 不通用",
+    },
+    # Kimi Code 官方也原生支持 Responses（kimi.com/code/docs/en/third-party-tools/codex），
+    # 只有 Codex 的会员用户不必装 Claude Code。国内地址；同一把会员 Key。
+    {
+        "id": "kimi-code-codex",
+        "label": "Kimi Code 会员",
+        "agent": "codex",
+        "base_url": "https://api.kimi.com/coding/v1",
+        "wire_api": "responses",
+        "models": ["k3-256k", "k3"],
+        "note": "Kimi Code 会员专属 Key，与开放平台 Key 不通用",
     },
     {
         "id": "zhipu",
         "label": "智谱 GLM",
         "agent": "claude",
         "base_url": "https://open.bigmodel.cn/api/anthropic",
-        "models": ["glm-4.6", "glm-4.5-air"],
+        "models": ["glm-5.3", "glm-5.2"],
+    },
+    {
+        "id": "minimax",
+        "label": "MiniMax",
+        "agent": "claude",
+        "base_url": "https://api.minimaxi.com/anthropic",
+        "models": ["MiniMax-M3", "MiniMax-M2.7"],
+    },
+    {
+        "id": "dashscope",
+        "label": "阿里云百炼（按量）",
+        "agent": "claude",
+        "base_url": "https://dashscope.aliyuncs.com/apps/anthropic",
+        "models": ["qwen3.7-plus", "qwen3.8-max"],
+    },
+    {
+        "id": "dashscope-coding",
+        "label": "阿里云百炼 Coding Plan",
+        "agent": "claude",
+        "base_url": "https://coding.dashscope.aliyuncs.com/apps/anthropic",
+        "models": ["qwen3.7-plus"],
+        "note": "Coding Plan 专属 Key（sk-sp- 开头），与按量 Key 不通用",
     },
     {
         "id": "openai",
@@ -94,22 +152,6 @@ PRESETS: list[dict] = [
         "note": "留空 = 用 codex CLI 自己的登录态",
     },
     {
-        "id": "dashscope",
-        "label": "阿里云百炼（通义）",
-        "agent": "codex",
-        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "wire_api": "chat",
-        "models": ["qwen3-coder-plus", "qwen-max"],
-    },
-    {
-        "id": "deepseek-oai",
-        "label": "DeepSeek（OpenAI 兼容）",
-        "agent": "codex",
-        "base_url": "https://api.deepseek.com/v1",
-        "wire_api": "chat",
-        "models": ["deepseek-chat", "deepseek-reasoner"],
-    },
-    {
         "id": "custom-claude",
         "label": "自定义（Anthropic 兼容）",
         "agent": "claude",
@@ -118,13 +160,31 @@ PRESETS: list[dict] = [
     },
     {
         "id": "custom-codex",
-        "label": "自定义（OpenAI 兼容）",
+        "label": "自定义（OpenAI Responses 兼容）",
         "agent": "codex",
         "base_url": "",
-        "wire_api": "chat",
+        "wire_api": "responses",
         "models": [],
     },
 ]
+
+# 旧版 codex 预设（wire_api=chat）的已知厂商 → 改由 Claude Code 接入时用的预设 id。
+# 只认主机名精确相等：coding.dashscope.aliyuncs.com 等是另一套 Key，不在此列。
+# 百炼不在 Codex 侧迁移：官方 Responses 地址带用户的 WorkspaceId，我们推不出来。
+_LEGACY_CHAT_HOST_PRESET = {
+    "dashscope.aliyuncs.com": "dashscope",
+}
+
+# 旧版 codex 预设里 DeepSeek 已退役的模型名 → 新 Responses 预设的型号。
+_DEEPSEEK_RETIRED_MODELS = {
+    "deepseek-chat": "deepseek-flash",
+    "deepseek-reasoner": "deepseek-v4-pro",
+}
+
+MIGRATE_CODEX_RESPONSES = "codex_responses"
+MIGRATE_CLAUDE = "claude"
+
+INCOMPATIBLE_CODEX_CHAT = "codex_chat_removed"
 
 _ID_RE = re.compile(r"[^a-zA-Z0-9_-]+")
 
@@ -154,7 +214,7 @@ def _clean(rec: dict, existing_ids: set[str] = frozenset()) -> dict:
         "api_key": str(rec.get("api_key") or "").strip(),
         "models": models,
         "default_model": default_model,
-        "wire_api": wire if wire in WIRE_APIS else "chat",
+        "wire_api": wire if wire in WIRE_APIS else "responses",
     }
 
 
@@ -183,7 +243,128 @@ def public(rec: dict) -> dict:
         **{k: v for k, v in rec.items() if k != "api_key"},
         "has_key": bool(key),
         "key_hint": f"…{key[-4:]}" if len(key) >= 4 else "",
+        "incompatible": incompatibility(rec),
+        "migratable": migration_kind(rec),
     }
+
+
+def incompatibility(rec: dict | None) -> str | None:
+    """这条记录现在还能不能用；不能用就返回稳定的原因码，否则 None。
+
+    **判据只在这一处**（前端只消费 `public()` 里的 `incompatible`，`ai_bridge.run`
+    在 spawn 之前拒绝）。已存的旧记录是 `_clean` 之前写下的原始值：codex +
+    `wire_api="chat"` 是 Codex 已不再支持的协议，一跑就整个启动失败。
+    """
+    if rec and rec.get("agent") == "codex" and rec.get("wire_api") == "chat":
+        return INCOMPATIBLE_CODEX_CHAT
+    return None
+
+
+def _host(rec: dict | None) -> str:
+    return (urlparse(str((rec or {}).get("base_url") or "")).hostname or "").lower()
+
+
+def migration_kind(rec: dict | None) -> str | None:
+    """不兼容的旧 codex 记录能怎么一步迁移：`"codex_responses"`（该厂商支持 Responses，原地改）、
+    `"claude"`（只有 Anthropic 端点，改由 Claude Code 接入）、None（对不上已知厂商）。"""
+    if incompatibility(rec) is None:
+        return None
+    host = _host(rec)
+    if host == "api.deepseek.com":
+        return MIGRATE_CODEX_RESPONSES
+    if host in _LEGACY_CHAT_HOST_PRESET:
+        return MIGRATE_CLAUDE
+    return None
+
+
+def migration_preset(rec: dict | None) -> dict | None:
+    """迁移的目标预设（Codex Responses 预设或 Claude Code 预设）；无法迁移 → None。"""
+    kind = migration_kind(rec)
+    if kind == MIGRATE_CODEX_RESPONSES:
+        pid = DEEPSEEK_CODEX_ID
+    elif kind == MIGRATE_CLAUDE:
+        pid = _LEGACY_CHAT_HOST_PRESET.get(_host(rec))
+    else:
+        return None
+    return next((p for p in PRESETS if p["id"] == pid), None)
+
+
+def migrate(pid: str) -> dict:
+    """按厂商分派：支持 Responses 的 → 原地改 Codex Responses；只有 Anthropic 端点的 → 改由 Claude Code 接入。"""
+    kind = migration_kind(get(pid))
+    if kind == MIGRATE_CODEX_RESPONSES:
+        return _migrate_in_place(pid)
+    if kind == MIGRATE_CLAUDE:
+        return migrate_to_claude(pid)
+    raise ValueError(f"该接口无法自动迁移: {pid}")
+
+
+def _migrate_in_place(pid: str) -> dict:
+    """旧 chat 记录 → 原地改成 Codex Responses：保留 id / 密钥 / 作为 codex 当前接口的激活状态；
+    已退役的模型名换成新预设的型号，其余模型保留。"""
+    old = get(pid)
+    preset = migration_preset(old)
+    if old is None or preset is None or migration_kind(old) != MIGRATE_CODEX_RESPONSES:
+        raise ValueError(f"该接口无法自动迁移: {pid}")
+
+    def fix(m: str) -> str:
+        return _DEEPSEEK_RETIRED_MODELS.get(m, m)
+
+    models: list[str] = []
+    for m in [*(old.get("models") or []), *preset["models"]]:
+        m = fix(str(m))
+        if m not in models:
+            models.append(m)
+    default = old.get("default_model")
+    providers = save(
+        {
+            "id": pid,
+            "agent": "codex",
+            "base_url": preset["base_url"],
+            "wire_api": "responses",
+            "models": models,
+            "default_model": fix(default) if default else None,
+        }
+    )
+    return next(p for p in providers if p.get("id") == pid)
+
+
+def migrate_to_claude(pid: str) -> dict:
+    """不兼容的旧 codex 接口 → 新建一条 claude 接口（保留原密钥、模型换成预设的）并删掉旧的。
+
+    旧记录若是 codex 的当前接口，`delete()` 会把 codex 清回官方登录；**不替用户激活**
+    新建的 claude 接口（执行器是用户自己选的）。对不上「改由 Claude Code」的厂商 → ValueError。
+    """
+    old = get(pid)
+    preset = migration_preset(old)
+    if old is None or preset is None or migration_kind(old) != MIGRATE_CLAUDE:
+        raise ValueError(f"该接口无法自动迁移: {pid}")
+    providers = list_providers()
+    taken = {p.get("id") for p in providers}
+    new_id = preset["id"]
+    while new_id in taken:  # 绝不覆盖用户已有的同名接口（save 对已有 id 是合并）
+        new_id = f"{new_id}-2"
+    created = _clean(
+        {
+            "id": new_id,
+            "label": preset["label"],
+            "agent": preset["agent"],
+            "base_url": preset["base_url"],
+            "api_key": old.get("api_key", ""),
+            "models": list(preset["models"]),
+        },
+        taken,
+    )
+    # 内存里算好新列表与新激活映射，一次 set_ai_settings（tmp + replace）落盘：
+    # 中途退出 / 写盘失败 = 配置原样，不会留下「新 claude + 旧 codex」并存的半截状态。
+    remaining = [p for p in providers if p.get("id") != pid]
+    active = dict(_ai().get("active_provider") or {})
+    for agent, cur in list(active.items()):
+        if cur == pid:
+            active[agent] = None
+    config.set_ai_settings({"providers": [*remaining, created], "active_provider": active})
+    _harden()
+    return created
 
 
 def save(rec: dict) -> list[dict]:
@@ -309,7 +490,7 @@ def spawn_overrides(
             "-c",
             f"model_providers.{pid}.base_url={_toml(base_url)}",
             "-c",
-            f"model_providers.{pid}.wire_api={_toml(rec.get('wire_api') or 'chat')}",
+            f"model_providers.{pid}.wire_api={_toml('responses')}",
             "-c",
             f"model_providers.{pid}.env_key={_toml(CODEX_KEY_ENV)}",
         ]
