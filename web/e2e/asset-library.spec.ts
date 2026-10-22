@@ -377,6 +377,46 @@ test('多 Figure：?pick= 打开选择器，选第二张加的就是第二张', 
   expect(panels[0].fileId).toContain(secondStem)
 })
 
+test('捕获结果弹层：每一行都有真实缩略图（非空），添加到画布不受影响', async ({ app, page }) => {
+  const dir = path.join(os.tmpdir(), `tavotto-e2e-capthumb-${Date.now()}`)
+  mkdirSync(dir, { recursive: true })
+  writeFileSync(
+    path.join(dir, 'show_two.py'),
+    [
+      'import matplotlib',
+      'matplotlib.use("Agg")',
+      'import matplotlib.pyplot as plt',
+      '',
+      'plt.figure()',
+      'plt.plot([1, 2], [3, 4])',
+      'plt.figure()',
+      'plt.plot([2, 1], [4, 3])',
+      'plt.show()',
+      '',
+    ].join('\n'),
+    'utf-8',
+  )
+  writeFileSync(path.join(dir, 'tavotto_registry.json'),
+                JSON.stringify({ version: 1, scripts: {} }), 'utf-8')
+  const a = await app({ figures: dir })
+  await page.goto(a.baseURL)
+  await page.locator('[data-script-run="show_two.py"]').click()
+  const open = page.locator('[data-capture-results-open="show_two.py"]')
+  await expect(open).toBeVisible({ timeout: 120_000 })
+  await open.click()
+  const dialog = page.locator('[data-dialog="capture-results"]')
+  const rows = dialog.locator('[data-capture-row]')
+  await expect(rows).toHaveCount(2)
+  for (let i = 0; i < 2; i++) {
+    const row = rows.nth(i)
+    await expect(row.locator('[data-capture-thumb="ready"]')).toBeVisible({ timeout: 30_000 })
+    // 真的解出了像素，不是 0×0 的空图
+    const natural = await row.locator('img').evaluate((el: HTMLImageElement) => el.naturalWidth)
+    expect(natural).toBeGreaterThan(0)
+    await expect(row.locator('[data-capture-add]')).toBeEnabled()
+  }
+})
+
 /**
  * 起会话之前的依赖门（Windows 真机验收，main 493a1310）：项目里只有脚本、还没有图，试运行 200 回来、
  * `error.code == dependency_preparation_required` 带整份载荷。以前这一行掉进「可能需要原环境」，出口只有
