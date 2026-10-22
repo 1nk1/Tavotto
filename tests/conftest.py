@@ -18,7 +18,12 @@ import urllib.request
 
 import pytest
 
-from support import hang_watchdog as _hang, shard as _shard, system_fonts_shim as _system_fonts_shim
+from support import (
+    hang_watchdog as _hang,
+    render_children as _render_children,
+    shard as _shard,
+    system_fonts_shim as _system_fonts_shim,
+)
 
 # 模块级设置：app / engine 的路径常量在 import 时求值，必须先于用例模块被
 # import 就位，否则测试会写到真实的用户数据目录。单个用例仍各自 monkeypatch
@@ -268,6 +273,29 @@ def _stop_project_watchers_started_by_this_test():
         if t.is_alive():
             stuck.append(t.name)
     assert not stuck, f"本用例起的 project watcher 线程停不下来：{stuck}"
+
+
+@pytest.fixture(autouse=True)
+def _render_children_reaped():
+    """用例 teardown：**本用例自建**的 `RenderHost`（不是进程级共享实例）起的 render child 必须已经退出。
+
+    #1285：CI 上 `describe_children()` 在同片里撞见存活数分钟的 `python -m tavotto.rendercore.renderchild`。
+    判据的主语：本用例期间新建的非共享宿主的 child；时刻是用例 teardown。没 `close()` 就失败，打出 pid 与完整
+    命令行，随后只杀登记过的 PID。进程级共享实例按模块收，见 `_render_shared_host_reaped_per_module`。"""
+    _render_children.install()
+    mark = _render_children.mark()
+    yield
+    _render_children.reap(mark)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _render_shared_host_reaped_per_module():
+    """模块 teardown：收掉进程级共享 render child（`renderhost.shared()`，懒建、合法的会话级资源）。
+    不按用例收：每条都关会让下一条重起 child，用共享宿主多的文件慢两成左右。按模块收同样保证它不跨模块
+    活下去——这就是 #1285 里看门狗那条「此刻没有子进程」用例要的：进入它的模块之前，前一个模块的共享 child 已经收掉。"""
+    yield
+    if "tavotto.rendercore.renderhost" in sys.modules:
+        _render_children.reap_shared()
 
 
 @pytest.fixture(autouse=True)
