@@ -495,8 +495,22 @@ test('导出对话框：axe 干净 + 焦点 trap + Escape 关闭后焦点恢复'
     allow: [dialogBackgroundIsInert, contrastCoveredByOurOwnRuler, headingOrderCheckedByOurselves],
   })
 
-  // 原图的 EPS 可用；切到画布也扫一遍，覆盖「禁用控件 + 淡色标签」的整项语义。
-  await dialog.locator('[data-onboarding-anchor="export-scope"] [data-value="canvas"]').click()
+  // 单图编辑：固定按原图，没有「输出范围」；EPS 可用。再回到多图排版（默认整版）扫一遍，
+  // 覆盖「禁用控件 + 淡色标签 + 左栏缩略图条」的整项语义。
+  await expect(dialog.locator('[data-onboarding-anchor="export-scope"]')).toHaveCount(0)
+  await page.keyboard.press('Escape')
+  await expect(dialog).toHaveCount(0)
+  // 进多图排版的路：把第二张图加到画布（素材卡上的「＋」），页面 `[data-page-sheet]` 出现即为排版
+  const rail = page.locator('[data-rail="assets"]')
+  if ((await rail.getAttribute('aria-expanded')) !== 'true') await rail.click()
+  const second = page.locator('li[data-card="Fig2_yield.pdf"]')
+  await second.hover()
+  await second.locator('[data-card-add]').click()
+  await expect(page.locator('[data-page-sheet]')).toBeVisible({ timeout: 30_000 })
+  await exportButton.focus()
+  await page.keyboard.press('Enter')
+  await expect(dialog).toBeVisible()
+  await expect(dialog.locator('[data-onboarding-anchor="export-scope"]')).toHaveCount(1)
   await expect(dialog.locator('[data-export-formats] input').nth(2)).toBeDisabled()
   await expectAccessible(page, {
     allow: [dialogBackgroundIsInert, contrastCoveredByOurOwnRuler, headingOrderCheckedByOurselves],
