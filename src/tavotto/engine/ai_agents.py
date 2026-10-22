@@ -75,7 +75,10 @@ class CliCandidate:
 class ModelDetail:
     """一个模型型号的展示信息与它自己支持的推理强度（加字段协议：旧前端忽略）。
 
-    `efforts` 为空 = 该 Agent 没声明这个型号的档位，前端回落到 Agent 级 `efforts`。
+    `efforts_known` 区分「未知」与「明确没有档位」：False（默认）= 目录里没有这个型号
+    （只在 config.toml 里有 / 目录读不到），`efforts` 为空只表示“不知道”，前端回落到
+    Agent 级 `efforts`；True = 目录明确给了这个型号，`efforts` 就是它的全部档位，
+    为空 = 明确没有档位（不暴露选择、不传 `--effort`）。
     """
 
     id: str
@@ -83,6 +86,7 @@ class ModelDetail:
     description: str = ""
     efforts: list[str] = field(default_factory=list)
     default_effort: str | None = None
+    efforts_known: bool = False
 
 
 @dataclass(frozen=True)
@@ -122,6 +126,19 @@ class InstallSpec:
 
     method: str
     package: str
+
+
+def _effort_supported(details: list[ModelDetail], model: str | None, effort: str | None) -> bool:
+    """所选型号在目录里且 `efforts_known` 时，请求档位必须在其档位内（含明确无档位 = 一律不传）。
+
+    没选型号 / 目录里没有该型号 = 未知，沿用请求。Claude 与 Codex 的 `build_command` 共用。
+    """
+    if not model:
+        return True
+    d = next((x for x in details if x.id == model), None)
+    if d is None or not d.efforts_known:
+        return True
+    return effort in d.efforts
 
 
 @dataclass(frozen=True)
@@ -383,6 +400,9 @@ class AgentDefinition:
     install_spec: InstallSpec | None = None
     supports_model_selection: bool = False
     supports_effort_selection: bool = False
+    #: 档位来自官方目录：接第三方接口（网关）时网关后面的型号未必认，界面不给档位、命令不传。
+    #: 默认 False（Codex 现状不变，网关下仍可传）
+    effort_official_only: bool = False
     #: 该族的第三方接口要不要选 wire api（OpenAI 兼容那一族才有 responses/chat
     #: 两种协议）。**由适配器声明**，前端不该靠 `id === "codex"` 猜。
     supports_wire_api: bool = False
@@ -562,6 +582,7 @@ class CodexAgent(AgentDefinition):
                         description=desc if isinstance(desc, str) else "",
                         efforts=efforts,
                         default_effort=default if isinstance(default, str) and default else None,
+                        efforts_known=True,
                     ),
                 )
             )
@@ -624,7 +645,8 @@ class CodexAgent(AgentDefinition):
         cmd += ctx.endpoint_args
         if ctx.model:
             cmd += ["-m", ctx.model]
-        if ctx.effort:
+        # 目录明确给了所选型号的档位时，请求档位必须在其中；明确无档位就不传（Codex 会拒绝）
+        if ctx.effort and _effort_supported(self._catalog(), ctx.model, ctx.effort):
             cmd += ["-c", f"model_reasoning_effort={ctx.effort}"]
         return SpawnSpec(cmd + [ctx.prompt], dict(ctx.endpoint_env))
 
@@ -670,17 +692,128 @@ class ClaudeAgent(AgentDefinition):
     endpoint_family = "anthropic"
     install_spec = InstallSpec(method="npm", package="@anthropic-ai/claude-code")
     supports_model_selection = True
-    #: claude CLI 没有推理强度开关，不假装有
-    supports_effort_selection = False
+    #: claude CLI 有 `--effort <level>`；档位来自它自己的模型目录缓存（读不到就不暴露档位）
+    supports_effort_selection = True
+    effort_official_only = True
     supports_readiness_probe = True
 
+    #: 模型目录缓存不可用时的退路：三个别名，行为与引入目录之前完全一致
     MODELS = ["sonnet", "opus", "haiku"]
 
+    @staticmethod
+    def _home() -> Path:
+        """Claude Code 自己的配置目录（`CLAUDE_CONFIG_DIR` 是其官方覆盖变量，测试也用它重定向）。"""
+        return Path(os.environ.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+
+    @classmethod
+    def _catalog(cls) -> tuple[list[ModelDetail], dict[str, str], dict[str, str]]:
+        """读 `<home>/cache/model-catalog/*.json`（CLI 自己缓存的模型目录），只读。
+
+        返回 (`section == "main"` 的型号按文件原序, id→family, 别名→id)。文件名里带账号
+        uuid、可能有多份：取 `fetchedAt` 最大且**可解析、main 段非空**的一份。缺失 / 损坏 /
+        结构变了一律返回空（调用方退回三个别名），绝不抛、不猜。`overflow` 段是旧型号，不列。
+        """
+        best: tuple[float, list, dict] | None = None
+        try:
+            files = sorted((cls._home() / "cache" / "model-catalog").glob("*.json"))
+        except OSError:
+            return [], {}, {}
+        for f in files:
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+                cfg = data["catalog"]["config"]
+                raw = cfg["models"]
+                fetched = data.get("fetchedAt")
+                if not isinstance(raw, list) or isinstance(fetched, bool):
+                    continue
+                stamp = float(fetched)
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+            if best is None or stamp > best[0]:
+                if any(isinstance(m, dict) and m.get("section") == "main" for m in raw):
+                    best = (stamp, raw, cfg)
+        if best is None:
+            return [], {}, {}
+        details: list[ModelDetail] = []
+        families: dict[str, str] = {}
+        for m in best[1]:
+            if not isinstance(m, dict) or m.get("section") != "main":
+                continue
+            mid = m.get("id")
+            if not isinstance(mid, str) or not mid or any(d.id == mid for d in details):
+                continue
+            name = m.get("name")
+            desc = m.get("description")
+            rt = m.get("runtime") if isinstance(m.get("runtime"), dict) else {}
+            levels = rt.get("effort_levels")
+            efforts = (
+                [e for e in levels if isinstance(e, str) and e] if isinstance(levels, list) else []
+            )
+            default = rt.get("default_effort")
+            fam = rt.get("family")
+            if isinstance(fam, str) and fam:
+                families[mid] = fam
+            details.append(
+                ModelDetail(
+                    id=mid,
+                    display_name=name if isinstance(name, str) and name else mid,
+                    description=desc if isinstance(desc, str) else "",
+                    efforts=list(dict.fromkeys(efforts)),
+                    default_effort=default if isinstance(default, str) and default else None,
+                    efforts_known=True,
+                )
+            )
+        aliases: dict[str, str] = {}
+        pat = best[2].get("provider_alias_targets")
+        if isinstance(pat, dict):
+            for alias, spec in pat.items():
+                target = spec.get("default") if isinstance(spec, dict) else None
+                if isinstance(alias, str) and isinstance(target, str):
+                    aliases[alias] = target
+        return details, families, aliases
+
+    @classmethod
+    def _user_model(cls) -> str | None:
+        """用户 `settings.json` 里的 `model`（只读）；`[1m]` 之类方括号后缀去掉。"""
+        try:
+            data = json.loads((cls._home() / "settings.json").read_text(encoding="utf-8"))
+            value = data["model"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        if not isinstance(value, str):
+            return None
+        return re.sub(r"\[[^\]]*\]$", "", value.strip()) or None
+
     def model_capabilities(self) -> ModelCapabilities:
+        details, families, aliases = self._catalog()
+        if not details:
+            return ModelCapabilities(
+                models=list(self.MODELS),
+                default_model="sonnet",
+                model_details=[ModelDetail(id=m, display_name=m.capitalize()) for m in self.MODELS],
+            )
+        ids = [d.id for d in details]
+        wanted = self._user_model()
+        default = ids[0]
+        if wanted:
+            if wanted in ids:
+                default = wanted
+            elif aliases.get(wanted) in ids:
+                default = aliases[wanted]
+            else:
+                default = next((i for i in ids if families.get(i) == wanted), ids[0])
+        by_id = {d.id: d for d in details}
+        efforts: list[str] = []
+        for d in details:
+            for e in d.efforts:
+                if e not in efforts:
+                    efforts.append(e)
         return ModelCapabilities(
-            models=list(self.MODELS),
-            default_model="sonnet",
-            model_details=[ModelDetail(id=m, display_name=m.capitalize()) for m in self.MODELS],
+            models=ids,
+            default_model=default,
+            efforts=efforts,
+            default_effort=by_id[default].default_effort,
+            model_details=details,
         )
 
     def readiness(self, argv: list[str]) -> ReadinessResult:
@@ -729,7 +862,15 @@ class ClaudeAgent(AgentDefinition):
         cmd += ctx.endpoint_args
         if ctx.model:
             cmd += ["--model", ctx.model]
+        # 网关（注入了接口参数 / 环境）后面的型号未必认这个档位：宁可不传
+        # 目录明确给了所选型号的档位时，请求的档位必须在其中；明确无档位就不传
+        if ctx.effort and not (ctx.endpoint_args or ctx.endpoint_env) and self._effort_ok(ctx):
+            cmd += ["--effort", ctx.effort]
         return SpawnSpec(cmd, dict(ctx.endpoint_env))
+
+    def _effort_ok(self, ctx: RunContext) -> bool:
+        details, _families, _aliases = self._catalog()
+        return _effort_supported(details, ctx.model, ctx.effort)
 
     def classify_event(self, line: str, state: dict) -> list[tuple[str, str]]:
         try:

@@ -134,7 +134,18 @@
   `model_details[]`（`id / display_name / description / efforts / default_effort`，与 `models` 并行）
   带显示名与**自己支持的**推理强度（`supported_reasoning_levels` / `default_reasoning_level`）。
   缓存缺失 / 损坏 / 字段变了一律退回只用 config.toml（不抛、不猜模型名）；第三方接口接管时
-  `model_details` 为空（网关的型号名与官方目录无关）；Claude Code 侧仍是 sonnet/opus/haiku，只多带显示名。
+  `model_details` 为空（网关的型号名与官方目录无关）；**Claude Code 侧同理读它自己的模型目录缓存**
+  `$CLAUDE_CONFIG_DIR`（默认 `~/.claude`）`/cache/model-catalog/*.json`（只读）：多份取 `fetchedAt` 最新且可解析、
+  main 段非空的一份；只列 `section == "main"`（`overflow` 旧型号不列），`model_details.id` 是完整 id（直接传 `--model`），
+  `efforts` / `default_effort` 取 `runtime.effort_levels / default_effort`，派活时经 `--effort` 传入。默认型号 =
+  `settings.json` 的 `model`（去 `[1m]` 后缀）依次按：完整 id → `provider_alias_targets` 别名 → 同 family 的 main 型号 → 目录第一项。
+  缓存缺失 / 损坏 / 结构变了一律退回 sonnet/opus/haiku 三个别名且无档位（不抛、不猜）；旧记住的别名选择
+  被 `prunePrefs` 丢弃后落到默认型号。第三方接口（网关）生效时 Claude 不暴露档位、`build_command` 不带 `--effort`
+  （`effort_official_only`；网关后面的型号未必认这个档位）。
+  `model_details[].efforts_known`（加字段）区分「未知」与「明确没有档位」：目录里给了该型号 runtime 但没有
+  `effort_levels`（或为空）= `efforts_known: true` 且 `efforts: []`，前端不显示强度选择、发送不带 effort，Claude 与 Codex 的
+  `build_command` 都兜底不传（请求档位不在该型号档位内同样不传）；只在 config.toml 里有、目录里没有的型号 = 未知
+  （`false`/缺省），前端回落 Agent 级 `efforts`。
   Agent 级 `efforts` 仍在，是各型号档位的并集（旧前端与 `prunePrefs` 用）。前端两级选择器
   （执行器家族 → 型号）与「档位跟着型号走」见 `web/src/components/ai/ModelPicker.tsx`、
   `aiStore.effortsForModel / resolveEffort`（`aiModelPicker.test.tsx`、`e2e/ai-model-picker.spec.ts`）。
