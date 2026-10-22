@@ -8,6 +8,7 @@ import { CloseGuardDialog } from '@/components/CloseGuardDialog'
 import { ConfirmDialog } from '@/components/ConfirmDialog'
 import { ExportDialog } from '@/components/ExportDialog'
 import { Inspector } from '@/components/inspector/Inspector'
+import { TimelinePreviewDialog } from '@/components/VersionDialog'
 import { LayoutDialog } from '@/components/LayoutDialog'
 import { CommandPalette } from '@/components/CommandPalette'
 import { FigurePickerDialog } from '@/components/FigurePickerDialog'
@@ -23,7 +24,6 @@ import { DiagnosticsSendHost } from '@/components/DiagnosticsSendHost'
 import { ShortcutHelp } from '@/components/ShortcutHelp'
 import { StyleDialog } from '@/components/StyleDialog'
 import { PreparationCard } from '@/components/PreparationCard'
-import { VersionDrawer } from '@/components/VersionDialog'
 import { NamedNodeQuickBox } from '@/components/NamedNodeQuickBox'
 import { LeftPanel } from '@/components/left/LeftPanel'
 import { LeftRail } from '@/components/left/LeftRail'
@@ -325,8 +325,9 @@ function Workspace() {
               className="absolute inset-0 z-canvas-chrome cursor-default bg-shadow/10 data-[state=open]:animate-fade-in data-[state=closed]:animate-fade-out"
             />
           )}
-          <VersionDrawer />
         </div>
+        {/* 时间线预览 / 恢复对话框：与 Inspector 平级常驻，不随右栏开合、页签切换卸载（恢复在飞时它就是锁） */}
+        <TimelinePreviewDialog />
         <ExportDialog />
         <SettingsDialog />
         <LayoutDialog />
