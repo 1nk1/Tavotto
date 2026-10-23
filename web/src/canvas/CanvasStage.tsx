@@ -19,6 +19,7 @@ import { applyStageFit, fitStage, stageFitFrame } from '@/store/zoomToSelection'
 import { normalizeWheel } from '@/lib/wheel'
 import { ObjectView } from './ObjectView'
 import { WorkspaceContextBar } from './WorkspaceContextBar'
+import { IssueSpotlight } from './IssueSpotlight'
 import { OverlaySvg } from './OverlaySvg'
 import { MeasureChip } from './MeasureChip'
 import { PageSheet } from './PageSheet'
@@ -295,6 +296,8 @@ export function CanvasStage() {
         {/* 单图编辑：直接拖这张图的四条边改图幅，手感与上面拖页面边一致 */}
         {fastEdit && <FigureEdgeHandles panelId={activePanelId} />}
 
+        {/* 定位舞台灯：在选框覆盖层之下，选择框与高亮框始终清晰 */}
+        <IssueSpotlight />
         <OverlaySvg />
         {ghost.box && <DropGhost box={ghost.box} />}
         {/* 贴着选区的尺寸芯片：与选框同一个视口坐标系（2026-10-07 设计审计 §10.1） */}

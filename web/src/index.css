@@ -230,6 +230,8 @@
   --color-glass: color-mix(in srgb, var(--color-field) 90%, transparent);
   /* 拖放接收态的外发光（ui/dropZone）：accent 14% 的 4px 环，不透明度走 color-mix，不在组件里手写任意投影 */
   --shadow-drop: 0 0 0 4px color-mix(in srgb, var(--color-accent) 14%, transparent);
+  /* 定位舞台灯（`canvas/IssueSpotlight`）的暗幕颜色：压在画布内容上，两档主题同值 */
+  --color-spotlight-shade: #050609;
   --shadow-composer:
     0 0 0 1px color-mix(in srgb, var(--color-shadow-edge) 4%, transparent),
     0 2px 8px color-mix(in srgb, var(--color-shadow) 4%, transparent),
@@ -343,6 +345,13 @@
      不是 Tailwind 的 pulse——那条无限呼吸被门禁禁了（加载方言只有 sweep / 静态骨架 / shimmer / 转圈）；
      这是一次性的注意力信号，有限次数、走 token 曲线。 */
   --animate-attention: attention 900ms var(--ease-standard) 3;
+  /* 定位舞台灯（`canvas/IssueSpotlight`，参照 iMessage「聚光灯」）：光打过来 · 停 · 散开，整段 1000ms
+     （`SPOTLIGHT_MS` 同长），一次性、有限。景深层的关键帧直接动 backdrop-filter（祖先有 opacity / transform 时
+     背后取不到，模糊失效）；光圈与光柱的缓动写在各关键帧里（打过来 pop、散开 exit） */
+  --animate-spotlight-blur: spotlight-blur 1000ms var(--ease-standard) both;
+  --animate-spotlight-fade: spotlight-fade 1000ms linear both;
+  --animate-spotlight-land: spotlight-land 1000ms linear both;
+  --animate-spotlight-shaft: spotlight-shaft 1000ms linear both;
 }
 
 /* @sfinterface/numbers 的两个时长钩子接到动效 token（宪法第七节：时长只来自 token）：
@@ -589,6 +598,74 @@
   }
 }
 
+/* 舞台灯的景深：光外轻微失焦，两端都是原样（blur 0），停在末帧不留痕。
+   **带前缀的那条必须写在前面**：构建期的压缩器把两条当成同一属性、只留后写的那条——标准写法在前时产物里只剩
+   -webkit-，Chrome 不认它，整段在 Chrome 里什么都没有（2026-10-23 实测） */
+@keyframes spotlight-blur {
+  0%,
+  100% {
+    -webkit-backdrop-filter: blur(0);
+    backdrop-filter: blur(0);
+  }
+  30%,
+  70% {
+    -webkit-backdrop-filter: blur(2.5px);
+    backdrop-filter: blur(2.5px);
+  }
+}
+
+/* 舞台灯的暗幕：渐入 · 停 · 渐出（整层的不透明度；它没有 backdrop-filter，动 opacity 不影响景深层） */
+@keyframes spotlight-fade {
+  0% {
+    opacity: 0;
+    animation-timing-function: var(--ease-pop);
+  }
+  30%,
+  70% {
+    opacity: 1;
+    animation-timing-function: var(--ease-exit);
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+/* 舞台灯的光圈（暗幕遮罩里的受光区）：从光源那一侧、放大着收拢到目标（pop，像光打过来对上焦），停住，最后放大散开 */
+@keyframes spotlight-land {
+  0% {
+    transform: translate(var(--spot-from-x), var(--spot-from-y)) scale(1.5);
+    animation-timing-function: var(--ease-pop);
+  }
+  30%,
+  70% {
+    transform: none;
+    animation-timing-function: var(--ease-exit);
+  }
+  100% {
+    transform: scale(1.2);
+  }
+}
+
+/* 舞台灯的光柱：从光源一端射出去（transform-origin 由组件设在光源处），停住，淡出 */
+@keyframes spotlight-shaft {
+  0% {
+    opacity: 0;
+    transform: scale(0.15);
+    animation-timing-function: var(--ease-pop);
+  }
+  30% {
+    opacity: 1;
+    transform: none;
+  }
+  70% {
+    opacity: 1;
+    animation-timing-function: var(--ease-exit);
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
 @keyframes attention {
   0%,
   100% {
@@ -712,6 +789,17 @@
     background: transparent;
   }
 
+  /* 定位落点（`lib/issueFocus.focusField` 加上、到点撤掉）：问题面板「定位」把焦点送到的那一行亮一下——
+     sel 色内环 + 淡底，与画布上那一圈同一个注意力节拍（`--animate-attention`，有限三次）。此前落点只有
+     输入框自己的焦点边，混在一屏字段里认不出来（2026-10-23 用户反馈「提醒不够明显」）。内环不外扩：
+     属性栏的滚动容器会裁掉外扩的阴影。reduced motion 下不闪，静静亮同样长的时间 */
+  [data-locate-flash] {
+    border-radius: var(--radius-sm);
+    background-color: color-mix(in srgb, var(--color-sel) 14%, transparent);
+    box-shadow: inset 0 0 0 2px var(--color-sel);
+    animation: var(--animate-attention);
+  }
+
   /* 动效可关：动画只是点缀，关掉不损失任何信息 */
   @media (prefers-reduced-motion: reduce) {
     *,
@@ -753,6 +841,14 @@
    那一刻已经截好，所以拖影是实色、原位这一行淡下去——一眼分得出「在拿的」和「放哪儿」（2026-10 UI 审计 G11）。 */
 @utility opacity-dragging {
   opacity: 0.6;
+}
+
+/* 舞台灯景深层的遮罩（`canvas/IssueSpotlight`）：以元素中心为光心、`--spot-r` 为光圈半径，0.7r 内清晰、
+   往外 smoothstep 一条曲线到全模糊（逐点取样，没有折点）。暗幕的受光曲线在组件里，与它同一个起点 */
+@utility mask-spotlight {
+  -webkit-mask-image: var(--spotlight-mask);
+  mask-image: var(--spotlight-mask);
+  --spotlight-mask: radial-gradient(circle farthest-side at 50% 50%, rgb(0 0 0 / 0.0) calc(var(--spot-r) * 0.7), rgb(0 0 0 / 0.043) calc(var(--spot-r) * 0.85), rgb(0 0 0 / 0.156) calc(var(--spot-r) * 1.0), rgb(0 0 0 / 0.316) calc(var(--spot-r) * 1.15), rgb(0 0 0 / 0.5) calc(var(--spot-r) * 1.3), rgb(0 0 0 / 0.684) calc(var(--spot-r) * 1.45), rgb(0 0 0 / 0.844) calc(var(--spot-r) * 1.6), rgb(0 0 0 / 0.957) calc(var(--spot-r) * 1.75), rgb(0 0 0 / 1.0) calc(var(--spot-r) * 1.9));
 }
 
 /* 层级工具类：值在 :root 的 --z-*（见上），组件只写名字 */
@@ -1055,8 +1151,8 @@
   }
   [data-dialog-footer][data-scrolled] {
     background: color-mix(in srgb, var(--color-surface) 82%, transparent);
-    backdrop-filter: blur(10px);
     -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
     box-shadow: 0 -1px 0 var(--color-border);
   }
   @media (prefers-reduced-transparency: reduce) {
