@@ -536,6 +536,8 @@ export default interface Resources {
       "locationChange": "更改…",
       "locationDefault": "项目的导出目录",
       "locationLabel": "位置",
+      "locationPickTitle": "选择导出文件夹",
+      "locationUpdating": "正在更新…",
       "mmSize": "{{w}} × {{h}} mm",
       "needsRerun": "这张图需要重新运行脚本才能按原图导出。也可以改按画布导出（版面按画布，保真度较低）。",
       "openProblems": "在问题面板中查看",

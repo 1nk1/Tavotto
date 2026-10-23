@@ -112,10 +112,21 @@ let runtimeStatusGate: Promise<void> | null = null
 /** 非 0 时 `/api/runtime/status` 回这个 HTTP 状态码（模拟服务端瞬时失败）；-1 = 抛网络错误 */
 let runtimeStatusFail = 0
 
+/** 项目设置 PATCH 回包前先等它（模拟位置写入在飞） */
+let settingsGate: Promise<void> | null = null
+
 function stubFetch() {
   exportBodies = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input)
+    if (url.includes('/api/project/settings')) {
+      await settingsGate
+      const body = JSON.parse(String(init?.body ?? '{}')) as { export_dir?: string }
+      return new Response(
+        JSON.stringify({ settings: { export_dir: body.export_dir }, export_dir: body.export_dir, backup_dir: '/b' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } },
+      )
+    }
     if (url.includes('/api/export/start') || url.endsWith('/api/export')) {
       exportBodies.push(JSON.parse(String(init?.body ?? '{}')))
       const status = jobStatusSeq?.length ? jobStatusSeq.shift()! : jobStatus
@@ -427,13 +438,10 @@ describe('信息架构：删掉的东西不许回来', () => {
     expect(group('checks').querySelector('[aria-label="严格核验产物"]')).not.toBeNull()
     // 没有一个收起的「高级」把它们藏起来
     for (const d of document.body.querySelectorAll('details')) expect(d.textContent).not.toContain('样式检查报告')
-    // 输出组里导出之前就看得见文件落到哪，「更改…」去设置 › 导出
+    // 输出组里导出之前就看得见文件落到哪；「更改…」直接弹选择文件夹（细节在 ExportLocationRow.test.tsx），不再跳设置页
     expect(group('output').querySelector('[data-export-location]')).not.toBeNull()
     await click(group('output').querySelector('[data-export-location-change]')!)
-    expect(useUiStore.getState().settingsOpen).toBe(true)
-    expect(useUiStore.getState().settingsSection).toBe('export')
-    // 设置压在导出上（dialogStack）：收起来，别把这一层栈带进后面的用例
-    await act(async () => useUiStore.getState().setSettingsOpen(false))
+    expect(useUiStore.getState().settingsOpen).toBe(false)
   })
 })
 
@@ -2574,6 +2582,50 @@ describe('每张图单独导出：依次发多个作业（后端协议不变）'
     expect(useExportStore.getState().batch?.aggregate?.status).toBe('done')
   })
 
+  it('撞名停下后位置写入在飞：覆盖 / 另存一份都不发（会按旧目录写），落地后才放行', async () => {
+    jobStatusSeq = ['conflict', 'done', 'done']
+    await setupTwo({ select: [] })
+    await click(originalRadio())
+    await start()
+    await until(() => !!button('覆盖'))
+    expect(exportBodies).toHaveLength(1)
+    let release!: () => void
+    settingsGate = new Promise<void>((r) => { release = r })
+    const { applyProjectSettingsPatch } = await import('@/lib/projectSettingsPatch')
+    let done!: Promise<void>
+    await act(async () => { done = applyProjectSettingsPatch({ export_dir: '/new/dir' }) })
+    expect(button('覆盖')!.hasAttribute('disabled')).toBe(true)
+    expect(button('另存一份')!.hasAttribute('disabled')).toBe(true)
+    await click(button('覆盖')!)
+    await click(button('另存一份')!)
+    expect(exportBodies, '写入在飞：一个请求都不许发').toHaveLength(1)
+    await act(async () => { release(); await done })
+    settingsGate = null
+    expect(button('覆盖')!.hasAttribute('disabled')).toBe(false)
+    await click(button('覆盖')!)
+    await batchDone()
+    expect(exportBodies[1].overwrite).toBe('replace')
+  })
+
+  it('撞名停下后位置写入在飞：Esc（安全答案 = 另存一份）也不发请求', async () => {
+    jobStatusSeq = ['conflict', 'done', 'done']
+    await setupTwo({ select: [] })
+    await click(originalRadio())
+    await start()
+    await until(() => !!button('覆盖'))
+    let release!: () => void
+    settingsGate = new Promise<void>((r) => { release = r })
+    const { applyProjectSettingsPatch } = await import('@/lib/projectSettingsPatch')
+    let done!: Promise<void>
+    await act(async () => { done = applyProjectSettingsPatch({ export_dir: '/new/dir' }) })
+    await act(async () => {
+      document.querySelector('[data-dialog="export"]')!.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))
+    })
+    expect(exportBodies, '写入在飞：Esc 不许发另存一份').toHaveLength(1)
+    await act(async () => { release(); await done })
+    settingsGate = null
+  })
+
   it('批开始后改格式 / PPI / 排版、甚至关掉对话框：后面每张的请求仍是点击那一刻冻结的（Codex #1295 P1）', async () => {
     jobStatusSeq = ['running', 'done']
     await setupTwo({ select: [] })
@@ -3388,5 +3440,20 @@ describe('导出页改版（beta 0.19.0b3 反馈）', () => {
     expect(text).toContain('2 条提示')
     expect(text).toContain('导出期间排版又改了')
     expect(q('[data-export-result]')!.getAttribute('data-notice')).toBe('warn')
+  })
+
+  it('位置写入在飞：开始导出灰着（免得写到旧目录），落地后恢复；写入失败也恢复', async () => {
+    await setup(9)
+    expect(button('开始导出')!.hasAttribute('disabled')).toBe(false)
+    let release!: () => void
+    settingsGate = new Promise<void>((r) => { release = r })
+    const { applyProjectSettingsPatch } = await import('@/lib/projectSettingsPatch')
+    let done!: Promise<void>
+    await act(async () => { done = applyProjectSettingsPatch({ export_dir: '/new/dir' }) })
+    expect(button('开始导出')!.hasAttribute('disabled')).toBe(true)
+    expect(q('[data-export-location]')!.textContent).toBe('正在更新…')
+    await act(async () => { release(); await done })
+    settingsGate = null
+    expect(button('开始导出')!.hasAttribute('disabled')).toBe(false)
   })
 })

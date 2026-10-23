@@ -55,6 +55,8 @@ import {
 import { ICON_SIZE } from "@/components/ui/Icon";
 import { CanvasThumb } from "./CanvasThumb";
 import { ExportZoomStage } from "./ExportZoomStage";
+import { ExportLocationRow } from "./ExportLocationRow";
+import { useProjectSettingsPending } from "@/lib/projectSettingsPatch";
 import { Checkbox } from "./ui/Checkbox";
 import { Segmented } from "./ui/Segmented";
 import {
@@ -169,7 +171,6 @@ import { FieldGroup, FormSection } from "./ui/FormSection";
 import { Notice } from "./ui/Notice";
 import { splitNoticeSentences } from "@/lib/noticeText";
 import { ProgressBar } from "./ui/ProgressBar";
-import { dirTail } from "@/lib/pathDisplay";
 
 
 /** 导出终局 toast 的主人：重开对话框 / 新一轮开始时撤掉 */
@@ -303,8 +304,6 @@ export function ExportDialog() {
   const cancelError = useExportStore((s) => s.cancelError);
   const cancelState = useExportStore((s) => s.cancelState);
   const editedDuringExport = useExportStore((s) => s.editedDuringExport);
-  /** 导出会落到哪个目录（后端说了算：`project.export_dir`）；导出之前就摆出来，改它在设置 › 导出 */
-  const exportDir = useProjectStore((s) => s.project?.export_dir ?? null);
 
   const [formats, setFormats] = useState<string[]>(
     () => readExportDefaults().formats,
@@ -845,6 +844,8 @@ export function ExportDialog() {
    * `start()` 没有"，第五轮又抓到"两边都有，但 `start()` 那份少了一条"。
    * 一份判断、两个消费点，就没有"少写一条"这回事了。
    */
+  // 导出位置的写入还在飞：导出键灰着，免得写到旧目录
+  const locationUpdating = useProjectSettingsPending();
   const prepared = prepareExport(inputOf());
   const filenameIssue = prepared.filenameProblem;
   const names = prepared.names;
@@ -855,6 +856,7 @@ export function ExportDialog() {
     !figureChecking &&
     names.length > 0 &&
     !filenameIssue &&
+    !locationUpdating &&
     (scope !== "original" || availability.ok);
 
   /**
@@ -863,7 +865,7 @@ export function ExportDialog() {
    * 走的就是单张导出的那条路，没有第二套。
    */
   const batchMode = !single && scope === "original";
-  const canStartBatch = batchMode && canvasFigures.length > 0 && formats.length > 0 && !busy;
+  const canStartBatch = batchMode && canvasFigures.length > 0 && formats.length > 0 && !busy && !locationUpdating;
   /**
    * 「每张图单独导出」的**冻结**：点「导出」之后分两步，且两步之间没有任何交错——
    * ① 先 await 拿齐每张图的 export route（只取后端的回答，不读文档、不生成请求输入；用户这几秒里改了什么，
@@ -874,6 +876,8 @@ export function ExportDialog() {
    * 之后的发送只读冻结好的输入。表单在冻结段里整块禁用（`fieldset`）。
    */
   const startBatch = () => {
+    // 所有会发起导出的入口共用「位置写入在飞」这一个前置条件（canStart / 冲突按钮 / Esc / 批的逐张发送都读它）
+    if (locationUpdating) return;
     writeExportDefaults({ formats, dpi: String(ppi), withProof: withReport, strictInspection: strict });
     const figs = canvasFigures;
     if (
@@ -1102,7 +1106,7 @@ export function ExportDialog() {
   const lastRecorded = useRef<unknown>(null);
   // 发（send）：只按冻结的输入依次发
   useEffect(() => {
-    if (!batch || batch.done || batch.cancelRequested || batch.phase !== "send" || running) return;
+    if (!batch || batch.done || batch.cancelRequested || batch.phase !== "send" || running || locationUpdating) return;
     if (launched.current.ids === batch.ids && launched.current.index === batch.index) return; // 已发出：等终局或撞名决定
     const cur = batch.prepared[batch.index];
     if (!cur) return;
@@ -1113,7 +1117,7 @@ export function ExportDialog() {
     // 同步路径上就没起来（请求成形被拒）：不会有终局，直接记失败
     if (!useExportStore.getState().running) recordBatchStartFailure(sendFailureReason());
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [batch, running]);
+  }, [batch, running, locationUpdating]);
   // 收尾：这一张落了终局（撞名除外——停在冲突条上等用户选覆盖 / 另存，再发出的是新作业）
   useEffect(() => {
     if (!batch || batch.done || batch.phase !== "send" || running) return;
@@ -1130,6 +1134,8 @@ export function ExportDialog() {
   }, [batch, running, storeJob, startError]);
   /** 撞名后的「覆盖 / 另存一份」：一批里重发的是这一张**冻结的**输入，不读活的表单 */
   const restart = (overwrite: OverwritePolicy) => {
+    // 位置写入在飞时覆盖 / 另存一份也不许发：会按旧目录写（批的分支直接 runExport，不经 canStart）
+    if (locationUpdating) return;
     if (batch && !batch.done && batch.phase === "send") {
       const cur = batch.prepared[batch.index];
       if (!cur) return;
@@ -1453,7 +1459,7 @@ export function ExportDialog() {
             </Button>
           ),
           secondary: (
-            <Button variant="secondary" size="lg" data-export-conflict-rename onClick={() => restart("rename")}>
+            <Button variant="secondary" size="lg" data-export-conflict-rename disabled={locationUpdating} onClick={() => restart("rename")}>
               {ex("conflictRename")}
             </Button>
           ),
@@ -1462,6 +1468,7 @@ export function ExportDialog() {
               variant="danger-tinted"
               size="lg"
               data-export-conflict-replace
+              disabled={locationUpdating}
               onClick={() => restart("replace")}
             >
               {ex("conflictReplace")}
@@ -1650,24 +1657,8 @@ export function ExportDialog() {
             </section>
             )}
 
-            {/* 2. 位置 —— 导出之前就看得见文件会落到哪（审计 §10.2 P0）；改它在设置 › 导出（这里只读） */}
-            <FormRow label={ex("locationLabel")}>
-              <span
-                data-export-location
-                className="min-w-0 flex-1 truncate font-mono text-sm text-ink-2"
-                title={exportDir ?? undefined}
-              >
-                {exportDir ? dirTail(exportDir) : ex("locationDefault")}
-              </span>
-              <Button
-                variant="ghost"
-                size="sm"
-                data-export-location-change
-                onClick={() => useUiStore.getState().setSettingsOpen(true, "export")}
-              >
-                {ex("locationChange")}
-              </Button>
-            </FormRow>
+            {/* 2. 位置 —— 导出之前就看得见文件会落到哪（审计 §10.2 P0）；「更改…」直接弹选择文件夹 */}
+            <ExportLocationRow disabled={busy} />
           </FieldGroup>
         </FormSection>
 
