@@ -317,3 +317,43 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
 - `path_override` 必须 realpath + 指向该 Agent
 - spawn 时注入、绝不改写用户的 settings / config.toml
 - 模型名不写进源码
+
+## 内置执行器（`engine/agent_runner/`，ADR 0147 提议，第一阶段：核心循环）
+
+改图助手自己跑「模型 ↔ 工具」循环的独立子进程，不借 Codex / Claude Code CLI。**本阶段只有核心循环**，还没接进 `ai_bridge` /
+`ai_agents` / 设置页（`AGENT_REGISTRY` 不变）。看护 `tests/test_agent_runner.py`、`tests/test_outbound_https_trust.py`。
+
+- **边界**：纯标准库、3.10 可跑；不 import 科学栈，**不 import `ai_bridge` / `ai_agents` / `ai_tasks`**；唯一内部依赖 `tlstrust`。
+  只经 stdout 事件行与父进程说话。入口 `python -m tavotto.engine.agent_runner --cwd <候选目录> --target <相对路径> --wire <名> --base-url <url> --model <名>`。
+- **协议**（`wires.py`）：`anthropic`（`{base}/v1/messages`，`x-api-key` 与 `Authorization: Bearer` 都给，`anthropic-version: 2023-06-01`，
+  系统提示与最后一个工具定义带 `cache_control: ephemeral`）、`openai-chat`（`{base}/chat/completions`）、`openai-responses`
+  （`{base}/responses`，`store: false`）、`demo`（剧本回放，不联网，端到端测试用）。anthropic 的思考由**调用方声明** `--thinking {adaptive,budget,none}`（默认 `none`，runner 不猜：第三方兼容网关各不相同）：`adaptive` 发 `thinking:{type:adaptive}` + 有 effort 才发 `output_config.effort`（新模型，不发已弃用的 `budget_tokens`）；`budget` 发旧式 `budget_tokens`（必须配 `--effort low|medium|high|max`，`max` 映射到 high 档；缺省 effort 起跑即 `internal/bad_args`、0 次请求，不静默不发 thinking）；`none` 都不发。thinking 块按原样回放，不做 assistant prefill，工具参数一律 `json.loads`。openai-responses 只在给了 `--effort` 时传 `reasoning.effort`。`--wire openai-responses` 配 `--effort max` 起跑即 `internal/bad_args`、0 次请求（Responses 没有 max 档，不静默不发 reasoning）。
+  系统提示 + 工具定义在请求最前且逐字稳定（吃提示缓存）；变化的东西（目标名、用户指令）只在第一条用户消息里。
+- **出站**：只许 https，或主机恰为字面量 `127.0.0.1` 的 http；URL 不带用户信息 / 查询 / 片段。https 走 `_opener()`（`build_opener(tlstrust.https_handler(tlstrust.client_context()))`
+  + 不跟随重定向，代理沿用环境变量）；回环 http 用字面量 `HTTPConnection("127.0.0.1", …)` 直连、**不经代理**。响应体有上限；
+  请求有超时；`tests/test_outbound_https_trust.py` 的 `OUTBOUND` 登记了 `engine/agent_runner/wires.py: _opener`。
+- **密钥**：只读环境变量 `TAVOTTO_AGENT_API_KEY`（读后从本进程环境删除），绝不进 argv / stdout / stderr / 事件 / 日志 / repr。
+  提示词只经 `--prompt-file` 或 stdin。服务端错误体不进任何输出（可能回显提示词），只留 `detail` 短代码。
+  **模型的成功回复同样不可信**（服务端在请求头里拿到了密钥，可能回显）：`__main__` 的事件写出函数 `emit` 与 stderr 诊断函数 `diag` 是
+  进程里**唯一**的输出出口，所有字符串（`text`、`tool` 摘要、`done.detail`、诊断）统一过 `redact.Redactor`，已知密钥（长度 ≥ 8 才参与）
+  及其去空白 / JSON 转义变形换成 `[redacted]`。同一保证的另一出口：`edit_file` / `write_file` 的内容含密钥 → 工具错误 `secret_in_content`，拒写、文件零改动。
+  提示词读不到或为空白 → 不调模型，`done{ok:false, reason:"internal", detail:"bad_prompt"}`、退出码 1。
+- **工具与路径判据**（`tools.py`，ADR 0138 §四）：`read_file`（≤ 200 KB 的 UTF-8 文本）、`list_dir`（一层，符号链接只标注不跟随）、
+  `edit_file`（`old` 必须在目标脚本里**恰好出现一次**，0 次 / 多次都是带说明的工具错误；本会话必须先 `read_file` 过目标）、
+  `write_file`（整份覆盖，兜底）、`check`（调用方注入的回调，没注入 = `not_available` 工具错误）。**没有 shell、网络、MCP 工具。**
+  路径判据只有一处 `FigureEditSession._resolve`：`realpath` 后须在候选目录内（符号链接先解开再判，链出界即越界）；写只许目标脚本，
+  目标本身是符号链接也拒写。越界 / 写非目标 / 超大 / 非文本一律返回**工具错误结果**，不抛、不执行、文件零改动。
+  换行：读出时统一成 `\n`，写回恢复文件原有的 `\r\n`（混合换行的文件会被统一成首见的那种）。
+  将来 `data_to_figure` 的工具集**没有写文件工具**（只出结构化列映射，ADR 0138 §四）。
+- **事件**（stdout 每行一条 JSON，ASCII 转义）：`thinking`（只有字符数）、`tool`（工具名、成败、一句话摘要，**不带文件内容 / 提示词 / 密钥**）、
+  `text`（模型对用户说的话）、`usage`（每轮用量）、`done`（最后一条，恰好一条）。stderr 只写诊断级错误码。
+- **结束条件与结局**：`done{ok, reason, detail}`，`reason` ∈ `completed | max_turns | budget | tool_error_loop | auth | quota | refused | network | cancelled`，
+  外加兜底 `internal`（本模块自己的缺陷，`detail` 只有异常类型名）。失败**不抛**。429、5xx、408 与传输失败指数退避重试（有上限），401 / 403 → `auth`，
+  402 或额度类 429 → `quota`，429 重试用尽 → `quota`，其余 4xx（含 409）不重试 → `network`。服务端过滤 / 拒答 → `refused`（chat `finish_reason=content_filter`、
+  anthropic `stop_reason=refusal`、responses `status:incomplete` 且原因不是 `max_output_tokens`，`detail` 如 `incomplete_content_filter`）；
+  responses 顶层 `status` 为 `failed`（`detail=failed_<error.code>`）或 `cancelled / queued / in_progress`（`status_<名>`）→ `network`，不再当作空的 end 轮。
+  重试等待 = min(退避, Retry-After, 30 s, 距总时限的剩余)，剩余 ≤ 0 不再发请求 → `budget`（`detail=time`）；单次请求超时也不超过剩余时间。**等响应时也看总时限**：服务端以小于 socket 超时的间隔慢慢吐字节时每次 read 都成功，所以等待循环（与取消同一处、每 50 ms）同时判 deadline，到点即 `budget/time`，在途请求丢弃、回复不接受。
+  **只有 `stop == end` 且无工具调用才算 `completed`**：其它停止值（未知 `stop_reason` / `finish_reason`，或 `tool_calls` / `tool_use` 结束却没有可用调用）→ `network`，`detail=bad_stop_<值>`（值只留小写字母数字下划线、≤ 24 字符）；`max_tokens` 仍是 `budget/output_truncated`。同一工具的同一错误码连续 3 次 → `tool_error_loop`。
+  SIGTERM / SIGINT / Ctrl-Break → `cancelled`。
+- **预算与账本**：轮数、token（input+output）、秒数三道上限。每轮 input / output / 耗时入账，结束时核「合计 == 各轮之和」，不等记
+  `done.ledger_mismatch=true`（不抛）。每轮记账后立刻复查 token：**终止答复**（`end` 且无工具调用）累计 `>` 上限才拒，恰好用满上限仍 `completed`；带工具调用 / 要开下一轮的答复累计 `>=` 上限即 `budget/tokens`，工具不执行、不开新轮。估计上下文超阈值时把早先的 `read_file` 结果换成「已读过 X（第 a–b 行，sha 前缀）」。
