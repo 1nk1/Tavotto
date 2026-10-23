@@ -4999,6 +4999,8 @@ export default interface Resources {
       "rowAria": "{{label}}（{{role}}）",
       "rowAriaHidden": "，已隐藏",
       "rowAriaLocked": "，已锁定",
+      "savedMoment": "按存盘时的样子编辑",
+      "savedMomentHint": "脚本保存这张图之后又改动了它。这里编辑的是保存那一刻的样子，与磁盘上的文件对应；脚本后来的改动不在其中。",
       "search": "搜索图内元素",
       "searchAria": "搜索图内元素",
       "unhide": "恢复显示",

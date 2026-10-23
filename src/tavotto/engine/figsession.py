@@ -875,6 +875,8 @@ class LiveFigureSession:
         #: 存过盘但参数没观察到）。只记不用：渲染与几何一概不读它（tight 图幅的决定之前）。
         self.savefig_calls: dict[str, list | None] = {}
         self.savefig_observations = figcapture.SavefigObservations()
+        #: 保存瞬间快照账（ADR 0139 §九）：开关关掉时不拍
+        self._save_moments = self._new_save_moments()
         self.artifact_source = None
         self._artifact_background_hidden = False
         self.artifact_probe = None
@@ -952,6 +954,7 @@ class LiveFigureSession:
         extra_artists=None,
         target: str | None = None,
         verify=None,
+        observation=None,
     ) -> None:
         """记一次**成功的** savefig 调用（规则在 `figcapture.note_savefig_writer`）。
 
@@ -972,6 +975,74 @@ class LiveFigureSession:
             verify=verify,
         )
         figcapture.mark_saved(fig)
+        if self._save_moments is not None:
+            row = self.savefig_observations.observation(observation)
+            self._save_moments.take(fig, row["occurrence"] if row else None, extra_artists)
+            # 不在这里清脏标记：拍摄期间若有任何改动，`take` 作废快照、标记留真，最终如实报 `modified_after_save`
+
+    @staticmethod
+    def _new_save_moments():
+        return figcapture.SaveMomentLedger() if figcapture.save_moment_enabled() else None
+
+    def begin_save_moments(self) -> None:
+        """一次脚本执行开始：换一份**新**快照账（旧账先释放）。账的生命周期绑「一次执行」，不绑会话——
+        pool 会在同一个 worker 里重跑脚本（instrument / 发布阶段临时失败后重试），重跑必须有账可记。"""
+        self.release_save_moments()
+        self._save_moments = self._new_save_moments()
+
+    def release_save_moments(self) -> None:
+        """采用或放弃之后释放快照字节（账对象留着、已清空；下一次执行由 `begin_save_moments` 换新）。"""
+        if self._save_moments is not None:
+            self._save_moments.release()
+
+    def adopt_save_moments(self) -> dict[str, str]:
+        """存盘后又被脚本改过的 savefig 图：能还原保存那一刻的复制品，就让它顶替捕获表里的最终态 Figure（ADR 0139 §九）。
+
+        在 `note_modified_after_save` 与 pyplot 兜底**之后**、`prepare_artifact` / `instrument_all` **之前**调（兜底按身份去重，
+        先换会让原件被当成没认领的 pyplot 图又收一遍）。还原不了 = 原因进闭集 `SAVE_MOMENT_REASONS`，编辑基础仍是最终态。
+        结论记在捕获表里那张 Figure 上（`figcapture.SAVE_MOMENT`），manifest 读它；返回 stem -> 结论。"""
+        ledger = self._save_moments
+        if ledger is None:
+            return {}
+        if (
+            self.artifact_source is not None
+            and self.artifact_source.get("render_policy") != figcapture.SCRIPT_BACKED_POLICY
+        ):
+            # 精确策略（selected-figsize-v1）一字不动（ADR 0139 §二）：它的「存后改过就拒」是自己的闸门
+            self.release_save_moments()
+            return {}
+        outcome: dict[str, str] = {}
+        holders: dict[int, int] = {}
+        for fig in self.capture.values():
+            holders[id(fig)] = holders.get(id(fig), 0) + 1
+        for stem, fig in list(self.capture.items()):
+            if self.capture_source.get(stem) != figcapture.SOURCE_SAVEFIG:
+                continue
+            if not getattr(fig, figcapture.MODIFIED_AFTER_SAVE, False):
+                continue
+            selected = None
+            if self._artifact_save is not None and self._artifact_save[2] is fig:
+                selected = self._artifact_save[0]["occurrence"]
+            if holders[id(fig)] > 1:
+                restored, reason = None, "multi_stem"
+            else:
+                restored, reason = ledger.restore(fig, selected)
+            if restored is None:
+                setattr(fig, figcapture.SAVE_MOMENT, reason)
+                outcome[stem] = reason
+                continue
+            setattr(restored, figcapture.MODIFIED_AFTER_SAVE, True)
+            setattr(restored, figcapture.SAVE_MOMENT, figcapture.SAVE_MOMENT_RESTORED)
+            FigureCanvasAgg(restored)  # 复制品出来是裸 canvas；几何与渲染都按 Agg 量
+            self.capture[stem] = restored
+            if id(fig) in self.passthrough_figures:
+                self.passthrough_figures.add(id(restored))
+            if self._artifact_save is not None and self._artifact_save[2] is fig:
+                row, art_stem, _, extras = self._artifact_save
+                self._artifact_save = (row, art_stem, restored, extras)
+            outcome[stem] = figcapture.SAVE_MOMENT_RESTORED
+        self.release_save_moments()
+        return outcome
 
     def note_artifact(self, observation, stem, fig, extra_artists):
         if self.artifact_source is None:

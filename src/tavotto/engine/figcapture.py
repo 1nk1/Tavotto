@@ -156,6 +156,7 @@ import math
 import ntpath
 import os
 import pathlib
+import pickle
 import posixpath
 import re
 import shutil
@@ -163,12 +164,14 @@ import stat
 import sys
 import threading
 import time
+import types
 import unicodedata
 import weakref
 
 if __package__:
-    from . import patchspec
+    from . import axestraversal, patchspec
 else:
+    import axestraversal
     import patchspec
 
 __all__ = [
@@ -551,7 +554,7 @@ _poison_lock = threading.Lock()
 
 
 def _dir_key(out_dir) -> str:
-    return os.path.normcase(os.path.abspath(os.fspath(out_dir)))
+    return os.path.normcase(os.path.realpath(os.fspath(out_dir)))
 
 
 def poison_preview_dir(out_dir) -> None:
@@ -1840,7 +1843,7 @@ def mark_saved(fig) -> None:
     **两个钩子只在脚本运行期存在**：`note_modified_after_save` 判定时一并卸掉，之后 Figure 与原生无异
     （采纳检查 `figsession._require_artifact_figure` 看不到它们）；已判过的图不再装。
     用户脚本若自己替换 `fig.stale_callback`：记录随之丢失（下次保存时重新套）；尽力而为、绝不抛错。
-    不额外渲染、不复制 Figure（ADR 0139 §八「不声称拥有保存瞬间的快照」——这里只报一个事实）。"""
+    本函数只报事实、不额外渲染、不复制 Figure；保存瞬间的快照是另一件事（`SaveMomentLedger`，ADR 0139 §九，只在 safe worker 的 `note_savefig` 里拍）。"""
     if hasattr(fig, MODIFIED_AFTER_SAVE):
         # 已经判过（例如 native 在 show 屏障判过、之后脚本又存盘）：钩子早已卸掉，不再装
         try:
@@ -1877,6 +1880,826 @@ def note_modified_after_save(capture: dict, capture_source: dict) -> list[str]:
         if getattr(fig, MODIFIED_AFTER_SAVE, False):
             out.append(stem)
     return out
+
+
+#: 保存瞬间快照（ADR 0139 §九）。只在 safe worker 里、只活在本进程内存里：**不落盘、不跨进程、不读项目文件里的任何 pickle**。
+#: 记在 Figure 上的结论属性（manifest 读它；`manifest.SAVE_MOMENT_ATTR` 是同源对，`tests/test_save_moment.py` 钉相等）
+SAVE_MOMENT = "_mm_save_moment"
+#: 结论取值：`SAVE_MOMENT_RESTORED`，或下面闭集里的一个失败原因（编辑基础退回脚本跑完的最终态，照旧只告知）
+SAVE_MOMENT_RESTORED = "restored"
+SAVE_MOMENT_REASONS = frozenset(
+    {
+        "unpicklable",  # pickle.dumps 抛了（lambda 格式化器、不可序列化的 artist……）
+        "too_large",  # 单张快照超过 SAVE_MOMENT_MAX_BYTES
+        "budget_exceeded",  # 本次执行累计超过 SAVE_MOMENT_TOTAL_BYTES
+        "bbox_extra_artists",  # 保存带 bbox_extra_artists：那批 artist 属于原件，复制品对不上
+        "restore_failed",  # 还原失败（含白名单外的类：用户自定义的 artist / 格式化器 / 变换）
+        "structure_mismatch",  # 还原出的 Figure 与拍快照时的结构签名对不上
+        "multi_stem",  # 同一张图以多个 stem 被捕获：快照只对应它最后一次保存，说不清是哪个 stem 的
+        "not_selected_save",  # 选定原件对应的那次保存不是这张图的最后一次保存（快照取的是最后一次）
+        "matplotlib_patched",  # 脚本改了 matplotlib 的方法面（patch 过类 / 函数）：拍摄与还原都会走被改过的代码，一律放弃
+    }
+)
+#: 单张快照 / 本次执行累计的字节上限。**只用字节数当预算，不用墙钟**：热会话与写回的一次性重放必须在同一处同样地
+#: 放弃，否则「热态所见 == 重放所得」会被计时抖动破坏
+SAVE_MOMENT_MAX_BYTES = 32 * 1024 * 1024
+SAVE_MOMENT_TOTAL_BYTES = 128 * 1024 * 1024
+#: 关掉快照（只告知，行为与 #1250 相同）：环境变量值为 "0"。worker 由同一个父进程拉起，热会话与一次性重放读到同一个值
+SAVE_MOMENT_ENV = "TAVOTTO_SAVE_MOMENT_SNAPSHOT"
+#: 还原时允许解析的全局：matplotlib / mpl_toolkits / numpy 本体（名字不含点、对象自己的 `__module__` 也在这些包里），
+#: 加下面几个精确名字。用户自己的类 / 函数 / 模块一律拒绝——还原不执行用户代码、不 import 用户模块。
+#: 这是纵深防御，不是边界：边界是快照字节只在产生它的进程里存在，从不落盘、从不来自项目文件（ADR 0139 §九）
+_SAVE_MOMENT_PACKAGES = ("matplotlib", "mpl_toolkits", "numpy")
+_SAVE_MOMENT_EXACT = frozenset(
+    {
+        ("builtins", "object"),
+        ("builtins", "getattr"),
+        ("builtins", "set"),
+        ("builtins", "frozenset"),
+        ("builtins", "slice"),
+        ("builtins", "complex"),
+        ("builtins", "bytearray"),
+        ("builtins", "range"),
+        ("collections", "OrderedDict"),
+        ("collections", "defaultdict"),
+        ("collections", "deque"),
+        ("functools", "partial"),
+        ("itertools", "count"),
+        ("itertools", "cycle"),
+        ("copyreg", "_reconstructor"),
+    }
+)
+#: 拍快照时从复制品上抹掉的、属于 `mark_saved` 的私有记账（复制品没有这些钩子）
+_SAVE_MOMENT_STRIP = (_SAVED_MARK, DIRTY_SINCE_SAVE, _ORIG_STALE_CALLBACK, _DRAW_HOOK)
+
+
+def save_moment_enabled() -> bool:
+    return os.environ.get(SAVE_MOMENT_ENV, "1").strip() != "0"
+
+
+# ---- 静态读取原语（Codex #1314 P1-e）：拍摄 / 指纹 / 白名单把关全程**不许触发用户代码** ----
+# 被检查的对象可能带自定义 `__getattr__` / `__getattribute__` / `__eq__` / `__hash__` / `__bool__`，或元类的 `__instancecheck__`。
+# 所以这一段只用：`type(x)` + `is`、`id`、直接从 `type` / `function` / `code` / `staticmethod` 等**内建类型的 `__dict__` 里取出来的描述符**
+# 去读对象（描述符是 C 实现，不经过对象自己的属性查找），以及精确 `str` / `dict` 上的读取。不用 `getattr` / `hasattr` / `isinstance` /
+# `callable` / `==` / `hash` / `bool` / `str` / `repr` 去碰被检查的对象。
+_T_DICT = type.__dict__["__dict__"]
+_T_MRO = type.__dict__["__mro__"]
+_T_MODULE = type.__dict__["__module__"]
+_T_QUALNAME = type.__dict__["__qualname__"]
+_FN_CODE = types.FunctionType.__dict__["__code__"]
+_FN_MODULE = types.FunctionType.__dict__["__module__"]
+_FN_QUALNAME = types.FunctionType.__dict__["__qualname__"]
+_CODE_FILENAME = types.CodeType.__dict__["co_filename"]
+_BF_MODULE = types.BuiltinFunctionType.__dict__["__module__"]
+_BF_QUALNAME = types.BuiltinFunctionType.__dict__["__qualname__"]
+_BF_SELF = types.BuiltinFunctionType.__dict__["__self__"]
+_SM_FUNC = staticmethod.__dict__["__func__"]
+_CM_FUNC = classmethod.__dict__["__func__"]
+_PROP_PARTS = tuple(property.__dict__[n] for n in ("fget", "fset", "fdel"))
+_MOD_DICT = types.ModuleType.__dict__["__dict__"]
+#: 值本身不可能是钩子的简单数据：这些类型的「重新绑定」不记进指纹（原地改容器不换 id，本来也看不出）
+_SIMPLE_TYPES = (
+    int,
+    float,
+    complex,
+    str,
+    bytes,
+    bool,
+    type(None),
+    tuple,
+    frozenset,
+    range,
+    slice,
+    type(Ellipsis),
+    type(NotImplemented),
+    list,  # 如 copyreg 在首次 pickle 时写入的 `__slotnames__` 缓存
+    dict,
+    set,
+)
+
+
+def _is_class_type(t) -> bool:
+    """`t`（某个对象的类型）的 MRO 里有 `type` = 那个对象本身是个类。只用 `is`。"""
+    for c in _T_MRO.__get__(t):
+        if c is type:
+            return True
+    return False
+
+
+def _is_simple(v) -> bool:
+    t = type(v)
+    for c in _SIMPLE_TYPES:
+        if t is c:
+            return True
+    return False
+
+
+def _static_type_names(t):
+    return _T_MODULE.__get__(t), _T_QUALNAME.__get__(t)
+
+
+def save_moment_module_allowed(module, name) -> bool:
+    """白名单的第一关（还原侧与拍摄侧共用）：精确名单里的 `(模块, 名字)`，或模块顶层包是 matplotlib / mpl_toolkits / numpy。
+    只看名字、不 import、不解析、不执行任何东西（名字必须是精确的 `str`，其它一律拒绝）。用户模块（含用户继承 matplotlib 的子类，
+    它们的 `__module__` 是用户模块）在这里被拒。
+    威胁模型是「诚实的用户钩子意外改了图」，不是蓄意把自己的类的 `__module__` 伪装成 numpy——后者本来就能直接改 Figure。"""
+    if type(module) is not str or type(name) is not str:
+        return False
+    return (module, name) in _SAVE_MOMENT_EXACT or module.split(".", 1)[0] in _SAVE_MOMENT_PACKAGES
+
+
+def _snapshot_type_allowed(t) -> bool:
+    """`t`（一个类）能不能出现在快照里：按它的 `__module__` / `__qualname__`（静态读）查共用白名单的第一关。"""
+    return save_moment_module_allowed(*_static_type_names(t))
+
+
+def save_moment_global_allowed(module, name, resolve) -> bool:
+    """还原侧（`find_class`）的完整判据：第一关 `save_moment_module_allowed`（拍摄侧同用这一关），再要求名字不含点或点前是类
+    （`BoxStyle.Round` 这种嵌套类）、解析到的对象自己的 `__module__` 也在这些包里。`resolve(module, name)` 是 `Unpickler.find_class`。
+    用户模块在第一关就被拒，不会走到 `resolve`（不 import 用户模块）。"""
+    if not save_moment_module_allowed(module, name):
+        return False
+    if (module, name) in _SAVE_MOMENT_EXACT:
+        return True
+    if "." in name and not _is_class_type(type(resolve(module, name.split(".")[0]))):
+        # 带点的名字只许是类的嵌套类（`BoxStyle.Round`），不许沿模块属性链走到别的模块去
+        return False
+    found = resolve(module, name)
+    tf = type(found)
+    if _is_class_type(tf):
+        owner = _T_MODULE.__get__(found)
+    elif tf is types.FunctionType:
+        owner = _FN_MODULE.__get__(found)
+    elif tf is types.BuiltinFunctionType:
+        owner = _BF_MODULE.__get__(found)
+    else:
+        owner = _T_MODULE.__get__(tf)
+    return type(owner) is str and owner.split(".", 1)[0] in _SAVE_MOMENT_PACKAGES
+
+
+class _RestrictedUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if not save_moment_global_allowed(module, name, super().find_class):
+            raise pickle.UnpicklingError(f"not allowed: {module}.{name}")
+        return super().find_class(module, name)
+
+
+# ---- 可信方法面指纹（Codex #1314 P1-d；用户裁决：检测到 matplotlib 被 patch 就放弃快照，不逐个封堵） ----
+#: 指纹范围：matplotlib / mpl_toolkits 已导入模块里每个类 `__dict__` 中的非简单数据值（函数、描述符、嵌套类、其它对象）和模块级的类 / 函数，
+#: 再加还原路径实测会解析到的标准库与 numpy 入口（见 `_SURFACE_EXTRA_MODULES`）。值记 `id`，同时握住对象本身（防地址复用漏报）。
+#: **全程静态读取**（见上面的原语）：被改过的对象可能带自定义 `__getattr__` 等，比对本身不能把它们的代码跑起来。
+_SURFACE_PACKAGES = ("matplotlib", "mpl_toolkits")
+_SURFACE_EXTRA_MODULES = (
+    "copyreg",
+    "enum",
+    "collections",
+    "functools",
+    "numpy.ma.core",
+    "numpy._core.multiarray",
+    "numpy._core.numeric",
+    "numpy.core.multiarray",
+    "numpy.core.numeric",
+)
+_surface_lock = threading.Lock()
+_surface_base: dict[str, tuple[dict, list]] | None = None
+_surface_roots: tuple[str, ...] = ()
+#: 仅 matplotlib / mpl_toolkits 自己的包目录：变化条目复核（`_changed_entries_are_library`）只认这里的函数
+_surface_mpl_roots: tuple[str, ...] = ()
+_realpath_cache: dict[str, tuple[str, str]] = {}
+_STDLIB_NAMES = frozenset(getattr(sys, "stdlib_module_names", ()))
+_LIB_TOPS = (
+    frozenset(_SURFACE_PACKAGES) | {"numpy"} | frozenset(getattr(sys, "stdlib_module_names", ()))
+)
+
+
+def _module_dict(mod):
+    """精确 `ModuleType` 的命名空间（静态读）；模块子类 / 别的对象一律 None（不碰）。"""
+    if type(mod) is not types.ModuleType:
+        return None
+    d = _MOD_DICT.__get__(mod)
+    return d if type(d) is dict else None
+
+
+def _defined_in(cls, name: str) -> bool:
+    module = _T_MODULE.__get__(cls)
+    return type(module) is str and module == name
+
+
+def _record_class_value(v) -> bool:
+    """类字典里的这个值要不要进指纹：函数 / 内建 / 描述符 / 嵌套类一律记；其余对象只记「类型不是库的」（用户对象）。
+    库类型的实例（如 `Path._unit_circle` 这种首次使用才写入的缓存）会合法地被重新绑定，不记。
+    它们若被当成序列化钩子，`_class_hooks_trusted` 另有一层拦。"""
+    t = type(v)
+    if (
+        t is types.FunctionType
+        or t is types.BuiltinFunctionType
+        or t is staticmethod
+        or t is classmethod
+        or t is property
+        or _is_class_type(t)
+    ):
+        return True
+    if _is_simple(v):
+        return False
+    if not _owner_module_ok(t):
+        return True
+    # 库类型的实例里，**可调用的 / 描述符**（`functools.partial(用户函数)`、绑定方法、`cached_property` 之类）也要记：
+    # 它们一被取用 / 调用就可能跑到用户代码。不可调用的普通数据（首次使用才写入的缓存）仍不记
+    for c in _T_MRO.__get__(t):
+        cd = _T_DICT.__get__(c)
+        if (
+            _dict_get(cd, "__call__", _MISSING) is not _MISSING
+            or _dict_get(cd, "__get__", _MISSING) is not _MISSING
+        ):
+            return True
+    return False
+
+
+_MISSING = object()
+
+
+def _dict_get(d, name: str, default=None):
+    """精确 dict / mappingproxy 里取 `name`：逐项只比精确 `str` 键。不用 `in` / `[]` / `.get`——非 `str` 键可能带自定义
+    `__hash__` / `__eq__`，哈希碰撞时会被调用。"""
+    for k, v in d.items():
+        if type(k) is str and k == name:
+            return v
+    return default
+
+
+def _loaded_module_dict(name: str):
+    """`sys.modules` 里 `name` 的命名空间（静态读）；`sys.modules` 被换成别的容器类型就当不可信（None）。"""
+    mods = sys.modules
+    if type(mods) is not dict:
+        return None
+    return _module_dict(mods.get(name))
+
+
+def _surface_module_map(name: str, mod) -> tuple[dict, dict]:
+    """(条目 -> 对象 id, 条目 -> 对象本身)。对象本身既握住（防地址复用），也供「变了的条目来源是不是库」复核用。"""
+    out: dict = {}
+    objs: dict = {("!mod", None): mod}
+    d = _module_dict(mod)
+    if d is None:
+        out[("!nonstd", None)] = id(type(mod))
+        return out, objs
+
+    def put(key, obj) -> None:
+        out[key] = id(obj)
+        objs[key] = obj
+
+    for attr, val in list(d.items()):
+        if type(attr) is not str:
+            put(("!key", id(attr)), val)
+            continue
+        t = type(val)
+        if _is_class_type(t):
+            if not _defined_in(val, name):
+                # 别的模块定义的类由它自己的模块登记；库里的类在模块间被惰性重新绑定是正常的（如 pyplot 的 `_backend_mod`），
+                # 只有「用户的类被塞进库模块」才记
+                if not _owner_module_ok(val):
+                    put((attr, "!foreign"), val)
+                continue
+            qualname = _T_QUALNAME.__get__(val)
+            if type(qualname) is str and "<locals>" in qualname:
+                continue  # 函数里现造的类（pyplot 每次切后端重新建的 `_backend_mod`）：库自己的惰性状态
+            put((attr, None), val)
+            for k, v in list(_T_DICT.__get__(val).items()):
+                if type(k) is not str:
+                    put(("!key", id(k)), v)
+                elif _record_class_value(v):
+                    put((attr, k), v)
+        elif t is types.FunctionType or t is types.BuiltinFunctionType:
+            put((attr, None), val)
+    return out, objs
+
+
+def _surface_modules() -> dict:
+    out = {}
+    mods = sys.modules
+    if type(mods) is not dict:
+        raise TypeError("sys.modules is not a plain dict")  # 外层兜底成「被改过」
+    for k, m in list(mods.items()):
+        if type(k) is not str or m is None:
+            continue
+        if k.split(".", 1)[0] in _SURFACE_PACKAGES or k in _SURFACE_EXTRA_MODULES:
+            out[k] = m
+    return out
+
+
+def _owner_module_ok(cls) -> bool:
+    """类（或某个对象的类型）定义在库里：matplotlib / mpl_toolkits / numpy / 标准库，或装在 site-packages 里的依赖
+    （cycler / pyparsing / PIL / dateutil / kiwisolver……，按该模块的文件位置判）。用户脚本 / 用户项目里的模块不算。"""
+    module = _T_MODULE.__get__(cls)
+    if type(module) is not str:
+        return False
+    top = module.split(".", 1)[0]
+    if top in _LIB_TOPS:
+        return True
+    d = _loaded_module_dict(top)
+    if d is None:
+        return False
+    loc = _dict_get(d, "__file__")
+    if type(loc) is str:
+        return _path_under_roots(loc, _surface_roots)
+    # 包：`__path__` 只认精确的 list / tuple（里面全是精确 str）。命名空间包的 `_NamespacePath` 一迭代就会重算——走
+    # `sys.meta_path` / `path_hooks`，那是用户可注入的代码——所以其它类型一律当「非库来源」
+    paths = _dict_get(d, "__path__")
+    if type(paths) is list or type(paths) is tuple:
+        return bool(paths) and all(
+            type(x) is str and _path_under_roots(x, _surface_roots) for x in paths
+        )
+    return False
+
+
+def _path_under_roots(filename: str, roots) -> bool:
+    """`filename` 在 `roots` 之下（先按原样规整比，再按 realpath 比；Windows 的大小写 / 短路径 / 符号链接差异都不该造成误判）。
+    `<…>` 形式的合成文件名（`<string>`、`<frozen …>` 等）一律不算：`exec` 生成的用户函数就是 `<string>`；
+    冻结的标准库函数由 `_function_origin_ok` 按 `__module__` 另判。"""
+    if filename.startswith("<"):
+        return False
+    cached = _realpath_cache.get(filename)
+    if cached is None:
+        raw = os.path.normcase(os.path.normpath(filename))
+        try:
+            real = os.path.normcase(os.path.realpath(filename))
+        except Exception:  # noqa: BLE001
+            real = raw
+        cached = _realpath_cache[filename] = (raw, real)
+    for candidate in cached:
+        for root in roots:
+            if candidate == root or candidate.startswith(root + os.sep):
+                return True
+    return False
+
+
+def _function_origin_ok(fn, roots) -> bool:
+    filename = _CODE_FILENAME.__get__(_FN_CODE.__get__(fn))
+    module = _FN_MODULE.__get__(fn)
+    if type(filename) is not str:
+        return False
+    if filename.startswith("<"):
+        # 合成文件名：`<string>` 等一律不算库来源；`<frozen X>` 只在 X 精确等于该函数的 `__module__` 且它是标准库模块时才认
+        if filename.startswith("<frozen ") and filename.endswith(">"):
+            return (
+                type(module) is str
+                and filename[len("<frozen ") : -1] == module
+                and module.split(".", 1)[0] in _STDLIB_NAMES
+            )
+        return False
+    if _path_under_roots(filename, roots):
+        return True
+    # 路径对不上时（打包 runtime 的目录布局各异）再看函数声明的所属模块：库的函数 `__module__` 是库的模块，
+    # 用户脚本里写的 patch 函数是用户的模块。威胁模型同上（防诚实的用户钩子，不防蓄意伪装 `__module__`）
+    return type(module) is str and module.split(".", 1)[0] in _LIB_TOPS
+
+
+def _origin_value_ok(v, roots, depth: int = 0) -> bool:
+    """类字典里的一个值，来源是库吗？函数看定义文件，描述符拆开看里面的函数，其它对象看它的类型定义在哪。"""
+    if depth > 4:
+        return False
+    if _is_simple(v):
+        return True
+    t = type(v)
+    if t is types.FunctionType:
+        return _function_origin_ok(v, roots)
+    if t is types.BuiltinFunctionType:
+        return True
+    if t is staticmethod:
+        return _origin_value_ok(_SM_FUNC.__get__(v), roots, depth + 1)
+    if t is classmethod:
+        return _origin_value_ok(_CM_FUNC.__get__(v), roots, depth + 1)
+    if t is property:
+        for part in _PROP_PARTS:
+            if not _origin_value_ok(part.__get__(v), roots, depth + 1):
+                return False
+        return True
+    return _owner_module_ok(v if _is_class_type(t) else t)
+
+
+def _module_origin_ok(mod, name: str, roots) -> bool:
+    """首次才见到的模块（脚本运行期间才导入，如 `mpl_toolkits.mplot3d`）：没有「启动时」的基线可比，
+    所以从严——它的 Python 函数必须定义在 matplotlib / mpl_toolkits 自己的目录（或标准库 / numpy）里，其它对象的类型也必须是库的。"""
+    d = _module_dict(mod)
+    if d is None:
+        return False
+    for attr, val in list(d.items()):
+        if type(attr) is not str:
+            return False
+        t = type(val)
+        if _is_class_type(t):
+            if not _owner_module_ok(val):
+                return False
+            if _defined_in(val, name):
+                for k, v in list(_T_DICT.__get__(val).items()):
+                    if type(k) is not str or not _origin_value_ok(v, roots):
+                        return False
+        elif t is types.FunctionType and not _function_origin_ok(val, roots):
+            return False
+    return True
+
+
+def freeze_trusted_surface() -> None:
+    """进程内只拍一次（同 worker 重试不重拍——否则脚本上一轮的 patch 会被当成基线）。safe worker 在跑用户脚本之前调。"""
+    global _surface_base, _surface_roots, _surface_mpl_roots
+    with _surface_lock:
+        if _surface_base is not None:
+            return
+        roots: list[str] = []
+
+        def add(path) -> None:
+            if type(path) is str and path:
+                for form in (os.path.normpath(path), os.path.realpath(path)):
+                    form = os.path.normcase(form)
+                    if form not in roots:
+                        roots.append(form)
+
+        for pkg in _SURFACE_PACKAGES:
+            d = _loaded_module_dict(pkg)
+            paths = _dict_get(d, "__path__") if d is not None else None
+            # 只读精确的 list / tuple；命名空间包（mpl_toolkits）的 `_NamespacePath` 不迭代（迭代会重算、走 meta_path / path_hooks），
+            # 改取它已算好的内部 `_path` 列表，再不行就用 matplotlib 目录的兄弟目录
+            if type(paths) is not list and type(paths) is not tuple and paths is not None:
+                try:
+                    inner = object.__getattribute__(paths, "_path")
+                except Exception:  # noqa: BLE001
+                    inner = None
+                paths = inner if type(inner) is list or type(inner) is tuple else None
+            for p in paths or ():
+                add(p)
+        if roots and not any(os.path.basename(r) == "mpl_toolkits" for r in roots):
+            add(os.path.join(os.path.dirname(roots[0]), "mpl_toolkits"))
+        _surface_mpl_roots = tuple(roots)
+        # 「库来源」还包括：matplotlib 所在的 site-packages（它的依赖）、解释器安装前缀（标准库、嵌入式发行版的 python3xx.zip、
+        # 各平台 site-packages）、Tavotto 引擎目录（worker 对 `plt.show` 等的自家 patch）。被用户脚本里的函数顶替才是 patch
+        import site  # noqa: PLC0415
+        import sysconfig  # noqa: PLC0415
+
+        if roots:
+            add(os.path.dirname(roots[0]))
+        for path in (
+            sysconfig.get_paths().get("stdlib"),
+            sysconfig.get_paths().get("platstdlib"),
+            sys.prefix,
+            sys.base_prefix,
+            sys.exec_prefix,
+            os.path.dirname(os.path.abspath(__file__)),
+        ):
+            add(path)
+        try:
+            for path in site.getsitepackages():
+                add(path)
+        except Exception:  # noqa: BLE001
+            pass
+        _surface_roots = tuple(roots)
+        _surface_base = {k: _surface_module_map(k, m) for k, m in _surface_modules().items()}
+
+
+def _reset_trusted_surface_for_tests() -> None:
+    global _surface_base
+    with _surface_lock:
+        _surface_base = None
+
+
+def trusted_surface_diff() -> list:
+    """诊断用：与基线不一致的条目（不补登记新模块）。"""
+    base = _surface_base or {}
+    out = []
+    for name, mod in _surface_modules().items():
+        known = base.get(name)
+        if known is None:
+            continue
+        cur = _surface_module_map(name, mod)[0]
+        out += [(name, k) for k in set(cur) | set(known[0]) if cur.get(k) != known[0].get(k)]
+    return out
+
+
+_surface_reported: set = set()
+
+
+def _report_patched(why: str) -> None:
+    """只记一次、只写 stderr（worker.log）：下次再有环境差异造成的误判，能直接看到是哪个模块的哪一项。"""
+    if why in _surface_reported:
+        return
+    _surface_reported.add(why)
+    try:
+        print(f"[snapshot] matplotlib_patched: {why[:300]}", file=sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _is_mpl_own_function(obj) -> bool:
+    """变化条目复核唯一接受的新对象：matplotlib / mpl_toolkits **自己**的函数——精确类型 `FunctionType`（文件在 matplotlib /
+    mpl_toolkits 的包目录下，`__module__` 顶层也是它们），或 C 层 builtin（`__module__` 属于它们）。
+    partial / 绑定方法 / 描述符包装 / 库类型的实例 / 别的第三方包（scienceplots、seaborn……）/ 标准库的函数一律不是。"""
+    t = type(obj)
+    if t is types.FunctionType:
+        module = _FN_MODULE.__get__(obj)
+        filename = _CODE_FILENAME.__get__(_FN_CODE.__get__(obj))
+        return (
+            type(module) is str
+            and module.split(".", 1)[0] in _SURFACE_PACKAGES
+            and type(filename) is str
+            and not filename.startswith("<")
+            and _path_under_roots(filename, _surface_mpl_roots)
+        )
+    if t is types.BuiltinFunctionType:
+        module = _BF_MODULE.__get__(obj)
+        return type(module) is str and module.split(".", 1)[0] in _SURFACE_PACKAGES
+    return False
+
+
+def _changed_entries_are_library(name: str, cur_ids: dict, cur_objs: dict, known_ids: dict) -> bool:
+    """基线之后有变化的条目：只有新对象是 matplotlib / mpl_toolkits 自己的函数（它们自己的惰性重绑定，如 pyplot 的
+    `switch_backend`）才接受并更新基线；其余一律是被改过（用户裁决：matplotlib 被任何东西改过就放弃快照）。被移除的条目不算。"""
+    for key in set(cur_ids) | set(known_ids):
+        if cur_ids.get(key) == known_ids.get(key) or key not in cur_ids:
+            continue
+        if not _is_mpl_own_function(cur_objs.get(key)):
+            _report_patched(f"{name}.{key[0]}.{key[1]}")
+            return False
+    return True
+
+
+def trusted_surface_intact() -> bool:
+    """此刻 matplotlib（及还原路径上的几个入口）的方法面与基线一致吗？每次都按真实值重算，不缓存。
+    基线里有的模块逐项比对；基线之后才导入的模块首次见到时按来源从严检查、通过则补登记（之后的 patch 靠 id 比对发现）。
+    与基线不一致的条目再复核一次：只有 matplotlib / mpl_toolkits 自己的函数重绑定才接受并更新基线。
+    全程静态读取；任何意外异常都按「被改过」处理（返回 False），绝不向调用方抛。"""
+    try:
+        if _surface_base is None:
+            freeze_trusted_surface()
+        base = _surface_base
+        if base is None:
+            return False
+        with _surface_lock:
+            for name, mod in _surface_modules().items():
+                known = base.get(name)
+                if known is None:
+                    if name.split(".", 1)[0] in _SURFACE_PACKAGES and not _module_origin_ok(
+                        mod, name, _surface_roots
+                    ):
+                        _report_patched(f"{name}: 首次见到的模块里有非库来源的函数 / 对象")
+                        return False
+                    base[name] = _surface_module_map(name, mod)
+                    continue
+                cur = _surface_module_map(name, mod)
+                if cur[0] != known[0]:
+                    if not _changed_entries_are_library(name, cur[0], cur[1], known[0]):
+                        return False
+                    base[name] = cur
+        return True
+    except Exception as exc:  # noqa: BLE001 —— 比对失败本身就是不可信
+        _report_patched(f"异常 {type(exc).__name__}")
+        return False
+
+
+_SERIALISATION_HOOKS = ("__reduce_ex__", "__reduce__", "__getstate__", "__setstate__")
+_C_HOOK_TYPES = (
+    types.WrapperDescriptorType,
+    types.MethodDescriptorType,
+    types.BuiltinFunctionType,
+    types.ClassMethodDescriptorType,
+)
+
+
+#: 标准库里自带 Python 级序列化钩子的模块（`enum.Enum.__reduce_ex__` 等；matplotlib 的枚举 / 集合类型会用到）
+_TRUSTED_HOOK_MODULES = frozenset({"enum", "copyreg", "collections", "functools"})
+
+
+def _class_hooks_trusted(t) -> bool:
+    """纵深层（Codex #1314 P1-c）：`t` 沿 MRO 解析出的类级序列化钩子必须出自白名单包或是 C 实现（`object` 自带的槽）。
+    脚本可以 patch `Line2D.__reduce__` / `Figure.__getstate__`——类型名仍是 matplotlib，只看模块拦不住。
+    只静态读各类的 `__dict__`，不调用、不触发描述符；每次 dump 重新判，不跨快照缓存。"""
+    for name in _SERIALISATION_HOOKS:
+        for klass in _T_MRO.__get__(t):
+            attr = _dict_get(_T_DICT.__get__(klass), name, _MISSING)
+            if attr is _MISSING:
+                continue
+            ta = type(attr)
+            if ta is staticmethod:
+                attr = _SM_FUNC.__get__(attr)
+            elif ta is classmethod:
+                attr = _CM_FUNC.__get__(attr)
+            ta = type(attr)
+            if any(ta is c for c in _C_HOOK_TYPES):
+                break
+            if ta is types.FunctionType:
+                module, qualname = _FN_MODULE.__get__(attr), _FN_QUALNAME.__get__(attr)
+                if (type(module) is str and module in _TRUSTED_HOOK_MODULES) or (
+                    save_moment_module_allowed(module, qualname)
+                ):
+                    break
+            return False
+    return True
+
+
+class _SnapshotPickler(pickle.Pickler):
+    """拍摄侧的守门：**任何用户的 `__reduce__` / `__reduce_ex__` / `__getstate__` 被调用之前**先按类型把关。
+
+    `reducer_override` 先于 `__reduce_ex__` 被调用（C 实现里 int / str / bytes / float / bool / None 与精确的 list / tuple /
+    dict / set / frozenset / bytearray 走快速通道、不经过它——它们没有用户代码，容器里的元素仍逐个经过这里）。
+    不在白名单里的类型（用户类、用户继承 matplotlib 的子类、函数、lambda……）立刻抛 `PicklingError`，
+    所以拍快照绝不执行用户的序列化代码，也就不可能借它改活 Figure。允许的返回 `NotImplemented`，交给默认机制。
+    判断本身只做静态读取（`type(obj)` + 内建类型的描述符），不对 `obj` 调 `isinstance` / `getattr`，所以带自定义属性钩子的对象也跑不起来。
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        #: id(类型) -> 类级序列化钩子是否都出自白名单。只活在这一次 dump 里：脚本在两次快照之间 patch 类方法，下一次重新判
+        self._hooks_ok: dict[int, bool] = {}
+
+    def _class_hooks_ok(self, t) -> bool:
+        key = id(t)
+        ok = self._hooks_ok.get(key)
+        if ok is None:
+            ok = self._hooks_ok[key] = _class_hooks_trusted(t)
+        return ok
+
+    def reducer_override(self, obj):
+        t = type(obj)
+        if _is_class_type(t):
+            # 类对象一律按全局名存（元类的 `__reduce__` 不会被调用，已实测），只看类自己在不在名单里
+            ok = _snapshot_type_allowed(obj)
+        elif t is types.BuiltinFunctionType:
+            owner = _BF_SELF.__get__(obj)
+            if owner is None or type(owner) is types.ModuleType:
+                # 模块级内建函数按全局名存
+                ok = save_moment_module_allowed(_BF_MODULE.__get__(obj), _BF_QUALNAME.__get__(obj))
+            else:
+                # 内建对象的绑定方法（`list.remove` 的 bound 形态）存成 `getattr(self, 名字)`，`self` 之后逐个过这里
+                ok = True
+        elif t is types.FunctionType:
+            # 函数按全局名存（`copyreg._reconstructor`、numpy 的重建函数……）；lambda / 用户函数 / 内部函数都不在名单里
+            ok = save_moment_module_allowed(_FN_MODULE.__get__(obj), _FN_QUALNAME.__get__(obj))
+        elif t is types.MethodType:
+            # 绑定方法存成 `getattr(self, 名字)`：`__reduce__` 是 C 实现、不跑用户代码；`self` 之后仍逐个经过这里
+            ok = True
+        else:
+            ok = _snapshot_type_allowed(t) and self._class_hooks_ok(t)
+            if ok:
+                # 实例上挂着的序列化钩子（`obj.__reduce_ex__ = ...`）也是用户代码；实例字典只在库类型上静态读
+                try:
+                    inst = object.__getattribute__(obj, "__dict__")
+                except AttributeError:
+                    inst = None
+                if type(inst) is dict:
+                    for k in inst:
+                        if type(k) is str and k in ("__reduce__", "__reduce_ex__", "__getstate__"):
+                            ok = False
+                            break
+        if not ok:
+            module, qualname = _static_type_names(t)
+            raise pickle.PicklingError(f"not snapshot-safe: {module}.{qualname}")
+        return NotImplemented
+
+
+def _snapshot_dumps(fig) -> bytes:
+    buf = io.BytesIO()
+    _SnapshotPickler(buf, protocol=pickle.HIGHEST_PROTOCOL).dump(fig)
+    return buf.getvalue()
+
+
+def _structure_signature(fig) -> tuple:
+    """还原前后都能算的廉价结构签名：图幅 + 每个 Axes 的 artist 计数。不渲染、不改 Figure。
+
+    轴的清单走 `axestraversal.ordered_axes`（全产品唯一的遍历权威，含 `inset_axes` / `secondary_[xy]axis` / 寄生轴）。
+    静态读纪律：只在**已通过类型白名单的库对象图**上调用——拍摄侧排在序列化成功之后（图里全是库类型），还原侧算在刚还原出的复制品上；
+    `ordered_axes` 只按属性名 `axes` / `child_axes` / `parasites` 走对象图。"""
+    axes = tuple(
+        (
+            type(ax).__name__,
+            len(ax.lines),
+            len(ax.collections),
+            len(ax.patches),
+            len(ax.texts),
+            len(ax.images),
+            len(ax.containers),
+        )
+        for ax in axestraversal.ordered_axes(fig)[0]
+    )
+    w, h = fig.get_size_inches()
+    return (round(float(w), 6), round(float(h), 6), len(fig.texts), len(fig.artists), axes)
+
+
+class SaveMomentLedger:
+    """保存瞬间快照账（一个 `FigureSession` 一份，ADR 0139 §九）。
+
+    每张 Figure 只留**最近一次**保存的快照（与「改动判据是最近一次保存之后」同一时刻）。快照是 `pickle.dumps(fig)`
+    ——matplotlib 文档化的 Figure 持久化——的字节串，只握在本进程内存里，随会话消亡；绝不写盘、不发给别的进程。
+    """
+
+    def __init__(self):
+        #: id(fig) -> {"ref", "blob", "occurrence", "signature", "reason", "stems"}
+        self._rows: dict[int, dict] = {}
+        self._total = 0
+
+    def _drop(self, key: int) -> None:
+        row = self._rows.pop(key, None)
+        if row is not None and row["blob"] is not None:
+            self._total -= len(row["blob"])
+
+    def take(self, fig, occurrence, extra_artists=None) -> None:
+        """一次 savefig 记完账之后调用：给 `fig` 拍快照（替换它上一次的）。绝不抛，也不改 Figure。"""
+        for key in [k for k, r in self._rows.items() if r["ref"]() is None]:
+            self._drop(key)
+        key = id(fig)
+        self._drop(key)
+        row = {
+            "ref": weakref.ref(fig),
+            "blob": None,
+            "occurrence": occurrence,
+            "signature": None,
+            "reason": None,
+        }
+        self._rows[key] = row
+        if extra_artists:
+            row["reason"] = "bbox_extra_artists"
+            return
+        # 结构层（Codex #1314 P1-c）：拍摄期间 Figure 若被置脏（任何途径改了图，含被 patch 过的类级钩子），
+        # 这次改动必须留在 `DIRTY_SINCE_SAVE` 里如实报成 `modified_after_save`——这里绝不清标记，快照作废。
+        # 兜底：下面任何一步（含指纹比对）出了意外都只是放弃快照、退回只告知，绝不让 build 失败
+        try:
+            if not trusted_surface_intact():
+                row["reason"] = "matplotlib_patched"
+                return
+            # 先看类型再碰对象：Figure 若是用户子类，读它的任何属性都可能是用户代码
+            if not _snapshot_type_allowed(type(fig)):
+                row["reason"] = "unpicklable"
+                return
+            dirty_before = bool(getattr(fig, DIRTY_SINCE_SAVE, False))
+            try:
+                self._take_into(row, fig)
+            finally:
+                if not dirty_before and getattr(fig, DIRTY_SINCE_SAVE, False):
+                    row["blob"], row["signature"], row["reason"] = None, None, "unpicklable"
+        except Exception:  # noqa: BLE001
+            row["blob"], row["signature"], row["reason"] = None, None, "unpicklable"
+        if row["blob"] is None:
+            return
+        blob = row["blob"]
+        row["blob"] = None
+        if len(blob) > SAVE_MOMENT_MAX_BYTES:
+            row["reason"] = "too_large"
+        elif self._total + len(blob) > SAVE_MOMENT_TOTAL_BYTES:
+            row["reason"] = "budget_exceeded"
+        else:
+            row["blob"] = blob
+            self._total += len(blob)
+
+    @staticmethod
+    def _take_into(row, fig) -> None:
+        """序列化 `fig` 进 `row["blob"]`；失败写 `row["reason"]`。绝不抛。"""
+        canvas = manager = None
+        try:
+            # 先看类型再碰对象：Figure / canvas 若是用户子类，读它们的属性（`fig.axes`、`canvas.manager = None`）就可能是用户代码
+            if not _snapshot_type_allowed(type(fig)):
+                raise pickle.PicklingError("user Figure subclass")
+            canvas = fig.canvas
+            if canvas is not None and not _snapshot_type_allowed(type(canvas)):
+                canvas = None
+                raise pickle.PicklingError("user canvas")
+            # 复制品不能带「还原时挂回 pyplot」：临时摘掉 canvas.manager（matplotlib 据此写 `_restore_to_pylab`），用完放回
+            manager = getattr(canvas, "manager", None)
+            canvas.manager = None
+            row["blob"] = _snapshot_dumps(fig)
+            # 签名最后算：序列化通过 = 图里全是库类型，读 `ax.lines` 之类不会落到用户重写的属性上
+            row["signature"] = _structure_signature(fig)
+        except Exception:  # noqa: BLE001 —— 快照尽力而为：失败只是退回「告知」
+            row["blob"], row["reason"] = None, "unpicklable"
+        finally:
+            if manager is not None:
+                canvas.manager = manager
+
+    def restore(self, fig, selected_occurrence=None):
+        """还原 `fig` 最近一次保存时的复制品；返回 `(restored, None)` 或 `(None, 原因)`。绝不抛。"""
+        row = self._rows.get(id(fig))
+        if row is None or row["ref"]() is not fig:
+            return None, "unpicklable"
+        if row["reason"] is not None:
+            return None, row["reason"]
+        if selected_occurrence is not None and selected_occurrence != row["occurrence"]:
+            return None, "not_selected_save"
+        # 还原会走 `__setstate__` 等类级钩子：脚本在拍摄之后才 patch 的也要拦住（拍摄前的那次比对管不到）
+        try:
+            if not trusted_surface_intact():
+                return None, "matplotlib_patched"
+        except Exception:  # noqa: BLE001 —— 比对本身出意外 = 不可信
+            return None, "matplotlib_patched"
+        try:
+            restored = _RestrictedUnpickler(io.BytesIO(row["blob"])).load()
+            if _structure_signature(restored) != row["signature"]:
+                return None, "structure_mismatch"
+        except Exception:  # noqa: BLE001
+            return None, "restore_failed"
+        for name in _SAVE_MOMENT_STRIP:
+            restored.__dict__.pop(name, None)
+        return restored, None
+
+    def release(self) -> None:
+        """判定完（采用或放弃）之后释放所有快照字节。"""
+        self._rows.clear()
+        self._total = 0
 
 
 def savefig_verifier(real_savefig, fig, fname, args, kwargs: dict):

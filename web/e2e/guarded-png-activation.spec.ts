@@ -1,7 +1,7 @@
 import type { APIRequestContext, Locator, Page, Request, Response } from '@playwright/test'
 import { execFileSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { expect, openElementsTab, test } from './fixtures'
 
@@ -827,7 +827,13 @@ test('source-backed PNG: legend + pixel difference → compare dialog → confir
   mkdirSync(config, { recursive: true })
   // 应急开关默认开；这里仍显式写 true，让用例不依赖默认值
   writeFileSync(path.join(config, 'config.json'), JSON.stringify({ experiments: { script_backed_figure: true } }))
-  const a = await app({ figures: source.figures, env: { TAVOTTO_CONFIG_DIR: config } })
+  // 这条用例要走「对照确认弹窗 → 确认 → 重画 → 撤销」整条流程，靠的是「存后改图」造出的像素差。保存瞬间快照
+  // （ADR 0139 §九）会把重画还原成保存那一刻，像素差就没了、弹窗不再出现——所以这里显式关掉快照，保住原流程；
+  // 快照开启时的行为由下面 "saved-moment snapshot" 那条用例单独钉住。环境变量由同一个父进程传给 worker。
+  const a = await app({
+    figures: source.figures,
+    env: { TAVOTTO_CONFIG_DIR: config, TAVOTTO_SAVE_MOMENT_SNAPSHOT: '0' },
+  })
   const data = await seed(page.request, a.baseURL, ['a'], 'source-backed-png')
   const traffic = watchRenders(page)
   await page.goto(`${a.baseURL}/${data.query}`)
@@ -934,6 +940,63 @@ test('source-backed PNG: legend + pixel difference → compare dialog → confir
   if (await page.locator('[data-exit-element-edit]').count()) await exitEdit(page)
   await paintedOriginal(page, 'a', source.png)
   // The original PNG (and the script) are byte-identical to what the user had: adoption and editing never write the source.
+  expect(readFileSync(path.join(source.figures, FILE))).toEqual(source.png)
+  expect(readFileSync(path.join(source.figures, 'figure.py'), 'utf8')).toContain('Edited after save')
+})
+
+test('source-backed PNG: saved-moment snapshot → edits the figure as it was saved and says so (no compare dialog when the fixture and the engine share one interpreter)',
+  { tag: '@feature:assets.source-backed-adoption' }, async ({ app, page }, testInfo) => {
+  test.setTimeout(300_000)
+  // 同一份「存后改图」夹具（保存后标题被改成 "Edited after save"），快照开启（默认，ADR 0139 §九）。
+  // 要钉死的是快照本身的事实：可编辑基础的标题是保存时的 "Guarded source"、界面说「按存盘时的样子编辑」、原件与脚本字节不变。
+  // 「有没有对照弹窗」则取决于运行环境：夹具用 TAVOTTO_WORKER_PYTHON 生成原图，引擎用自己的解释器重画；两者是同一个解释器
+  // （同一份 matplotlib / 字体）时重画与原件逐像素相同、不出弹窗；打包产物（Windows smoke）的内置 runtime 与夹具解释器不同，
+  // 像素会有环境差异、弹窗照常出现——那种情况点确认继续，不当作失败。
+  const source = sourceProject(testInfo.outputPath('source'), false, true, true)
+  const config = testInfo.outputPath('config')
+  mkdirSync(config, { recursive: true })
+  writeFileSync(path.join(config, 'config.json'), JSON.stringify({ experiments: { script_backed_figure: true } }))
+  const a = await app({ figures: source.figures, env: { TAVOTTO_CONFIG_DIR: config } })
+  const data = await seed(page.request, a.baseURL, ['a'], 'source-backed-png-snapshot')
+  const traffic = watchRenders(page)
+  await page.goto(`${a.baseURL}/${data.query}`)
+  await expect(await only(object(page, 'a'))).toBeVisible({ timeout: 60_000 })
+  await paintedOriginal(page, 'a', source.png)
+
+  // 夹具解释器与引擎解释器是不是同一个（路径与 matplotlib 版本都相同才算）
+  const [fixturePython, fixtureMpl] = execFileSync(
+    workerPython(), ['-c', 'import os, sys, matplotlib; print(os.path.realpath(sys.executable)); print(matplotlib.__version__)'],
+    { encoding: 'utf-8' },
+  ).trim().split(/\r?\n/)
+  const env = await (await page.request.get(`${a.baseURL}/api/engine/environment${data.query}`)).json() as
+    { matplotlib?: string; project?: { python?: string } }
+  const realpath = (p: string) => { try { return realpathSync(p).toLowerCase() } catch { return p.toLowerCase() } }
+  const sameInterpreter = !!env.project?.python && realpath(env.project.python) === fixturePython.toLowerCase() && env.matplotlib === fixtureMpl
+
+  await (await only(object(page, 'a'))).click({ button: 'right' })
+  await (await only(page.locator('[data-quick-item="edit-elements"]'))).click()
+  const host = await only(object(page, 'a'))
+  const review = page.locator('[data-source-review="adopt"]')
+  const svg = host.locator('[data-element-svg="a"] > svg')
+  await expect(review.or(svg)).toBeVisible({ timeout: 120_000 })
+  if (await review.count()) {
+    expect(sameInterpreter, '同一个解释器画出来的重画不该与原件有像素差（快照应还原保存瞬间）').toBe(false)
+    await (await only(page.locator('[data-source-review-confirm]'))).click()
+  }
+  await expect(svg).toBeVisible({ timeout: 120_000 })
+  await openElementsTab(page)
+  const pill = page.locator('[data-modified-after-save][data-save-moment="restored"]')
+  await expect(pill).toHaveCount(1, { timeout: 60_000 })
+  await expect(pill).toContainText('Edited as saved')
+
+  // 引擎侧：可编辑基础的标题是保存时的 "Guarded source"，不是脚本后来改的 "Edited after save"
+  const manifests = traffic.records.filter(r => r.endpoint === '/api/engine/render' && r.status === 200 && r.body.manifest)
+  expect(manifests.length).toBeGreaterThan(0)
+  const titleValues = manifests.flatMap(r => r.body.manifest!.elements.filter(e => e.gid === TITLE)
+    .flatMap(e => e.editable.filter(f => f.prop === 'text').map(f => f.value)))
+  expect(titleValues.length).toBeGreaterThan(0)
+  expect(new Set(titleValues)).toEqual(new Set(['Guarded source']))
+  // 原件与脚本都没被碰
   expect(readFileSync(path.join(source.figures, FILE))).toEqual(source.png)
   expect(readFileSync(path.join(source.figures, 'figure.py'), 'utf8')).toContain('Edited after save')
 })

@@ -482,6 +482,7 @@ def _patched_savefig(self, fname, *args, **kwargs):
             kwargs.get("bbox_extra_artists"),
             target=figcapture.savefig_target_key(fname, kwargs, getattr(self, "canvas", None)),
             verify=figcapture.savefig_verifier(_REAL_SAVEFIG, self, fname, args, kwargs),
+            observation=observation,
         )
     if not to_path:
         if SESSION is not None:
@@ -1085,6 +1086,8 @@ class Worker(wireproto.V1Handler):
         t_build = time.perf_counter()
         if self.built:
             return self._stems_summary()
+        # 快照账绑「这一次脚本执行」：同 worker 重试（instrument / 发布阶段临时失败）也从一份新账开始
+        self.session.begin_save_moments()
         self.configure_run({})
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.sandbox.mkdir(parents=True, exist_ok=True)
@@ -1295,6 +1298,8 @@ class Worker(wireproto.V1Handler):
         self._input_channel = channel
         scriptinput.install(channel)
 
+        # 可信方法面指纹：用户代码（含 paper_style）跑之前、Tavotto 自己的 patch 都装完之后拍一次（进程内只拍一次）
+        figcapture.freeze_trusted_surface()
         capture_threads = set(threading.enumerate())
         t_script = time.perf_counter()
         # `source_sha256`（TAF 改图验证的判据：这次 build 执行的是哪一版源码）。两条路径各自成立的理由不同：
@@ -1429,6 +1434,8 @@ class Worker(wireproto.V1Handler):
                 )
                 self.dropped_figures = dropped
 
+        # 存盘后又被改过的图：能还原保存那一刻的 Figure 就用它当编辑基础（ADR 0139 §九）
+        self.session.adopt_save_moments()
         try:
             if (
                 self.session.artifact_source is not None
