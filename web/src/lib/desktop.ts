@@ -174,6 +174,8 @@ export async function onDesktopOpen(
  */
 export type NativeFileDrop =
   | { kind: 'script'; folder: string; script: string; name: string; ignored: number }
+  /** R / MATLAB 脚本（`.R` / `.r` / `.m`，ADR 0143 修订二）：打开 `folder`，由页面提议「生成可编辑版本」；语言由页面按文件名后缀判 */
+  | { kind: 'foreign_script'; folder: string; script: string; name: string; ignored: number }
   | { kind: 'folder'; folder: string; name: string; ignored: number }
   | { kind: 'unsupported'; name: string }
 
@@ -346,7 +348,8 @@ export async function pickDirectory(title?: string): Promise<string | null> {
 }
 
 /**
- * 原生文件选择器，只收 `.py`（主页「导入我的脚本」用）。取消返回 null；
+ * 原生文件选择器，收 `.py`，以及 R / MATLAB 脚本 `.R` / `.r` / `.m`（ADR 0143 修订：这些会走“生成可编辑版本”的入口卡，
+ * 不会被当成可运行脚本）。主页「导入我的脚本」用。取消返回 null；
  * 浏览器模式返回 null，调用方回退到服务器端目录浏览器（选脚本所在的文件夹）。
  * 与 `pickDirectory` 同一条 `dialog:allow-open` 权限，壳侧不用加 ACL。
  */
@@ -357,7 +360,7 @@ export async function pickScriptFile(title?: string): Promise<string | null> {
     directory: false,
     multiple: false,
     title,
-    filters: [{ name: 'Python', extensions: ['py'] }],
+    filters: [{ name: 'Python / R / MATLAB', extensions: ['py', 'R', 'r', 'm'] }],
   })
   return typeof picked === 'string' ? picked : null
 }

@@ -22,6 +22,9 @@
 2. **Agent 只写候选工作区里的一个新文件**。候选 `data_dir()/cache/ai_convert/<sid>/` 只**复制**原脚本（与 ≤ 8 MB 的原输出图当参考），
    不建链接；提交前检查：除这一个新文件外候选树逐字节不变（含原脚本副本）、原项目指纹不变、项目里原脚本仍是起跑那一版。
    CLI 把写入挡在 cwd 之外是 CLI 的行为，指纹只能发现、不能阻止（同 `figure_edit`，R-03）。
+   **完整性闸门先于依赖等待（Codex #1330 P1）**：校验运行前的依赖调查期间项目文件被改（`project.untouched` / `project.target` 失败）→ 不进入依赖等待、
+   不留存候选，结局同不缺依赖时的完整性失败。续跑的项目指纹基线是**起跑时**存进 `meta.json` 的那份（`project_before`），不用此刻的项目重建；
+   停住期间项目或原脚本被改、或 meta 里没有基线 → 续跑失败（`convert_project_changed` / `convert_source_changed`）并删掉候选脚本与预览，不可采用。
 3. **提交不碰用户文件**：任务的 `commit` 只把通过检查的候选留存待采用（候选目录 + `meta.json`，24 h 过期清理）。用户点「采用」才由后端
    `ai_convert.adopt` 把候选**新建**进项目——新原语 `atomicio.create_new_bytes`（同目录临时文件写满 fsync → `os.link` 到目标，已存在由内核
    原子拒绝；不支持硬链接的文件系统退到 `O_CREAT|O_EXCL`）经 `scriptlock.create_script`（必须持目标的 `script_guard`）。存在即失败、
@@ -56,9 +59,111 @@
 本 ADR **不加新遥测事件**（新事件须攒齐一次升 `CONSENT_VERSION`）。后续候选：`convert_started` / `convert_outcome`（闭集：library、
 outcome、corrections 个数、是否采用）——不带脚本、路径或图内文字。
 
+## 修订：R / MATLAB 来源（2026-10-23）
+
+起因：论文图常由 R（ggplot2）或 MATLAB 画，用户手里只有脚本与（或没有）导出的图。维护者四条裁决：
+
+1. **范围**：第一版只收 `.R` / `.r` / `.m` 纯文本脚本，不含 `.Rmd` / `.qmd` / `.mlx` / `.fig` / `.rds`。`.m` 是 MATLAB 与 Objective-C 共用的后缀，
+   所以来源语言由 `engine/sourcelang.detect(path, text)` 看内容定（Obj-C 特征 `#import` / `@interface` / `@implementation` / `@end` 等一票否决；MATLAB 特征
+   `%` 注释、`function`、独占一行的 `end`、绘图 / 读数据调用等至少两类），≤ 1 MB、UTF-8；**判不出就拒绝，不猜**。
+2. **不运行**用户的 R / MATLAB：对照只用脚本旁已有的原图（沿用本 ADR 的 `path` / `original_rel`；请求没给时取脚本旁同主干名的位图）。没有原图时
+   `comparison` 带 `reference: null`、`verification: "unknown"`（有原图为 `side_by_side`，只是并排给人看，不是判定），界面一句话说明。
+3. **没有逐一对应的统计方法时停下**：Agent 首行写 `TAVOTTO_NEEDS_INPUT: <原因>` 并且不写新文件 → 任务结局 `needs_input`（`ai_tasks.NeedsInput`，在 Agent 运行结束后判，
+   与 `Plan.needs_input` 的“执行前”不同），不生成新脚本。标记只在“没有新文件”时算数、只认 Agent 的完整回答、行首；原因清洗 + 限长 200 字，只随结局给界面，不进日志 / 遥测。
+   没有标记且没写文件仍是原来的 `target_missing` 失败。
+4. **新脚本缺的 Python 包自动装进用户环境**（用户改了默认值）：不新写 pip 路径，缺什么由 `deprepair.joint_plan_for`（`importscan` 静态扫 + `depplan`）算，装由
+   `create_joint_plan` + `prepare`。装好的包进结果 `installed`（界面一句“已为这个项目装好 pandas、statsmodels”）；装失败是不可修正的失败（`dependency_install_failed`）。
+
+### 修订二（维护者 2026-10-23 第二次裁决）：大名单 + 每个环境问一次 + 真卡片 + 取消
+
+替换上面 4 里的“14 包闭集 + 只两类目标”。
+
+- **名单**：只装“在名单里”的发行包。名单 = 上一轮 14 个科学计算包 ∪ PyPI 30 天下载量前 1000 的项目名快照（来源 hugovk/top-pypi-packages 的
+  `top-pypi-packages-30-days.min.json`），存成纯数据文件 `src/tavotto/engine/autoinstall_dists.txt`（PEP 503 规范名，一行一个，文件头写来源 URL / 快照日期 / 许可证），
+  随 `packaging/tavotto.spec` 的 datas 进冻结产物；`scripts/dev/refresh_autoinstall_list.py` 重新生成（开发侧工具，必须显式给 `--license`，产品运行时从不联网取名单）。
+  **本次提交只带 14 个种子**：该上游仓库没有声明任何许可证（GitHub license API 404、仓库根无 LICENSE），“许可证不允许再分发就停下”的口径下没有把 1000 条快照提交进来；
+  维护者确认可再分发后跑一条脚本命令即可并入。名单读不到时退回 14 个种子（只会更小）。名单外的包：不自动装，卡片点名“这个包不常见，确认是你要的再装”。
+- **每个环境问一次**（环境按 `pool.resolve_worker_python` 此刻会跑脚本的解释器分类，`convertdeps.describe_env`）：
+  `project_venv` / 已存在的受管环境一代：名单内直接装（保持上一轮口径；受管目标要新建环境或下载私有 Python 时仍问）；
+  `system`（OS 自带 / `EXTERNALLY-MANAGED`）与 `builtin`（内置 runtime / 自建 worker-env / 本进程解释器）：**永不装**，卡片“这个 Python 是系统自带的……请给项目换一个环境”，
+  主按钮打开现有的「选择运行环境」入口（`openEngineEnvPicker`）；其余（Conda、设置里指定的、环境变量固定的、项目记录里用户采用的）：**第一次**需要装时卡片
+  “要给这个环境（conda: myenv）装缺的包吗？”+ 主按钮“装，以后这个环境都自动装”+ 次按钮“不装”；点主按钮才对**这个环境**记下常驻同意
+  （`ai.convert.auto_install_envs`，键 = 解释器路径 sha256 前 16 位，只存指纹 + 种类 + 目录名，不存明文路径），之后同一环境再缺名单内的包直接装；
+  设置 → Python 库有“已允许自动装包的环境”列表，每行一个“撤销”。
+- **现有修复链对非项目 venv 的环境不支持原地 pip**（`deprepair.joint_target_for`：非项目 venv 一律以受管环境为目标），所以对 Conda / 指定解释器这类环境，主按钮执行的是
+  现有链条的标准动作：装进 Tavotto 为本项目建的受管环境并让项目以后用它跑（不改动用户的那个环境；卡片文案如实写明）。不新增 pip 调用路径。
+- **真卡片（Codex #1330 P1-2）**：候选校验遇到缺依赖且不自动装时，任务以 `needs_input` 终局（`unmet[].reason_code = "dependency_decision"`，`unmet[].data` 是结构化卡片事实：
+  种类 / 包名 / 名单外的包 / 环境种类 + 可读名 / 动作 / 摘要 / 是否新建环境或下载 Python），**候选不删**（`meta.json` 状态 `awaiting_dependencies`），不进修正轮。
+  用户点主按钮 → `POST /api/ai/convert/<sid>/dependencies`，后端起作业装依赖并**接着校验同一个候选**（`resuming` → `ready` / 回 `awaiting_dependencies` / `failed`），不重跑 Agent；
+  “不装” = `discard`。计划不可执行 / 被修复链拒绝 / 开关关着这几种没有可执行动作的情况仍照常跑校验、以 `missing_dependency` 如实失败，失败一句话不再指向并不存在的提示。
+- **换环境后重新判定（Codex #1330 P1）**：系统 Python / 内置 runtime 卡的主按钮打开现有的环境选择器（不另造第二个）；选完且解释器确实变了（前端比环境身份：全局解释器 + 本项目来源 / 解释器），
+  前端自动 `POST …/dependencies {action:"replan"}`——不带摘要、不重跑 Agent，后端用此刻的项目解释器走自动路径的同一棵决定树（`convertdeps.ensure`）：能直接装的装并接着校验同一个候选，
+  要问一次 / 名单外 / 仍是系统 Python 的回新卡，已不缺包的直接续跑。会话认证、项目隔离、续跑忙碌判定（`convert_resume_busy`）、取消传递与 `install` 动作一致；解释器没变保持原卡。
+- **取消传到安装（Codex #1330 P1-1）**：任务的取消标记（`TaskRun.cancel_event`）与续跑作业的取消标记原样传给 `convertdeps`，由监视线程在取消到来时调 deprepair 现有的
+  `cancel_status`（`prepare` 复用同一个取消句柄，开跑前就取消也会在拿锁前停手、一个字节不写）；过了提交点的取消被 `cancel_status` 拒绝，结果如实回 `installed`。
+  卡片上点停止 / 关闭 = `discard`，它把取消传给正在进行的续跑作业，作业停手后删候选目录，结局 `cancelled`。
+- **晚到的停止以安装结果为准（Codex #1330 P2）**：续跑里依赖步骤返回 `installed`（过了 deprepair 提交点，`cancel_status` 拒绝了取消，环境已换代）而取消标记仍置位时，
+  **不删候选、不自动往下跑校验**（避免违背停止意图），候选停在 `meta.json` 状态 `deps_installed`（“已装好、等你继续”，`installed` 如实记录），界面一句「依赖已经装好了（停止来得太晚，没能撤回）。」
+  + 主按钮「继续」（走 `{action:"replan"}` 入口：已不缺包，直接校验同一个候选）。依赖步骤真的被取消（未过提交点，结局 `cancelled`）或根本没装过东西：照旧 `cancelled`、删候选。
+  取舍：停止是对“整件事”的意图，但环境写入已撤不回，保留候选让用户用已付出的安装继续，比删掉再让用户重来更不浪费；若用户在这之前已关掉卡片，候选留到 24 小时过期。
+  **首跑同一语义（Codex #1330 P2 再续）**：AI 任务阶段（首跑）里依赖步骤过了提交点返回 `installed` 而取消已置位，也不落入取消检查被 Task Core 丢弃：适配器的 `hold` 把候选留存成 `deps_installed`，
+  任务结局记 `needs_input`、`unmet[].reason_code = "dependency_installed_late"`（`data.installed` 如实带出）；本地取消仍先让会话显示 `cancelled`，前端在取消回复 `ok:true, mode:"local"` 后不再立即清条目，
+  而是等会话 `final` 后再 `GET /api/ai/convert/<sid>` 对账：`deps_installed` → 出同一张「依赖已经装好了……」+「继续 / 放弃」卡，404 / 其余 → 清。未过提交点的取消不变（`cancelled`、删候选）。
+  **普通依赖等待遇停止，取消赢（Codex #1330 P2）**：首跑校验期间依赖步骤停在 `system` / `uncommon` / `ask_once` 卡（环境没被动）而取消已置位时，不再 `hold` 成 `awaiting_dependencies`、也不以 `needs_input` 终局把已停止的转换藏起来：
+  Task Core 在调 `hold` 之前查取消，经适配器的 `settle_hold_on_cancel(候选)` 问「这次停住是否必须保留」——只有 `late_installed`（环境已换代，上一条）为是；否则适配器放掉停住态，任务按 `cancelled` 终局并删候选（Task Core 不认识 convert 的 reason_code）。
+  **停止后对账遇传输错误不清卡**：前端 `settleAfterStop` 对网络错误 / 超时 / 5xx（非 404、非 409）与 409 一样重试（至多 5 次、间隔 `POLL_MS`）；仍连不上则不清条目，落「暂时连不上」（`failed` + `resume_unreachable`，`lost.stopped`），
+  重试与 × 都先对账、不重发任何 POST；只有明确的 404 / `discarded` / 其余真实状态才清，`deps_installed` 照旧出「继续」卡。
+- **续跑期间点停止先对账再清卡（Codex #1330 P2）**：`resuming` 里点「停止」/ 关闭不再先清条目——条目留在 `resuming` 并标 `stopping`（卡片只一句「正在停止…」、无按钮），
+  发 `discard` 后由续跑轮询按后端真实状态收尾：候选已删（404 / `discarded`）→ 才清卡；`deps_installed`（停止来得太晚）→ 落 `installed`，出上面那张「依赖已经装好了……」+「继续」；
+  `ready` / `awaiting_dependencies` / `failed` 如实展示。`discard` 请求本身失败 → 立刻 `GET` 对账再按结果展示（仍在续跑 = 取消没送到，退回可再点停止）。后端不改：
+  `discard` 对续跑作业只置取消标记并立即回 `{ok:true}`（作业异步收尾，回复里本来就不可能知道结局），结局以状态读口为准。非续跑阶段（`deps` / `installed` / `ready` / `running`）的停止 / 关闭行为不变。
+- **AI 任务阶段点停止先看取消回复（Codex #1330 P1）**：`running` 里点「停止」/ 关闭不再先清条目。条目先标 `stopping`（卡片只一句「正在停止…」、无按钮），发 `POST /api/ai/sessions/<sid>/cancel` 后**看回复**：
+  `ok:true, mode:"local"`（本进程已终止）→ 清；`ok:false`（`refused_committing` 等，任务已进提交闸门）或 `mode:"owner"`（只转交给别的进程、结局未定）→ 条目与会话号保留，
+  由 `start()` 的轮询按会话 `final` + `GET /api/ai/convert/<sid>` 对账——与续跑阶段的 `stopping` 是同一套 `applyConvertStatus`，不写第二份：最终 `cancelled` / 会话或候选 404 / `discarded` → 清；
+  候选已 ready → 落 `ready` 并标 `stoppedLate`，卡片一句「转换已经完成，停止来得太晚。对照一下，要用就采用」+ 主按钮「采用」/ 次按钮「放弃」，不重跑 Agent；`needs_input` 等其余结局如实展示。
+  取消请求本身失败（传输错误）：不清、`stopping` 复位，用户可再点。
+- **续跑的指纹基线测不出按「已变化」拒（Codex #1330 P2）**：`_rebuild` 在 install / replan / continue 的**任何动作之前**比对起跑基线；`fingerprint_changes()` 回 `None`（任一侧超限 / 读不了，
+  例如停住后项目长过 `FINGERPRINT_MAX_FILES`）一律 fail-closed，按 `convert_project_changed` 拒：不装包、不跑候选、删候选。首跑与续跑落 ready 前的 `project.untouched` 对 `None` 本就记 `unknown`（非 `verified`，不放行）；
+  TAF figure_edit 的 `None` = unknown = 不提交语义不变。
+- **续跑落 ready 前原子地再查一次取消（Codex #1330 P2）**：「查取消标记 → `stage` 落 ready → 摘续跑登记」在 `_RESUMES_LOCK`（与 `_cancel_resume` 同一把锁）里一气做完。之前到达的 discard 在此被看见：删候选、结局 `cancelled`，绝不 ready；
+  之后到达的 discard 因登记已摘，按「已 ready 的候选」照常删。
+- **R / MATLAB 同名旁图只收浏览器能直接显示的格式（Codex #1330 P2）**：对照视图经 `/api/file` 原样取字节显示，所以 `sibling_original` 的候选后缀只有 png / jpg / jpeg / gif / webp / svg
+  （`ai_convert._SIBLING_EXTS`，仓库里没有现成的“可直接显示”名单：`project_refresh.IMG_EXT` 是素材盘点集、含 TIFF）。只有 `fig.tif` / `fig.tiff`（或 bmp）时不当参照：`reference: null`、`verification: unknown`，
+  照常说「未对照验证」；同时有 `fig.png` 用 png。TIFF 不走预览路径（那需要渲染，对一张用户的旁图不值得）。显式给 `path` 指认原图的路线不变。
+- **续跑里的取消在启动校验之前生效，并传到在跑的探测（Codex #1330 P2）**：`run_validation` 在依赖旁路返回“继续”（调研 `none` / `skipped` / 不缺包）之后、**启动校验 runner 之前**再查一次取消标记，已置位 → `cancelled`、
+  不启动 runner、删候选。校验运行中取消到来：`_convert_runner` 带 `force_cancel`（= `pool.force_cancel` 以同一份 run / write_roots 键硬杀在跑的探测 worker），`run_validation` 的监视线程在取消到来时调它，
+  阻塞中的 probe 读到 EOF 返回，结局 `cancelled`、删候选。runner 没有该入口（纯引擎单测）则只做启动前检查。
+- **「暂时连不上」点 × 也要停与对账（Codex #1330 P2）**：`failed` + `lost`（依赖 POST 已受理而对账也连不上）后端可能仍在装 / 校验，所以视同续跑中：× / 停止先标 `stopping`（一句「正在停止…」）、发 `discard`，
+  再走同一套对账收尾（候选已删 → 清卡与提议；`deps_installed` → 「继续」；`ready` → 可采用）；对账再连不上回到「暂时连不上」。不再只清提议。
+- **续跑遇到传输错误先对账（Codex #1330 P1）**：前端续跑（install / replan / 继续）的 POST 或轮询遇到网络 / 超时 / 5xx / 响应丢失，或 409 `convert_not_awaiting_dependencies`，不直接判失败：
+  先 `GET /api/ai/convert/<sid>`（转换自己的状态，**不是**已终结的 AI 会话，后者永远是 `needs_input`，会把已 ready 的候选盖回旧依赖卡），按后端真实状态展示
+  （`resuming` 继续等 / `ready` 可采用 / `awaiting_dependencies` 换新卡 / `deps_installed` / `failed` / 404 已不存在）。对账也连不上 → 「暂时连不上，请稍后重试」（`failed` + `resume_unreachable`，保留动作）；
+  重试先对账：后端已在续跑 / 已 ready 绝不重发 POST，仅当后端仍停在同一张卡（摘要一致，或 replan）说明那次点击没到，才重发一次。**后端不改**：不为 POST 加幂等，
+  因为 `convert_resume_busy` / `convert_not_awaiting_dependencies` 的 409 正好是对账的触发点，状态读口已足够区分各情形。
+- **孤儿续跑持久化回滚（Codex #1330 P2）**：`meta.json` 说 `resuming` 而本进程 `_RESUMES` 里没有该 sid（后端重启 / 续跑线程意外死掉）是同一个判据、同一处处理（`_reconcile_orphan_resume`，状态读口与 `prepare_resume` 共用）：
+  持 `_RESUMES_LOCK` 重读 meta 后原子写回——有 installed 记录 → `deps_installed`（等「继续」），否则 → `awaiting_dependencies`（卡片字段保留；环境若已被改动由下一次 install 的摘要校验兜住），没卡可回 → `failed`（`resume_interrupted`）。
+  于是卡片再点 install / replan 能续跑同一个候选；正在真实续跑的（已登记）不回滚。候选没有启动期扫描（`prune_expired` 只在新建候选时调用），故只在读路径与 `prepare_resume` 做。
+- **指纹不含 Python 环境目录（Codex #1330 P1）**：项目自己的 `.venv` 是自动装依赖的合法写入目标（`deprepair.prepare` 在校验前后写它），若指纹把它算进去，装包成功的候选会被
+  `project.untouched` 误拒（首跑与续跑同理）。`ai_figure_edit.project_fingerprint` 因此整棵跳过 Python 环境目录：判据是目录里有 `pyvenv.cfg`（venv / virtualenv / uv）或 `conda-meta/`
+  （conda，同 `launcher.conda_prefix_of`），**不按目录名猜**——叫 `.venv` 却没有这两个标记的目录照常计入；链接目录仍按原规则记链接目标。这同时影响 TAF figure_edit 的指纹（环境目录不是用户内容）。
+  **盲区（如实）**：Agent 或任何进程往项目环境目录里写东西，指纹发现不了；兜底是 CLI 沙盒 / 内置执行器的路径判据仍把 Agent 限制在候选目录（候选目录里本来没有项目的 `.venv`）。
+- **授权口径（两种，需要维护者知悉）**：`deprepair._check_confirmed` 要求调用方回显给用户看过的影响摘要，服务端自己持有的摘要不得代替回显。
+  ① 问过一次 / 点过卡片：确认来自用户这次真实点击——前端把卡片带着的 `impact_digest` 原样回传，服务端重算计划，对不上就不装、回新的卡片，**不自回显**；
+  ② 已记过常驻同意的环境（含 `project_venv` / 受管环境这两类上一轮就直接装的目标）：由服务端回显**同一次调用里刚算出的**摘要，依据是维护者 2026-10-23 的常驻同意裁决，
+  可用 `ai.convert.auto_install=false` / `TAVOTTO_NO_CONVERT_AUTO_INSTALL=1` 收回，也可在设置里撤销单个环境；`deprepair` 自己的 `dependency_impact_changed` /
+  `repair_plan_stale` 照样拦。
+
+其余不变：端点同一个 `POST /api/ai/convert`（多可选 `source_language`，缺省 `python`；r / matlab 时 `library` 必须缺省，声明与文件内容对不上 400
+`convert_source_language_mismatch`）；候选 / 校验 / 采用全套（第二节逐条）；目标名 `fig.R` → `fig_matplotlib.py`；`library` 在 r / matlab 时为 null；
+会话元数据（sidecar、`meta.json`）记 `source_language`；预算与契约不变；**不加遥测事件**（第五节）。前端：主页拖入 / 选择 `.R` / `.r` / `.m` 时打开所在文件夹并出一张
+一句话卡片（主按钮「生成可编辑版本」），不当成“不是脚本”，也不走“打开并运行”；桌面壳的原生拖放分类（`drop_paths.rs`，Codex #1330 P2）认这三个后缀（区分大小写，`.M` / `.Rmd` / `.mlx` 不算，与 `foreignScript.ts` / `sourcelang.extension_hint` 同一份）：
+`DropTarget::ForeignScript { folder, script, name, ignored }`（载荷 `kind: "foreign_script"`），分派顺序 `.py` > 外语脚本 > 文件夹 > 不支持，多个取第一个；页面收到后与 DOM 拖放、选择器走同一个入口
+（`openForeign`：开所在文件夹 → 出卡，不运行；语言按文件名后缀在页面侧判）。
+
 ## 不做
 
 - 不自动采用；不替用户改任何已有脚本；不在原脚本上叠改。
+- 不运行用户的 R / MATLAB；不收 `.Rmd` / `.qmd` / `.mlx` / `.fig` / `.rds`；不为统计方法近似替换。
 - 不把新版标成“与原图一致”：它是重画，用户看过对照才采用。
 - 不做像素差度量；不为转换放宽 safe 档或新增 native 路径。
 

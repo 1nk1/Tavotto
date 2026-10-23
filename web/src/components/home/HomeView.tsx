@@ -10,7 +10,7 @@ import {
   Play,
 } from '@/components/ui/icons'
 import { ICON_SIZE } from '@/components/ui/Icon'
-import type { RecentProject } from '@/lib/api'
+import { backendErrorText, browseDirs, type RecentProject } from '@/lib/api'
 import { PRODUCT_NAME } from '@/lib/brand'
 import {
   dragRegionProps,
@@ -33,6 +33,7 @@ import {
   useTutorialStore,
   type HomeVariant,
 } from '@/lib/onboarding/tutorial'
+import { foreignLanguageOf, type ForeignLanguage } from '@/lib/foreignScript'
 import {
   createDropArbiter,
   dragHasFiles,
@@ -43,6 +44,7 @@ import {
 } from '@/lib/scriptImport'
 import { cn } from '@/lib/utils'
 import { useOnboardingStore } from '@/store/onboardingStore'
+import { useForeignScriptStore } from '@/store/foreignScriptStore'
 import { scriptTarget, useProjectPreparationStore } from '@/store/projectPreparationStore'
 import { useProjectStore } from '@/store/projectStore'
 import { useUiStore } from '@/store/uiStore'
@@ -196,13 +198,19 @@ type Importer = ReturnType<typeof useScriptImport>
  * 上次的排版，用户看到的永远是第一张图（2026-10-21 诊断包）。只给目录的入口（目录浏览器、拖文件夹）不运行任何脚本。
  *
  * 拖放（ADR 0092）：macOS 桌面壳旁听系统拖放、交来 canonicalize 过的真实路径
- * （`onNativeFileDrop`），`.py` 打开它所在的文件夹、文件夹直接当项目、别的说不收，
+ * （`onNativeFileDrop`），`.py` 打开它所在的文件夹、`.R` / `.r` / `.m` 打开所在文件夹并提议“生成可编辑版本”、文件夹直接当项目、别的说不收，
  * 多拖了几个说一句只开了哪个。拿不到路径的宿主（浏览器、其它平台）退回选择器并说清是
  * 哪个文件。同一次放下两条路都会到，谁先谁后不定，由 `createDropArbiter` 仲裁。
  */
 function useScriptImport(openPath: (path: string) => Promise<boolean>) {
   const { t } = useTranslation('project')
   const [browsing, setBrowsing] = useState(false)
+  /**
+   * 浏览器拖入 R / MATLAB 脚本拿不到路径：记下文件名与语言，等用户在目录浏览器里选好文件夹后走 `openForeign`。
+   * 只在这一次选择内有效——取消 / 换别的入口 / 选完（成功或不对）都清掉；`problem` = 选错了文件夹的那句话。
+   */
+  const [pendingForeign, setPendingForeign] = useState<{ name: string; language: ForeignLanguage } | null>(null)
+  const [pickProblem, setPickProblem] = useState<string | null>(null)
   const [notice, setNotice] = useState<{ tone: 'info' | 'error'; text: string } | null>(null)
   /**
    * 壳能不能交来真实路径：`pending` = 能力探测与事件订阅还没都完成。两件事都是异步、先后不定，
@@ -224,6 +232,16 @@ function useScriptImport(openPath: (path: string) => Promise<boolean>) {
       return ok
     })
 
+  /**
+   * R / MATLAB 脚本（ADR 0143 修订）：它们不是可运行的 Python 脚本，不走「打开并运行」。打开所在文件夹，
+   * 然后由画布右下的入口卡提议「生成可编辑版本」（原脚本不动）。后缀只是粗判，内容由后端复核。
+   */
+  const openForeign = (folder: string, script: string, language: ForeignLanguage): Promise<boolean> =>
+    openPath(folder).then((ok) => {
+      if (ok && script === script.trim()) useForeignScriptStore.getState().setOffer({ script, language })
+      return ok
+    })
+
   const openDropped = (drop: NativeFileDrop) => {
     // 壳的事件不经过页面的 onDrop，切换中的闸要在这里再挡一次（与主页其它入口的 disabled 同一个判据）
     if (useProjectStore.getState().switching) return
@@ -232,6 +250,21 @@ function useScriptImport(openPath: (path: string) => Promise<boolean>) {
     if (useOnboardingStore.getState().surface !== 'none') return
     if (drop.kind === 'unsupported') {
       setNotice({ tone: 'error', text: t('home.import.dropNotScript', { name: drop.name }) })
+      return
+    }
+    if (drop.kind === 'foreign_script') {
+      // R / MATLAB 脚本：与 DOM 拖放、选择器同一个入口（openForeign）→ 画布右下的“生成可编辑版本”卡；语言只按后缀粗判，后端复核内容
+      const language = foreignLanguageOf(drop.name)
+      if (!language) {
+        setNotice({ tone: 'error', text: t('home.import.dropNotScript', { name: drop.name }) })
+        return
+      }
+      setNotice(null)
+      void openForeign(drop.folder, drop.name, language).then((ok) => {
+        // 单个：画布右下的入口卡自己会说话；多拖了的说只用了哪个（openedScript 的“正在运行它”对外语脚本不成立）
+        if (ok && drop.ignored > 0)
+          useUiStore.getState().setStatus(msg('home.import.droppedMany', { name: drop.name, total: drop.ignored + 1 }, 'project'), 'done')
+      })
       return
     }
     setNotice(null)
@@ -268,12 +301,16 @@ function useScriptImport(openPath: (path: string) => Promise<boolean>) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  const choose = () => {
+  const choose = (pending: { name: string; language: ForeignLanguage } | null = null) => {
+    setPendingForeign(pending)
+    setPickProblem(null)
     if (isDesktop()) {
       void pickScriptFile(t('home.import.nativeTitle')).then((path) => {
         if (path) {
           setNotice(null)
-          void openFolder(folderForPath(path), scriptForPath(path))
+          const foreign = foreignLanguageOf(path)
+          if (foreign) void openForeign(folderForPath(path), path.replace(/^.*[\\/]/, ''), foreign)
+          else void openFolder(folderForPath(path), scriptForPath(path))
         }
       })
     } else setBrowsing(true)
@@ -293,9 +330,14 @@ function useScriptImport(openPath: (path: string) => Promise<boolean>) {
         setNotice(null)
         void openFolder(target.folder, target.script)
         return
+      case 'foreign-path':
+        setNotice(null)
+        void openForeign(target.folder, target.script, target.language)
+        return
       case 'no-path':
+      case 'foreign-no-path':
         setNotice({ tone: 'info', text: t('home.import.dropNoPath', { name: target.name, product: PRODUCT_NAME }) })
-        choose()
+        choose(target.kind === 'foreign-no-path' ? { name: target.name, language: target.language } : null)
         return
       case 'not-script':
         setNotice({ tone: 'error', text: t('home.import.dropNotScript', { name: target.name }) })
@@ -330,11 +372,35 @@ function useScriptImport(openPath: (path: string) => Promise<boolean>) {
     <DirBrowser
       mode="open"
       title={t('home.import.folderTitle')}
-      onClose={() => setBrowsing(false)}
-      onPick={(path) => {
+      problem={pickProblem}
+      onClose={() => {
         setBrowsing(false)
-        setNotice(null)
-        void openPath(path)
+        setPendingForeign(null)
+        setPickProblem(null)
+      }}
+      onPick={(path) => {
+        const pending = pendingForeign
+        if (!pending) {
+          setBrowsing(false)
+          setNotice(null)
+          void openPath(path)
+          return
+        }
+        // 先核「这个文件夹里确有这个文件」再开项目：选错了不动当前状态、对话框不关，换个文件夹再选
+        void browseDirs(path, pending.name).then(
+          (r) => {
+            if (!r.has_file) {
+              setPickProblem(t('home.import.foreignNotFound', { name: pending.name }))
+              return
+            }
+            setBrowsing(false)
+            setPendingForeign(null)
+            setPickProblem(null)
+            setNotice(null)
+            void openForeign(path, pending.name, pending.language)
+          },
+          (e) => setPickProblem(backendErrorText(e)),
+        )
       }}
     />
   )

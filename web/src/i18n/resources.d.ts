@@ -1832,6 +1832,12 @@ export default interface Resources {
       },
       "navLabel": "设置分区",
       "packages": {
+        "autoInstall": {
+          "empty": "还没有环境被允许自动装包。",
+          "loading": "正在读取…",
+          "revoke": "撤销",
+          "title": "已允许自动装包的环境"
+        },
         "backgroundTitle": "背景信息",
         "builtinCountMeta": "{{count}} 个 · 只读",
         "builtinEmpty": "没有内置包信息。",
@@ -2409,10 +2415,14 @@ export default interface Resources {
       "convert_disabled": "「生成可编辑版本」已被关闭。",
       "convert_name_exhausted": "同名的新版本文件太多了（已有 99 个），请先清理再试。",
       "convert_no_preview": "这份新版本没有预览。",
+      "convert_not_awaiting_dependencies": "这份新版本现在不在等你决定装包，请刷新后再看。",
       "convert_not_found": "找不到这份待采用的新版本（可能已放弃、已过期，或属于别的项目）。",
       "convert_not_ready": "新版本还没生成好，或没有通过检查。",
       "convert_outside_project": "新版本的位置不在项目里，已拒绝写入。",
+      "convert_project_changed": "项目里的文件在生成之后被改动过，已拒绝继续。请重新生成。",
+      "convert_resume_busy": "正在装包并接着生成，请稍等。",
       "convert_source_changed": "原脚本在生成之后被改过，这份新版本是按旧版本写的。请重新生成。",
+      "convert_source_language_mismatch": "{{script}} 的内容看起来不是 R 或 MATLAB 脚本，没有生成。",
       "convert_write_failed": "无法把新版本写进项目，请检查文件夹是否可写。",
       "data_decode_error": "这份数据不是 UTF-8 编码，读不出来。",
       "data_empty": "这份数据是空的。",
@@ -4606,6 +4616,7 @@ export default interface Resources {
         "dropNotScript": "「{{name}}」不是 Python 脚本。请拖入 .py 文件。",
         "droppedMany": "拖入了 {{total}} 项，只用了「{{name}}」打开项目",
         "folderTitle": "选择脚本所在的文件夹",
+        "foreignNotFound": "这个文件夹里没找到「{{name}}」，请选它所在的文件夹。",
         "nativeTitle": "选择 Python 绘图脚本",
         "openedFolder": "已打开项目「{{name}}」",
         "openedScript": "已打开「{{name}}」所在的项目，正在运行它，出图后放进当前画布"
@@ -5282,23 +5293,61 @@ export default interface Resources {
           "retry": "重试",
           "start": "生成可编辑版本"
         },
+        "deps": {
+          "askOnce": "要给这个环境（{{env}}）装缺的包吗？",
+          "askOnceManaged": "要给这个环境（{{env}}）装缺的包吗（会装进 {{product}} 为本项目建的独立环境，不改动它）？",
+          "btn": {
+            "chooseEnv": "选择运行环境",
+            "continue": "继续",
+            "decline": "不装",
+            "installAlways": "装，以后这个环境都自动装",
+            "installOnce": "确认，装上"
+          },
+          "continuing": "正在继续检查新版本…",
+          "env": {
+            "managed": "{{product}} 的项目环境"
+          },
+          "installedLate": "依赖已经装好了（停止来得太晚，没能撤回）。",
+          "replanning": "正在按新环境重新检查…",
+          "resuming": "正在装 {{names}}，装好后接着生成…",
+          "stopping": "正在停止…",
+          "system": "这个 Python 是系统自带的，往里面装包可能弄坏系统工具。请给项目换一个环境。",
+          "systemBuiltin": "这是 {{product}} 内置的运行环境，不往里面装包。请给项目换一个环境。",
+          "uncommon": "{{names}} 这个包不常见，确认是你要的再装。"
+        },
         "fail": {
           "budget_exhausted": "尝试次数用完了",
+          "convert_candidate_changed": "待采用的新版本文件被改动过，请重新生成",
+          "convert_project_changed": "项目里的文件在这期间被改动过，请重新生成",
+          "convert_source_changed": "原脚本在这期间被改过，这份新版本是按旧版本写的，请重新生成",
+          "dependency_install_failed": "新版本要用的 Python 包没装成功，请稍后重试",
+          "missing_dependency": "新版本要用的 Python 包没装上（自动安装已关闭，或这些包没法自动装），请手动装好后重试",
+          "needs_input": "这份脚本里有一步在 Python 里没有可靠的对应，没有生成新版本",
+          "needs_input_reason": "没有生成新版本：{{reason}}",
           "no_matplotlib_figure": "生成的脚本跑完没有画出 Matplotlib 图",
           "no_matplotlib_import": "生成的脚本没有用 Matplotlib",
           "other_file_changed": "助手改动了不该动的文件，已丢弃",
-          "project_files_changed": "助手改动了项目文件，已丢弃",
+          "project_files_changed": "校验运行改动了项目文件，已丢弃",
           "render_not_wired": "暂时无法校验新版本",
+          "resume_error": "接着生成时出错了，请重试",
+          "resume_unreachable": "暂时连不上，请稍后重试",
           "run_failed": "生成的脚本运行出错了",
           "syntax_error": "生成的脚本有语法错误",
           "target_missing": "助手没有写出新脚本",
           "unknown": "没能生成可编辑版本"
         },
+        "foreign": {
+          "matlab": "这是 MATLAB 脚本，{{product}} 可以另写一份能直接编辑的 Matplotlib 版本，原脚本不动。",
+          "r": "这是 R 脚本，{{product}} 可以另写一份能直接编辑的 Matplotlib 版本，原脚本不动。"
+        },
+        "installed": "已为这个项目装好 {{names}}",
         "noPreview": "暂无预览",
         "original": "原图",
         "ready": "新版本生成好了，对照一下再决定",
         "redrawn": "重画的新版本",
-        "running": "正在生成可编辑版本…"
+        "running": "正在生成可编辑版本…",
+        "stoppedLate": "转换已经完成，停止来得太晚。对照一下，要用就采用",
+        "unverified": "{{product}} 没有运行 R / MATLAB，请并排看一眼再采用"
       },
       "detail": {
         "args": "参数",

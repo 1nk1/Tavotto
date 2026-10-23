@@ -67,6 +67,24 @@ class TaskError(Exception):
         self.code = code
 
 
+class NeedsInput(TaskError):
+    """执行器在**跑完之后**判定“这件事要用户先决定 / 先看”：任务结局 `needs_input`（候选作废、不提交）。
+
+    与 `Plan.needs_input`（执行**之前**由确定性计划判的）不同：这里是 Agent 自己停下说明（例如 R 脚本里某个统计方法在
+    Python 里没有逐一对应）。`reason` 是已清洗、有长度上限的一句话，只随任务结局（`unmet[].detail`）给界面。"""
+
+    def __init__(
+        self, reason: str = "", *, reason_code: str = "needs_input", data: dict | None = None
+    ):
+        super().__init__("needs_input")
+        self.reason = reason
+        #: 结局里 `unmet[].reason_code`（缺省 `needs_input`）。适配器可以用自己的稳定码，让界面分支
+        self.reason_code = reason_code
+        #: 随 `unmet[]` 一起交给界面的**结构化字段**（可恢复的停住：候选不删，界面据此出卡片、用户决定后继续同一个候选）。
+        #: 只放界面要的事实（包名 / 环境可读名 / 动作），不放机器路径
+        self.data = data
+
+
 class BudgetExceeded(TaskError):
     def __init__(self, key: str):
         super().__init__("budget_exhausted", key)
@@ -511,6 +529,11 @@ class TaskRun:
     def cancelled(self) -> bool:
         return self._cancel.is_set()
 
+    @property
+    def cancel_event(self) -> threading.Event:
+        """取消标记本身：执行中的长动作（装依赖）据此在取消到来时停手，而不是等编排器下一次复查。"""
+        return self._cancel
+
     def budget_used(self) -> dict:
         return {**self.used, "wall_s": round(self.elapsed(), 3)}
 
@@ -725,6 +748,33 @@ def _guarded_verify(adapter: TaskAdapter, stage: str, run: TaskRun, candidate) -
         ]
 
 
+def _verify_precommit(adapter: TaskAdapter, run: TaskRun, candidate) -> list[CheckResult]:
+    """提交前验证 + 适配器的「停住」口：验证期间适配器若发现“要用户先决定一件事、之后能接着走同一个候选”
+    （`adapter.hold(candidate)` 回 `NeedsInput`），就以 `needs_input` 终局，候选由执行器自己决定留不留（`discard` 里）。"""
+    pre = _guarded_verify(adapter, "precommit", run, candidate)
+    hold = getattr(adapter, "hold", None)
+    if hold is not None and run.cancelled():
+        # 取消已置位：取消要赢——除非适配器说这次停住必须保留（环境已被改动，如依赖装好后才收到停止）。
+        # 不保留就让适配器放掉停住态，照常往下走：循环前的取消检查按 cancelled 终局并删候选。
+        settle = getattr(adapter, "settle_hold_on_cancel", None)
+        keep = False
+        if settle is not None:
+            try:
+                keep = bool(settle(candidate))
+            except Exception:  # noqa: BLE001 —— 适配器出错按「取消赢」处理
+                keep = False
+        if not keep:
+            return pre
+    if hold is not None:
+        try:
+            held = hold(candidate)
+        except Exception:  # noqa: BLE001 —— 停住口自己出错当作没有停住：照常按检查结果走
+            held = None
+        if isinstance(held, NeedsInput):
+            raise held
+    return pre
+
+
 def _failure_signature(checks) -> frozenset[tuple[str, str]]:
     """一轮提交前检查的失败集合：没过的每条 `(id, reason_code)`。同一任务内执行配置不变，这就是「根因」的指纹。"""
     return frozenset(
@@ -826,8 +876,13 @@ def _drive(adapter: TaskAdapter, executor: Executor, run: TaskRun, db_path):
         if why := stop():
             return halted(why)
         phase("verifying")
-        pre = _guarded_verify(adapter, "precommit", run, candidate)
+        pre = _verify_precommit(adapter, run, candidate)
         while not precommit_admits(pre):
+            if (
+                why := stop()
+            ):  # 校验期间（例如装依赖）被取消：不浪费修正，也不把取消记成「检查不过」
+                checks += pre
+                return halted(why)
             # 有界修正（Phase 4）：只在提交前、只在同一个候选上；被拒的那一轮连同拒绝原因记进 attempts
             feedback, refused = _admit_correction(adapter, executor, run, pre)
             run.attempts.append(
@@ -860,7 +915,7 @@ def _drive(adapter: TaskAdapter, executor: Executor, run: TaskRun, db_path):
                 checks += pre
                 return halted(why)
             phase("verifying")
-            pre = _guarded_verify(adapter, "precommit", run, candidate)
+            pre = _verify_precommit(adapter, run, candidate)
         checks += pre
         phase("ready_to_commit")
         with (
@@ -887,6 +942,22 @@ def _drive(adapter: TaskAdapter, executor: Executor, run: TaskRun, db_path):
             checks,
             unmet,
             exc.code,
+            False,
+        )
+    except NeedsInput as exc:
+        discard()  # 没有可提交的东西：候选作废，原项目一个字节不动
+        return (
+            "needs_input",
+            checks,
+            [
+                {
+                    "constraint_id": "intent",
+                    "reason_code": exc.reason_code,
+                    **({"detail": exc.reason} if exc.reason else {}),
+                    **({"data": exc.data} if exc.data else {}),
+                }
+            ],
+            None,
             False,
         )
     except TaskError as exc:

@@ -258,7 +258,7 @@
   的目标脚本仍是起跑那一版、原项目指纹没变（超限 = unknown = 不提交）；提交 = `ai_figure_edit.commit` 持脚本锁再核一次基线 →
   `write_script` → 统一刷新一次（之后不再刷第二遍）。改前快照仍是 `run()` 起跑时拍的那份，回滚照旧走 `revert`。`cancel` /
   `interrupt_all` 先问 `ai_tasks.cancel`：进入提交后取消回 False、不改状态（`interrupt_all` 对该会话 `continue`，不计数）。
-  原项目指纹对符号链接（文件 / 目录）记 lstat + `readlink` 目标、不进入；经链接写到项目外的内容不在指纹里（CLI 沙盒负责）。提交后渲染层验证（Phase 3b）：app 经 `task_hooks` 注入两个钩子——
+  原项目指纹对符号链接（文件 / 目录）记 lstat + `readlink` 目标、不进入；指纹不含 Python 环境目录（`pyvenv.cfg` / `conda-meta/` 标记，不按名字猜；自动装依赖会合法地写那里；盲区：往环境目录里写发现不了，由 CLI 沙盒 / 路径判据限制 Agent 只写候选目录）；经链接写到项目外的内容不在指纹里（CLI 沙盒负责）。提交后渲染层验证（Phase 3b）：app 经 `task_hooks` 注入两个钩子——
   `before` 在**写入之前**从 `pool.peek` 到的、已 build 的 safe 会话读改前 manifest（不执行；没有 = 这次会话没渲染过这张图，或该会话 build
   **实际执行**的源码 sha256 与此刻磁盘脚本不符（旧版脚本建的）→ `render.figure` unknown `no_baseline`，**也不做改后渲染**，不为验证多跑脚本）；
   判据是「执行了哪一版源码」而不是「哪个进程 / 启动时采样」：worker 在 `build()` 里报摘要：按模块 import 的入口（entry 非 `__main__`）由**实际加载源码的 loader 报**——import 期间临时包 `SourceFileLoader.get_code`，入口脚本只 `get_data` 读源码、记 sha256、`source_to_code` 编译，不读任何 `.pyc`（恰好一次加载才报，否则 None）；`__main__` 入口（`runpy.run_path` 读源码本身、不查 `__pycache__`）沿用执行前后括号取 `(mtime_ns, size, inode, sha256)`，两端完全相同才报 sha，否则 None → 验证记 unknown；经 build 响应与
@@ -282,6 +282,28 @@
 写进项目只有 `ai_convert.adopt` → `scriptlock.create_script` → `atomicio.create_new_bytes`（O_EXCL，存在即失败，重名加序号，
 永不覆盖），采用前再核原脚本 sha256 与候选摘要。校验 = 在用户同一路由下 probe 一遍（紧挨原脚本的 `tavotto_convert_probe_<sid>.py`
 临时文件，后端建、跑完删），必须捕获到 Matplotlib 图。看护：`tests/test_ai_convert.py`、`tests/test_ai_convert_app.py`。
+
+**R / MATLAB 来源（ADR 0143 修订，2026-10-23）**：`POST /api/ai/convert` 多一个可选 `source_language`（`python` 缺省 | `r` | `matlab`）。
+r / matlab 时 `library` 必须缺省，后端用 `sourcelang.detect`（纯标准库；`.R` / `.r` / `.m` 纯文本、≤ 1 MB、UTF-8；`.m` 带 Objective-C 特征或
+MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `convert_source_language_mismatch`。**不运行 R / MATLAB**：对照只用请求给的 `path` 或脚本旁
+同名位图（`ai_convert.sibling_original`），没有原图时 `comparison.reference=null`、`verification="unknown"`（界面说一句“请并排看一眼再采用”）。
+提示词是 `ai_prompt_pack` convert 一节的变体（逐步搬运 + R→Python / MATLAB→Python 对照表）。Python 里没有可靠对应时 Agent 首行写
+`TAVOTTO_NEEDS_INPUT: <原因>` 且不写新文件 → `ConvertExecutor` 抛 `ai_tasks.NeedsInput` → 结局 `needs_input`（原因清洗后限长 200 字，只进 `unmet[].detail`，
+不进日志 / 遥测）；写了文件则按文件走，无标记照旧 `target_missing`。新脚本缺包：校验运行前 `convertdeps.ensure(project, rel, cancel)`（app 注入 `task_hooks["deps"]`，仅 r / matlab；`cancel` = `TaskRun.cancel_event`）
+走 `deprepair.joint_plan_for` → `create_joint_plan` → `prepare`（不新写 pip 路径；取消经 `deprepair.cancel_status` 传到安装）。**名单**：只装 `engine/autoinstall_dists.txt`
+（PEP 503 名；14 个种子 ∪ PyPI 30 天下载前 1000 快照，`scripts/dev/refresh_autoinstall_list.py` 生成，spec datas 带上）里的包；名单外的包不自动装。**每个环境问一次**：
+`project_venv` / 已存在的受管一代名单内直接装；系统 Python / 内置 runtime 永不装；其余环境（Conda / 指定 / 环境变量 / 用户采用）第一次出卡片，点主按钮才记
+`ai.convert.auto_install_envs`（解释器路径 sha256 前 16 位 + 种类 + 名，无明文路径；设置页可撤销），装的动作是现有链条的标准动作（受管环境）。
+**不自动装的分支都是真卡片**：`ConvertAdapter.hold` → `NeedsInput(reason_code="dependency_decision", data=card)`（`ai_tasks.NeedsInput` 带 `reason_code` / `data`，进
+`unmet[]`），结局 `needs_input`、候选不删（`meta.json` `awaiting_dependencies`）；`POST /api/ai/convert/<sid>/dependencies {action:"install", impact_digest}` 起作业
+（`ai_convert.prepare_resume` / `run_resume`：装 → 校验**同一个候选** → 留存，不重跑 Agent），`discard` 取消正在进行的安装。换了环境（系统 / 内置卡选完环境且解释器变了）前端发 `{action:"replan"}`：`run_resume(ensure=convertdeps.ensure)` 按此刻环境重判同一个候选（不带摘要，复用同一续跑作业与忙碌判定）。授权口径两种：点过卡片 = 前端回显卡片摘要（服务端不自回显，
+对不上回新卡片）；已记过同意的环境 = 服务端回显同次调用算出的摘要（维护者 2026-10-23 裁决）。开关 `ai.convert.auto_install=false` / `TAVOTTO_NO_CONVERT_AUTO_INSTALL=1`
+（关着或计划不可执行时没有可执行动作，校验以 `missing_dependency` 失败，不修正）。
+晚到的停止（ADR 0143 修订二）：`run_resume` 里依赖步骤返回 `installed`（过提交点，取消被拒）而取消标记已置位时，`run_validation` 在 `_ensure_dependencies` 处返回内部状态 `installed_stopped`，
+续跑把候选留成 `meta.json` `deps_installed`（不删、不自动校验、`installed` 如实记录），`prepare_resume` 也接受这个状态；用户点继续 = `{action:"replan"}`。依赖步骤返回 `cancelled`（或没装过东西）才删候选。
+前端续跑传输错误一律先 `GET /api/ai/convert/<sid>` 对账再决定，后端 POST 不做幂等（409 即对账触发点）。
+会话元数据：sidecar 与 `meta.json` 记 `source_language`；`library` 在 r / matlab 时为 null；遥测不新增事件。看护：`tests/test_sourcelang.py`、
+`tests/test_ai_convert_foreign.py`、`tests/test_ai_convert_foreign_app.py`、`tests/test_convertdeps.py`。
 
 ## 速查表原要点（2026-09-25 迁入，#608）
 

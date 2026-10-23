@@ -51,11 +51,13 @@
     "convert_not_found": "找不到这份待采用的新版本（可能已放弃、已过期，或属于别的项目）。",
     "convert_not_ready": "新版本还没生成好，或没有通过检查。",
     "convert_source_changed": "原脚本在生成之后被改过，这份新版本是按旧版本写的。请重新生成。",
+    "convert_project_changed": "项目里的文件在生成之后被改动过，已拒绝继续。请重新生成。",
     "convert_candidate_changed": "待采用的新版本文件被改动过，已拒绝采用。请重新生成。",
     "convert_outside_project": "新版本的位置不在项目里，已拒绝写入。",
     "convert_write_failed": "无法把新版本写进项目，请检查文件夹是否可写。",
     "convert_name_exhausted": "同名的新版本文件太多了（已有 99 个），请先清理再试。",
     "convert_no_preview": "这份新版本没有预览。",
+    "convert_source_language_mismatch": "{{script}} 的内容看起来不是 R 或 MATLAB 脚本，没有生成。",
     "ai_start_failed": "无法启动 AI 任务：{{reason}}",
     "annotations_need_pdf": "该素材没有矢量 PDF，标注暂时无法写回原图。",
     "artifact_rejected": "导出文件没有通过 {{policy}} 检查（{{failed}}），未发布到导出目录。",
@@ -329,7 +331,9 @@
     "data_empty": "这份数据是空的。",
     "data_header_invalid": "数据的表头有空列名或重复列名。",
     "data_ragged": "数据里有几行的列数和表头不一致。",
-    "figure_name_exhausted": "同名的图太多了，没能给新图找到可用的名字。"
+    "figure_name_exhausted": "同名的图太多了，没能给新图找到可用的名字。",
+    "convert_not_awaiting_dependencies": "这份新版本现在不在等你决定装包，请刷新后再看。",
+    "convert_resume_busy": "正在装包并接着生成，请稍等。"
   },
   "engine": {
     "apply": "应用",

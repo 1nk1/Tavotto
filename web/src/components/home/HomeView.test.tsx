@@ -10,6 +10,7 @@ import type { ProjectStatus, RecentProject } from '@/lib/api'
 import { ProjectPicker } from '@/components/ProjectPicker'
 import { configureOnboardingPersistence, useOnboardingStore, type OnboardingStatus } from '@/store/onboardingStore'
 import { useProjectStore } from '@/store/projectStore'
+import { useForeignScriptStore } from '@/store/foreignScriptStore'
 import { useProjectPreparationStore } from '@/store/projectPreparationStore'
 import { useTutorialStore } from '@/lib/onboarding/tutorial'
 import { useUiStore } from '@/store/uiStore'
@@ -48,6 +49,9 @@ vi.mock('@/lib/onboarding/tutorial', async (orig) => ({
   ...tutorial,
 }))
 
+/** 浏览器目录浏览器的 has_file 应答：选的文件夹里有没有被问的那个文件 */
+let browseHasFile = false
+const browseCalls: string[] = []
 let tutorialApi: 'ok' | 'broken' | 'none' | 'pending' = 'ok'
 globalThis.fetch = (async (url: unknown) => {
   const u = String(url)
@@ -57,7 +61,9 @@ globalThis.fetch = (async (url: unknown) => {
     return new Response(JSON.stringify({ available: tutorialApi === 'ok', problems: [] }), { status: 200 })
   }
   if (u.includes('/api/projects/browse')) {
-    return new Response(JSON.stringify({ path: '/srv', parent: '/', dirs: [] }), { status: 200 })
+    browseCalls.push(u)
+    const asked = new URL(u, 'http://x').searchParams.has('has_file')
+    return new Response(JSON.stringify({ path: '/srv', parent: '/', dirs: [], ...(asked ? { has_file: browseHasFile } : {}) }), { status: 200 })
   }
   return new Response('{}', { status: 404 })
 }) as typeof fetch
@@ -125,6 +131,7 @@ beforeEach(() => {
   desktop.state.handler = null
   desktop.state.offs = 0
   useUiStore.setState({ status: null })
+  useForeignScriptStore.setState({ offer: null })
   tutorial.runTutorialEntry.mockClear()
   tutorial.openSampleProject.mockClear()
 })
@@ -297,6 +304,112 @@ describe('老手版', () => {
     expect(desktop.pickScriptFile).not.toHaveBeenCalled()
   })
 
+  describe('R / MATLAB 脚本（ADR 0143 修订）：不再被当成“不是脚本”，走入口卡', () => {
+    it.each([
+      ['/Users/me/fig/fig.R', 'fig.R', 'r'],
+      ['/Users/me/fig/fig.r', 'fig.r', 'r'],
+      ['/Users/me/fig/fig.m', 'fig.m', 'matlab'],
+    ])('放下带路径的 %s：打开所在目录、不运行、记下待提议', async (uri, name, language) => {
+      await mount()
+      const ev = await dropOn(host.querySelector('[data-home-dropzone]')!, { uris: `file://${uri}`, files: [name] })
+      expect(ev.defaultPrevented).toBe(true)
+      expect(open).toHaveBeenCalledWith('/Users/me/fig', false)
+      expect(prepOpen).not.toHaveBeenCalled() // 不是可运行的 Python 脚本：不走“打开并运行”
+      expect(useForeignScriptStore.getState().offer).toEqual({ script: name, language })
+      expect(host.querySelector('[role="alert"]')).toBeNull()
+    })
+
+    it('桌面壳选择器选了 .R：同一条路（打开所在目录 + 待提议）', async () => {
+      desktop.pickScriptFile.mockResolvedValueOnce('/Users/me/paper/fig.R')
+      await mount()
+      await click(host.querySelector<HTMLButtonElement>('[data-home-dropzone]')!)
+      expect(open).toHaveBeenCalledWith('/Users/me/paper', false)
+      expect(prepOpen).not.toHaveBeenCalled()
+      expect(useForeignScriptStore.getState().offer).toEqual({ script: 'fig.R', language: 'r' })
+    })
+
+    describe('浏览器拖入 .R（拿不到路径）→ 选文件夹', () => {
+      const pickFolder = async () => {
+        await act(async () => {}) // 目录浏览器的首次列举落地
+        await click(document.querySelector<HTMLButtonElement>('[data-dir-browser-confirm]')!)
+        await act(async () => {}) // has_file 应答落地
+      }
+      beforeEach(() => {
+        desktop.isDesktop.mockReturnValue(false)
+        browseHasFile = false
+        browseCalls.length = 0
+      })
+
+      it('选对文件夹：打开它并出外语脚本卡', async () => {
+        browseHasFile = true
+        await mount()
+        await dropOn(host.querySelector('[data-home-dropzone]')!, { files: ['fig.R'] })
+        expect(document.querySelector('[role="dialog"]')).not.toBeNull()
+        await pickFolder()
+        expect(browseCalls.some((u) => u.includes('has_file=fig.R'))).toBe(true)
+        expect(open).toHaveBeenCalledWith('/srv', false)
+        expect(useForeignScriptStore.getState().offer).toEqual({ script: 'fig.R', language: 'r' })
+        expect(prepOpen).not.toHaveBeenCalled()
+        expect(document.querySelector('[role="dialog"]')).toBeNull()
+      })
+
+      it('选错文件夹：一句话说没找到，不开项目不出卡，对话框还在；换对文件夹后出卡', async () => {
+        await mount()
+        await dropOn(host.querySelector('[data-home-dropzone]')!, { files: ['fig.R'] })
+        await pickFolder()
+        expect(document.querySelector('[role="dialog"]')!.textContent).toContain('这个文件夹里没找到「fig.R」，请选它所在的文件夹')
+        expect(open).not.toHaveBeenCalled()
+        expect(useForeignScriptStore.getState().offer).toBeNull()
+        browseHasFile = true
+        await pickFolder()
+        expect(open).toHaveBeenCalledWith('/srv', false)
+        expect(useForeignScriptStore.getState().offer).toEqual({ script: 'fig.R', language: 'r' })
+      })
+
+      it('取消选择：什么都不出，待定也清掉（之后普通导入选文件夹不会冒出卡）', async () => {
+        await mount()
+        await dropOn(host.querySelector('[data-home-dropzone]')!, { files: ['fig.m'] })
+        await act(async () => {})
+        const cancel = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find((b) => b.textContent === '取消')!
+        await click(cancel)
+        expect(document.querySelector('[role="dialog"]')).toBeNull()
+        expect(open).not.toHaveBeenCalled()
+        expect(useForeignScriptStore.getState().offer).toBeNull()
+        browseHasFile = true
+        await click(host.querySelector<HTMLButtonElement>('[data-home-dropzone]')!)
+        await pickFolder()
+        expect(open).toHaveBeenCalledWith('/srv', false)
+        expect(useForeignScriptStore.getState().offer).toBeNull()
+      })
+    })
+
+    it('目录没打开成功就不提议', async () => {
+      open.mockRejectedValueOnce(new Error('cannot open'))
+      await mount()
+      await dropOn(main(), { uris: 'file:///Users/me/fig/fig.R', files: ['fig.R'] })
+      expect(useForeignScriptStore.getState().offer).toBeNull()
+    })
+
+    it('只有文件名（没有路径）：像 .py 一样说清是哪个文件、退回选择器', async () => {
+      desktop.pickScriptFile.mockResolvedValueOnce(null)
+      await mount()
+      await dropOn(main(), { files: ['fig.m'] })
+      expect(host.textContent).toContain(`系统没有告诉 ${PRODUCT_NAME}「fig.m」`)
+      expect(desktop.pickScriptFile).toHaveBeenCalledTimes(1)
+      expect(open).not.toHaveBeenCalled()
+    })
+
+    it('壳的拖放事件交来外语脚本（foreign_script）：开所在文件夹并出卡；fig.pdf 仍照旧说不收', async () => {
+      desktop.nativeFileDropAvailable.mockResolvedValue(true)
+      await mount()
+      await act(async () => desktop.state.handler?.({ kind: 'foreign_script', folder: '/Users/me/fig', script: '/Users/me/fig/fig.R', name: 'fig.R', ignored: 0 }))
+      expect(open).toHaveBeenCalledWith('/Users/me/fig', false)
+      expect(useForeignScriptStore.getState().offer).toEqual({ script: 'fig.R', language: 'r' })
+      await act(async () => desktop.state.handler?.({ kind: 'unsupported', name: 'fig.pdf' }))
+      expect(host.querySelector('[role="alert"]')!.textContent).toContain('fig.pdf')
+    })
+  })
+
   it('放下带 file:// 路径的 pdf：说不收，不拿它当项目去开（#688）', async () => {
     await mount()
     await dropOn(main(), { uris: 'file:///Users/me/fig/fig.pdf', files: ['fig.pdf'] })
@@ -394,6 +507,31 @@ describe('系统拖放（桌面壳交来真实路径，ADR 0092）', () => {
     act(() => useProjectStore.setState({ switching: false }))
     await fire({ kind: 'script', folder: '/Users/me/fig', script: '/Users/me/fig/plot.py', name: 'plot.py', ignored: 0 })
     expect(open).toHaveBeenCalledWith('/Users/me/fig', false)
+  })
+
+  it.each([
+    ['fig.R', 'r'],
+    ['fig.r', 'r'],
+    ['calc.m', 'matlab'],
+  ])('壳交来外语脚本 %s：打开所在文件夹、出外语脚本卡（与选择器同一入口），不运行、不提示“请重新选择”', async (name, language) => {
+    await mount()
+    await fire({ kind: 'foreign_script', folder: '/Users/me/fig', script: `/Users/me/fig/${name}`, name, ignored: 0 })
+    expect(open).toHaveBeenCalledWith('/Users/me/fig', false)
+    expect(useForeignScriptStore.getState().offer).toEqual({ script: name, language })
+    expect(prepOpen).not.toHaveBeenCalled()
+    expect(desktop.pickScriptFile).not.toHaveBeenCalled()
+    expect(host.querySelector('[role="alert"]')).toBeNull()
+    expect(host.textContent).not.toContain('dropForeign')
+  })
+
+  it('壳交来的外语脚本：项目没打开成就不出卡；多拖了几个说只用了哪个', async () => {
+    open.mockRejectedValueOnce(new Error('nope'))
+    await mount()
+    await fire({ kind: 'foreign_script', folder: '/a', script: '/a/f.R', name: 'f.R', ignored: 0 })
+    expect(useForeignScriptStore.getState().offer).toBeNull()
+    await fire({ kind: 'foreign_script', folder: '/a', script: '/a/f.R', name: 'f.R', ignored: 2 })
+    expect(useForeignScriptStore.getState().offer).toEqual({ script: 'f.R', language: 'r' })
+    expect(JSON.stringify(status())).toContain('home.import.droppedMany')
   })
 
   it('不支持的类型：说不收，什么都不打开', async () => {

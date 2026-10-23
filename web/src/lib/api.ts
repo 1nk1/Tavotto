@@ -728,13 +728,17 @@ export interface BrowseResult {
   /** 当前列的是「驱动器」那一层虚拟根 */
   is_roots: boolean
   writable?: boolean
+  /** 请求带了 `has_file` 才有：该叶子名在这个目录里确是一个文件 */
+  has_file?: boolean
 }
 
 /** 目录列举。`'@roots'` = 列驱动器（Windows 靠它跨到 D 盘）。 */
-export const browseDirs = (path?: string) =>
-  jsonFetch<BrowseResult>(
-    `/api/projects/browse${path ? `?path=${encodeURIComponent(path)}` : ''}`,
-  )
+export const browseDirs = (path?: string, hasFile?: string) => {
+  const q = [path ? `path=${encodeURIComponent(path)}` : '', hasFile ? `has_file=${encodeURIComponent(hasFile)}` : '']
+    .filter(Boolean)
+    .join('&')
+  return jsonFetch<BrowseResult>(`/api/projects/browse${q ? `?${q}` : ''}`)
+}
 
 export const patchProjectSettings = (patch: {
   export_dir?: string
@@ -3385,7 +3389,7 @@ export interface AiTaskSummary {
   task_type: string
   outcome: 'completed' | 'partial' | 'needs_input' | 'failed' | 'cancelled' | 'interrupted' | null
   /** 没满足的检查（技术 id + 稳定原因码）；界面只在详情里列 id */
-  unmet?: { constraint_id: string; reason_code: string }[]
+  unmet?: { constraint_id: string; reason_code: string; detail?: string; data?: ConvertDependencyCard }[]
   explain?: { message_key: string; params: Record<string, unknown> }
   /** 进行中的阶段：只在 Agent 正在自动修正上一版时为 `correcting`（有界修正，Phase 4）；终态没有 */
   phase?: 'correcting' | null
@@ -3534,14 +3538,52 @@ export interface ConvertComparison {
   candidate: { figures: number; width_mm: number | null; height_mm: number | null }
   aspect_delta: number | null
   pixel_diff: null
+  /** 参照的原图（项目相对路径）；没有原图 = null（R / MATLAB 来源：Tavotto 不运行它们，没有原图就无从对照）。老后端没有 */
+  reference?: string | null
+  /** `unknown` = 未对照验证（没有原图）；`side_by_side` = 并排给人看（不是判定）。老后端没有 */
+  verification?: 'unknown' | 'side_by_side'
+}
+
+/** 「生成可编辑版本」的来源语言（后端 `sourcelang.LANGUAGES`）：`python` = 位图库出的图；`r` / `matlab` = 转写 */
+export type ConvertSourceLanguage = 'python' | 'r' | 'matlab'
+
+/**
+ * 校验前缺 Python 包、要用户先决定时的卡片事实（后端 `convertdeps` 的 card；任务以 `needs_input` 终局，候选留着等用户）。
+ * `ask_once` = 这个环境第一次要装（主按钮：装，以后这个环境都自动装）；`uncommon` = 名单外的包，点名；
+ * `system` = 系统自带 / 内置 runtime，不装（主按钮：打开「选择运行环境」）。没有机器路径。
+ */
+export interface ConvertDependencyCard {
+  kind: 'ask_once' | 'uncommon' | 'system'
+  packages: string[]
+  outside_list: string[]
+  /** 环境的种类 + 可读名（`conda: myenv`）；不含路径 */
+  env: { kind: 'project_venv' | 'managed' | 'builtin' | 'system' | 'conda' | 'other'; name: string }
+  action: 'install' | 'install_managed' | 'choose_env'
+  /** 用户点主按钮时要原样回传的影响摘要（前端回显它看到的） */
+  impact_digest: string
+  target: string
+  creates_environment: boolean
+  downloads_python: boolean
+  modifies_user_environment: boolean
+  /** 上一次点击时摘要对不上（环境在期间变了），这是换新的卡片 */
+  notice?: string
 }
 
 export interface ConvertStatus {
   session: string
-  state: 'ready' | 'adopted' | 'discarded'
+  state: 'ready' | 'adopted' | 'discarded' | 'awaiting_dependencies' | 'resuming' | 'failed' | 'deps_installed'
+  /** `state === 'awaiting_dependencies'` 时的卡片事实 */
+  dependency_card?: ConvertDependencyCard | null
+  /** `state === 'failed'`（续跑失败）时的原因 */
+  failure?: { reason: string; installer_code?: string; packages?: string[]; code?: string } | null
   script: string
   target_name: string
-  library: string
+  /** 位图库名；R / MATLAB 来源没有（null） */
+  library: string | null
+  /** 老后端没有这个字段（= python） */
+  source_language?: ConvertSourceLanguage
+  /** 校验前自动装进用户环境的 Python 包 */
+  installed?: string[]
   comparison: ConvertComparison | null
   has_preview: boolean
   adopted_script?: string | null
@@ -3554,7 +3596,18 @@ const jsonPost = (body?: unknown): RequestInit => ({
 })
 
 export const startConvert = (
-  req: { script: string; library: string; path?: string | null; agent?: string; model?: string | null; effort?: string | null; client_request_id?: string },
+  req: {
+    script: string
+    /** Python 来源必填；R / MATLAB 来源必须缺省 */
+    library?: string
+    /** 缺省 = python */
+    source_language?: Exclude<ConvertSourceLanguage, 'python'>
+    path?: string | null
+    agent?: string
+    model?: string | null
+    effort?: string | null
+    client_request_id?: string
+  },
   pj: string | null,
 ) => jsonFetch<{ session: string; script: string; deduped?: boolean }>('/api/ai/convert', jsonPost(req), pj)
 
@@ -3566,6 +3619,33 @@ export const adoptConvert = (sid: string, pj: string | null) =>
 
 export const discardConvert = (sid: string, pj: string | null) =>
   jsonFetch<{ ok: boolean }>(`/api/ai/convert/${encodeURIComponent(sid)}/discard`, jsonPost(), pj)
+
+/** 依赖卡片的主按钮：`impact_digest` 是前端回显它看到的卡片摘要；后端起作业（装 + 接着校验同一个候选），前端轮询 `fetchConvert` */
+export const resolveConvertDependencies = (sid: string, impactDigest: string, pj: string | null) =>
+  jsonFetch<{ session: string; state: 'resuming' }>(
+    `/api/ai/convert/${encodeURIComponent(sid)}/dependencies`,
+    jsonPost({ action: 'install', impact_digest: impactDigest }),
+    pj,
+  )
+
+/** 换了环境后：按此刻的项目解释器重新判定**同一个**候选（不带摘要、不重跑 Agent）；后端起作业，前端轮询 `fetchConvert` */
+export const replanConvertDependencies = (sid: string, pj: string | null) =>
+  jsonFetch<{ session: string; state: 'resuming' }>(
+    `/api/ai/convert/${encodeURIComponent(sid)}/dependencies`,
+    jsonPost({ action: 'replan' }),
+    pj,
+  )
+
+/** 设置页：已允许自动装包的环境（种类 + 名字 + 键，没有路径） */
+export interface ConvertAutoInstallEnv {
+  key: string
+  kind: string
+  name: string
+}
+export const fetchConvertAutoInstallEnvs = () =>
+  jsonFetch<{ envs: ConvertAutoInstallEnv[] }>('/api/ai/convert/auto-install-envs')
+export const revokeConvertAutoInstallEnv = (key: string) =>
+  jsonFetch<{ envs: ConvertAutoInstallEnv[] }>('/api/ai/convert/auto-install-envs/revoke', jsonPost({ key }))
 
 /** 新版的 SVG 预览（只给 `<img>`：后端回沙盒 CSP） */
 export const convertPreviewUrl = (sid: string) => apiUrl(`/api/ai/convert/${encodeURIComponent(sid)}/preview.svg`)
