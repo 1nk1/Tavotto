@@ -1607,6 +1607,7 @@ export default interface Resources {
         "defaultLabel": "默认助手",
         "defaultNone": "没有可用的助手",
         "detail": {
+          "account": "账号",
           "addEndpoint": "添加服务…",
           "advanced": "高级设置",
           "autoDetected": "自动检测",
@@ -1710,6 +1711,17 @@ export default interface Resources {
           "running": "正在安装…"
         },
         "lastChecked": "最近检测 {{time}}",
+        "login": {
+          "action": "登录 {{account}}",
+          "browserHint": "浏览器没打开？",
+          "done": "我已登录",
+          "manualHint": "没找到可用的终端。请自己打开终端，运行：{{command}}",
+          "openLink": "点这里打开登录页",
+          "refreshFailed": "没能刷新登录状态。",
+          "retry": "重试",
+          "terminalHint": "在打开的终端里完成登录后回到这里。",
+          "waiting": "等待登录…"
+        },
         "noUsableAgent": "没有可用的改图助手。装好后点「重新检测」。",
         "readiness": {
           "needs_auth": "需要登录",
@@ -2551,6 +2563,8 @@ export default interface Resources {
       "ai_agent_disabled": "{{agent}} 已在设置中关闭。在「改图助手」里打开后再试。",
       "ai_agent_executable_invalid": "无法用作该 Agent 的可执行文件：{{path}}。原设置不变。",
       "ai_agent_install_unsupported": "{{agent}} 不支持一键安装，请按官方文档安装。",
+      "ai_agent_login_failed": "{{agent}} 的登录窗口没能打开。请在终端里运行它的登录命令，或检查可执行文件是否可用。",
+      "ai_agent_login_unsupported": "{{agent}} 没有官方登录入口，请按它自己的说明登录。",
       "ai_agent_needs_auth": "{{agent}} 还没有登录。在它自己的命令行里登录，或在设置里改用自定义模型服务。",
       "ai_agent_not_installed": "本机没有检测到可用的 {{agent}}。",
       "ai_agent_not_usable": "{{agent}} 暂时不可用。在「改图助手」里查看状态。",
