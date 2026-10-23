@@ -98,6 +98,7 @@ import { buildProofPayload } from "@/lib/preflight";
 import {
   defaultScope,
   epsAvailability,
+  runtimeRegistration,
   pixelPreview,
   PPI_DEFAULT,
   hasRaster,
@@ -145,7 +146,7 @@ import { useProjectStore } from "@/store/projectStore";
 import { useDocumentStore } from "@/store/documentStore";
 import { dialogCovered, useUiStore } from "@/store/uiStore";
 import { useWorkspaceStore } from "@/store/workspace";
-import type { CanvasObject, FigureDocument, PanelObject } from "@/types/document";
+import { isRuntimePanel, type CanvasObject, type FigureDocument, type PanelObject } from "@/types/document";
 import { cropToVisibleContent, croppedDocument } from "@/lib/exportCrop";
 import {
   getValidationSummary,
@@ -438,7 +439,19 @@ export function ExportDialog() {
    * 重开、素材清单里还没有它——或根本没有可选的图）静默改按画布导（内部 canvas scope，界面上不出现范围选择、
    * 不报错）；左栏预览如实显示导出的页面与页面尺寸（`ExportPreviewPane` 的 `fallbackPage`）。多图档由用户选。
    */
-  const scope: ExportScope = single ? (availability.ok ? "original" : "canvas") : scopeState;
+  /** 后端成功响应且明确「不认」这张 runtime 图：不静默改走画布，让用户显式选（下面的 note + 按钮） */
+  const [canvasAccepted, setCanvasAccepted] = useState(false);
+  const runtimeRefused =
+    single && !!figureId && figureId.startsWith("runtime:") && runtimeRegistration(figureId) === false;
+  useEffect(() => {
+    if (!open) setCanvasAccepted(false);
+  }, [open, figureId]);
+  // 明确「不认」的 runtime 图：留在原图口径（按钮灰、给 note），用户显式点「改按画布导出」才退到画布；其余不可用情形照旧静默退画布
+  const scope: ExportScope = single
+    ? availability.ok || (runtimeRefused && !canvasAccepted)
+      ? "original"
+      : "canvas"
+    : scopeState;
   const singleFallback = single && scope === "canvas";
   /** 单图退路导出的区域 = 可见对象并集包围盒（`lib/exportCrop`）；预览与尺寸读它，与请求同一份 */
   const fallbackCrop = useMemo(
@@ -454,6 +467,26 @@ export function ExportDialog() {
     [singleFallback, doc],
   );
   const exportPage = exportDoc.page;
+  /**
+   * runtime 图的注册状态此刻未知（失效后 / 还没问过，且素材清单里也没有它）：打开对话框时主动问一次（下面的 effect），
+   * 问到之前显示「正在确认这张图」并暂不放行导出——未知 ≠ 假，不先灰掉再翻（#1348 Codex）。
+   */
+  const figureChecking =
+    single &&
+    !!figureId &&
+    figureId.startsWith("runtime:") &&
+    runtimeRegistration(figureId) === null &&
+    // 问过但没问成（传输失败）= 仍未知，不再「确认中」：照常请求原图口径，交给后端权威校验
+    !runtimeById[figureId]?.checked;
+  const checkedPanelId = panel?.id;
+  const checkedFileId = panel && isRuntimePanel(panel) ? panel.fileId : null;
+  useEffect(() => {
+    if (!open || !panel || !checkedFileId) return;
+    const store = useRuntimeAssetStore.getState();
+    store.invalidate([checkedFileId]); // 打开时要**新鲜**的注册状态：旧的 false 在用户重跑注册之后是错的
+    store.ensure(panel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, checkedPanelId, checkedFileId]);
   const routeKey = routeKeyOf({ scope, formats, doc, panel, figureId });
   const route = useExportRouteStore((s) => (s.key === routeKey ? s.route : null));
   const refreshRoute = useExportRouteStore((s) => s.refresh);
@@ -777,9 +810,9 @@ export function ExportDialog() {
     [scope, route, formats],
   );
   const eps = useMemo(
-    () => epsAvailability(scope, figureId, route),
+    () => epsAvailability(scope, figureId, route, single),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [scope, figureId, assets, runtimeAssets, route],
+    [scope, figureId, assets, runtimeAssets, route, single],
   );
 
   function inputOf(over?: Partial<ExportRequestInput>): ExportRequestInput {
@@ -819,6 +852,7 @@ export function ExportDialog() {
   // 勾着的 EPS 不在其中）：只勾 EPS 又切到画布，按钮得灰，不能发一个空格式列表
   const canStart =
     !prepared.error &&
+    !figureChecking &&
     names.length > 0 &&
     !filenameIssue &&
     (scope !== "original" || availability.ok);
@@ -1548,15 +1582,39 @@ export function ExportDialog() {
                   />
                 </FormRow>
               )}
+              {figureChecking && (
+                <FormRow>
+                  <p data-export-figure-checking className="type-caption">
+                    {ex("checkingFigure")}
+                  </p>
+                </FormRow>
+              )}
+              {runtimeRefused && !canvasAccepted && (
+                <FormRow>
+                  <div data-export-runtime-refused className="flex flex-col items-start gap-1.5">
+                    <p className="type-caption">{ex("needsRerun")}</p>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      data-export-accept-canvas
+                      onClick={() => setCanvasAccepted(true)}
+                    >
+                      {ex("exportAsCanvas")}
+                    </Button>
+                  </div>
+                </FormRow>
+              )}
+              {!(runtimeRefused && !canvasAccepted) && (
               <ScopeNote
-                scope={scope}
-                // 每张图单独导出不用先选一张：「尚未选择要导出的图」那句指引在这一档不成立
-                available={availability.ok || (batchMode && availability.reason === "no_figure")}
-                reason={availability.reason}
-                originalSelectable={originalSelectable}
-                ignored={availability.spec?.ignored ?? []}
-                fallback={availability.spec?.fallback ?? false}
-              />
+                  scope={scope}
+                  // 每张图单独导出不用先选一张：「尚未选择要导出的图」那句指引在这一档不成立
+                  available={availability.ok || (batchMode && availability.reason === "no_figure")}
+                  reason={availability.reason}
+                  originalSelectable={originalSelectable}
+                  ignored={availability.spec?.ignored ?? []}
+                  fallback={availability.spec?.fallback ?? false}
+                />
+              )}
             </section>
 
             {batchMode ? (

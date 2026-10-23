@@ -46,6 +46,7 @@ import { currentFigureOf } from '@/lib/problemContext'
 import { effectiveScope, issuesInScope } from '@/lib/problemList'
 import { useSelectionStore } from '@/store/selectionStore'
 import { useWorkspaceStore } from '@/store/workspace'
+import { useRuntimeAssetStore } from '@/store/runtimeAssetStore'
 import { emptyProject, type PanelObject } from '@/types/document'
 import { seedExactRender } from '@/test/renderFixtures'
 
@@ -105,6 +106,11 @@ let jobStatusSeq: string[] | null = null
 /** `/api/export/validate` 回包前先等多久（模拟 route 慢：冻结段每张最多等它 1.5 s） */
 let routeDelayMs = 0
 let routeOf: ((req: Record<string, any>) => Record<string, unknown>) | null = null
+/** `/api/runtime/status` 的回答（null = 走兜底）；`runtimeStatusGate` 非 null 时先等它再回（模拟 ensure() 往返） */
+let runtimeStatus: Record<string, unknown> | null = null
+let runtimeStatusGate: Promise<void> | null = null
+/** 非 0 时 `/api/runtime/status` 回这个 HTTP 状态码（模拟服务端瞬时失败）；-1 = 抛网络错误 */
+let runtimeStatusFail = 0
 
 function stubFetch() {
   exportBodies = []
@@ -140,6 +146,14 @@ function stubFetch() {
         }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
       )
+    }
+    if (url.includes('/api/runtime/status') && runtimeStatusFail) {
+      if (runtimeStatusFail < 0) throw new TypeError('network down')
+      return new Response(JSON.stringify({ error: { code: 'boom' } }), { status: runtimeStatusFail })
+    }
+    if (url.includes('/api/runtime/status') && runtimeStatus) {
+      if (runtimeStatusGate) await runtimeStatusGate
+      return new Response(JSON.stringify(runtimeStatus), { status: 200, headers: { 'Content-Type': 'application/json' } })
     }
     if (url.includes('/api/export/validate') && routeOf) {
       if (routeDelayMs) await new Promise((r) => setTimeout(r, routeDelayMs))
@@ -507,6 +521,11 @@ describe('输出范围', () => {
     // 单图编辑没有范围按钮；原图口径不可用时静默改按画布导（不报错、不灰按钮），左栏预览如实显示导出的页面
     expect(scopeRadios()).toHaveLength(0)
     expect(button('开始导出')!.hasAttribute('disabled')).toBe(false)
+    // 没有范围选择的单图档里，EPS 灰着的原因不能指向不存在的「每张图单独导出」
+    const epsBox = formatBox('EPS')
+    expect(epsBox.disabled).toBe(true)
+    expect(epsBox.closest('label')!.title).toContain('没有可重新运行的脚本')
+    expect(epsBox.closest('label')!.title).not.toContain('每张图单独导出')
     expect(text()).not.toContain('先选中一张图')
     expect(document.body.querySelector('[data-export-preview-stage] [data-canvas-thumb]'), '预览显示页面').toBeTruthy()
     expect(document.body.querySelector('[data-export-preview-size]')?.textContent).toContain('80 × 60 mm')
@@ -3138,6 +3157,113 @@ describe('预览信息完善（PR3）：结果块', () => {
     await click(q('[data-export-start]')!)
     expect(q('[data-export-result]')).toBeTruthy()
     expect(q('[data-export-partial-summary]')).toBeNull()
+  })
+})
+
+
+describe('runtime 图：打开对话框主动确认注册状态（#1348 Codex）', () => {
+  const ID = 'runtime:fig.py#F'
+  async function openRuntime(assets: unknown[] = []) {
+    await useDocumentStore.getState().switchDocument(emptyProject(), 'd_rt')
+    useDocumentStore.getState().commit(literal('准备'), (d) => {
+      d.page = { w: 80, h: 60 }
+      d.objects = [
+        {
+          ...panel,
+          id: 'rp',
+          fileId: ID,
+          fileKind: 'runtime',
+          source: { script: 'fig.py', stem: 'F' },
+        } as never,
+      ]
+    })
+    useAssetStore.setState({ byId: {} } as never)
+    useRuntimeAssetStore.setState({ assets, byId: {} } as never)
+    useWorkspaceStore.setState({ mode: 'fast_edit', activePanelId: 'rp' })
+    useUiStore.getState().setExportOpen(false)
+    await act(async () => {
+      useUiStore.getState().setExportOpen(true)
+    })
+  }
+  afterEach(() => {
+    runtimeStatus = null
+    runtimeStatusGate = null
+    runtimeStatusFail = 0
+  })
+
+  it('清单缺 id、注册状态未知：先显示「正在确认」且不放行，ensure 回 registered 后可用（EPS 亮、按原图导）', async () => {
+    let release!: () => void
+    runtimeStatusGate = new Promise<void>((r) => (release = r))
+    runtimeStatus = { status: 'fresh', cached: true, registered: true, execution_profile: 'safe' }
+    await setup(9) // 先把组件挂上、store 铺好
+    await openRuntime()
+    expect(document.body.querySelector('[data-export-figure-checking]'), '确认中').toBeTruthy()
+    expect(button('开始导出')!.hasAttribute('disabled'), '确认完之前不放行').toBe(true)
+    await act(async () => release())
+    await act(async () => {})
+    expect(document.body.querySelector('[data-export-figure-checking]')).toBeNull()
+    expect(formatBox('EPS').disabled, '单图原图口径可用 → EPS 亮').toBe(false)
+  })
+
+  it('旧的 registered:false（重跑注册之前问的）：打开对话框重新问，拿到 true 后可用', async () => {
+    runtimeStatus = { status: 'fresh', cached: true, registered: true, execution_profile: 'safe' }
+    await setup(9)
+    await openRuntime()
+    const settle = () => act(async () => void (await new Promise((r) => setTimeout(r, 30))))
+    await settle()
+    // 用户重跑脚本之前问过一次得到 false，之后重跑注册了——store 里还留着旧的 false
+    useRuntimeAssetStore.setState({
+      byId: { [ID]: { registered: false, checked: true, status: 'needs_rerun', cached: false, profile: 'safe' } },
+    } as never)
+    await act(async () => {
+      useUiStore.getState().setExportOpen(false)
+    })
+    await act(async () => {
+      useUiStore.getState().setExportOpen(true)
+    })
+    await settle()
+    expect(useRuntimeAssetStore.getState().byId[ID]?.registered).toBe(true)
+    expect(formatBox('EPS').disabled).toBe(false)
+  })
+
+  const settle = () => act(async () => void (await new Promise((r) => setTimeout(r, 30))))
+
+  it.each([500, -1])('status 查询失败（%i）：注册状态仍未知，照常请求原图口径，不静默改走画布', async (fail) => {
+    runtimeStatusFail = fail
+    await setup(9)
+    await openRuntime()
+    await settle()
+    expect(useRuntimeAssetStore.getState().byId[ID]?.registered, '传输失败不是「不认」').toBeNull()
+    expect(document.body.querySelector('[data-export-figure-checking]'), '问过了，不再「确认中」').toBeNull()
+    expect(document.body.querySelector('[data-export-runtime-refused]')).toBeNull()
+    expect(button('开始导出')!.hasAttribute('disabled')).toBe(false)
+    await click(button('开始导出')!)
+    expect(exportBodies).toHaveLength(1)
+    expect(exportBodies[0].scope, '按原图口径交给后端权威校验').toBe('original')
+  })
+
+  it('后端明确回 registered:false：不静默改走画布，给 note 与按钮，用户显式选了才按画布导', async () => {
+    runtimeStatus = { status: 'needs_rerun', cached: false, registered: false, execution_profile: 'safe' }
+    await setup(9)
+    await openRuntime()
+    await settle()
+    expect(document.body.querySelector('[data-export-runtime-refused]'), '说清楚要重新运行').toBeTruthy()
+    expect(button('开始导出')!.hasAttribute('disabled'), '不静默导出').toBe(true)
+    await click(document.body.querySelector('[data-export-accept-canvas]') as HTMLElement)
+    expect(document.body.querySelector('[data-export-runtime-refused]')).toBeNull()
+    await click(button('开始导出')!)
+    expect(exportBodies).toHaveLength(1)
+    expect(exportBodies[0].scope, '用户显式选了才走画布').toBe('canvas')
+  })
+
+  it('缓存清单里还有旧条目、但刚问来的结果明确 false：显示 refused 提示、不发原图导出', async () => {
+    runtimeStatus = { status: 'needs_rerun', cached: false, registered: false, execution_profile: 'safe' }
+    await setup(9)
+    await openRuntime([{ id: ID, script: 'fig.py', stem: 'F', cached: true, status: 'fresh', size_mm: [80, 60] }])
+    await settle()
+    expect(document.body.querySelector('[data-export-runtime-refused]'), '新鲜的「不认」优先于旧清单').toBeTruthy()
+    expect(button('开始导出')!.hasAttribute('disabled')).toBe(true)
+    expect(exportBodies).toHaveLength(0)
   })
 })
 

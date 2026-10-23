@@ -131,10 +131,24 @@ export function originalAvailability(
   return { ok: true, reason: 'none', spec }
 }
 
+/** runtime 图的注册状态：`true` / `false` 是后端的回答（逐面板问来的先于清单），`null` = 未知（清单里有它也算已知为真） */
+export function runtimeRegistration(figureId: string): boolean | null {
+  const rt = useRuntimeAssetStore.getState()
+  // 逐面板问来的结果（打开对话框时刚问过的）优先于缓存的素材清单：清单可能还留着旧条目，而注册表已经变了
+  const asked = rt.byId[figureId]?.registered
+  if (asked === true || asked === false) return asked
+  if ((rt.assets ?? []).some((a) => a.id === figureId)) return true
+  return null
+}
+
 /** Guarded hidden PNGs still require the exact-source export preflight before publication. */
 function canValidateOriginalSource(figureId: string, panel?: PanelObject | null): boolean {
   if (figureId.startsWith('runtime:')) {
-    return (useRuntimeAssetStore.getState().assets ?? []).some((a) => a.id === figureId)
+    // 素材清单（`/api/runtime/assets`）会把「磁盘上已有同名原件」的 runtime 图让给 FileAsset，清单也可能还没取到；
+    // 但后端解析 runtime id 只看注册表（`runtimeasset.resolve`）。面板渲染时 `ensure()` 问来的 `registered` 就是同一判据，
+    // 认它，否则脚本跑出来的图被静默按画布导（EPS 灰、SVG 走画布合成）。
+    // **未知（还没问 / 失效后）不判假**：只有后端明确回「不认」才是不可用；未知期间由对话框 `ensure()` 去问并显示「正在确认」。
+    return runtimeRegistration(figureId) !== false
   }
   // /panels prefers a same-stem PDF; absence is not proof that this PNG is missing.
   // This permits validation, not a source-existence or fresh-metadata claim.
@@ -149,7 +163,9 @@ function canValidateOriginalSource(figureId: string, panel?: PanelObject | null)
  * 所以它只在「按原图导出一张**有脚本**的图」时存在：
  *
  * * `canvas_scope`：画布合成走 RenderCore（PDF / PNG / TIFF），给不出 EPS；
- * * `no_script`：这张图在注册表里没有脚本（runtime 素材天生有），引擎没法重画。
+ * * `no_script`：这张图在注册表里没有脚本（runtime 素材天生有），引擎没法重画；
+ * * `figure_not_ready`：单图档（没有范围选择）里这张图此刻按原图导不出（还没运行过 / 源文件不在），
+ *   于是静默按画布导，而画布没有 EPS——此时再说「选每张图单独导出」是指向一个不存在的选项，改说「先运行这张图」。
  *
  * 前端只判「有没有脚本」这一条；SVG 素材的 EPS 另需后端的字节绑定证明（`_produce_svg_asset_eps`，#1185），
  * 前端拿不到这个事实，**不预先禁用**——后端逐项失败并给真实原因（`eps_source_unverified` /
@@ -159,15 +175,24 @@ function canValidateOriginalSource(figureId: string, panel?: PanelObject | null)
  * 素材清单里的 `script`（那正是「注册表声明了映射没有」）。**不可用时不隐藏
  * 选项、不静默丢掉它**：禁用并说原因，发出去的请求里也不带它。
  */
-export type EpsBlockReason = 'none' | 'canvas_scope' | 'no_script'
+export type EpsBlockReason = 'none' | 'canvas_scope' | 'no_script' | 'figure_not_ready'
 
 export function epsAvailability(
   scope: ExportScope,
   figureId: string | null,
   /** 后端 validate 发布的 route；有就只读它（`offers.eps`），没有退回下面的旧判据 */
   route?: ExportRoute | null,
+  /** 单图档（没有范围选择）：画布范围只可能是「原图口径不可用」的静默退路 */
+  single = false,
 ): { ok: boolean; reason: EpsBlockReason } {
-  if (scope !== 'original') return { ok: false, reason: 'canvas_scope' }
+  if (scope !== 'original') {
+    if (!single) return { ok: false, reason: 'canvas_scope' }
+    // 单图档静默退到画布：先说「这张图没有脚本」（静态文件 / 原文件已删），只有 runtime 图才说「先运行它」
+    if (!figureId || (!figureId.startsWith('runtime:') && !useAssetStore.getState().byId[figureId]?.script)) {
+      return { ok: false, reason: 'no_script' }
+    }
+    return { ok: false, reason: 'figure_not_ready' }
+  }
   if (!figureId) return { ok: false, reason: 'no_script' }
   const fromRoute = epsFromRoute(route, scope, figureId)
   if (fromRoute) return fromRoute

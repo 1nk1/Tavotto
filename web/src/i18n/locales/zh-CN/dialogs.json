@@ -187,6 +187,9 @@
     "checkScopeCanvasNamed": "查整个画布「{{name}}」",
     "checkScopeFigureNamed": "仅查原图「{{name}}」",
     "checkScopeOffCanvas": "「{{name}}」不在画布上，这次导出不做规范检查",
+    "needsRerun": "这张图需要重新运行脚本才能按原图导出。也可以改按画布导出（版面按画布，保真度较低）。",
+    "exportAsCanvas": "改按画布导出",
+    "checkingFigure": "正在确认这张图……",
     "conflict": "导出目录里已经有 {{files}}。",
     "conflictRename": "另存一份",
     "conflictReplace": "覆盖",
@@ -194,6 +197,7 @@
     "epsHint": "矢量 · 不支持透明度",
     "epsUnavailable": {
       "canvas_scope": "EPS 只支持导出单张图：在单图编辑里导出，或选「每张图单独导出」。",
+      "figure_not_ready": "这张图现在还不能导出 EPS：它需要由脚本重新画一遍。请先运行这张图的脚本，再回来导出。",
       "no_script": "此图没有可重新运行的脚本。EPS 只能由脚本生成。"
     },
     "exported": "导出完成：{{files}}",

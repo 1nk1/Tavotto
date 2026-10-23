@@ -20,6 +20,7 @@ import {
 } from './exportRequest'
 import { useDocumentStore } from '@/store/documentStore'
 import { useAssetStore } from '@/store/assetStore'
+import { useRuntimeAssetStore } from '@/store/runtimeAssetStore'
 import { renderKey, useRenderStore } from '@/store/renderStore'
 import { emptyProject, type FigureDocument, type PanelObject } from '@/types/document'
 import { literal } from '@/i18n'
@@ -151,6 +152,27 @@ describe('scope', () => {
     expect(a.spec).toBeTruthy() // 规格还在（上一次已知的那份），只是导不出来
     expect(a.ok).toBe(false)
     expect(a.reason).toBe('source_stale')
+  })
+
+  it('runtime 图：素材清单没有它——后端注册表说了算；未知不判假', () => {
+    const rt: PanelObject = { ...panel, id: 'r1', fileId: 'runtime:fig.py#F', fileKind: 'runtime' } as never
+    useAssetStore.setState({ byId: {} } as never)
+    // 后端明确回「不认」：不可用
+    useRuntimeAssetStore.setState({ assets: [], byId: { 'runtime:fig.py#F': { registered: false, checked: true } } } as never)
+    expect(originalAvailability('runtime:fig.py#F', { panel: rt })).toMatchObject({ ok: false, reason: 'source_stale' })
+    // 未知（清单没取到 / 失效后）：不判 source_stale，由对话框去问
+    useRuntimeAssetStore.setState({ assets: null, byId: {} } as never)
+    expect(originalAvailability('runtime:fig.py#F', { panel: rt }).ok).toBe(true)
+    useRuntimeAssetStore.setState({ byId: { 'runtime:fig.py#F': { registered: null, checked: false } } } as never)
+    expect(originalAvailability('runtime:fig.py#F', { panel: rt }).ok).toBe(true)
+    useRuntimeAssetStore.setState({ byId: { 'runtime:fig.py#F': { registered: true, checked: true } } } as never)
+    expect(originalAvailability('runtime:fig.py#F', { panel: rt }).ok).toBe(true)
+    // 缓存的素材清单还留着旧条目、而刚问来的结果明确「不认」：逐面板结果优先
+    useRuntimeAssetStore.setState({
+      assets: [{ id: 'runtime:fig.py#F' }],
+      byId: { 'runtime:fig.py#F': { registered: false, checked: true } },
+    } as never)
+    expect(originalAvailability('runtime:fig.py#F', { panel: rt })).toMatchObject({ ok: false, reason: 'source_stale' })
   })
 
   it('判据是「够不够得着」而不是 `spec.stale`', () => {
@@ -318,6 +340,21 @@ describe('EPS 与 TIFF（ADR 0046）', () => {
     expect(epsAvailability('original', 'Fig1.pdf')).toEqual({ ok: true, reason: 'none' })
     // runtime 素材天生有脚本
     expect(epsAvailability('original', 'runtime:abc')).toEqual({ ok: true, reason: 'none' })
+  })
+
+  it('单图档（没有范围选择）静默退到画布时，EPS 的原因不再指向不存在的「每张图单独导出」', () => {
+    // 没有脚本的图（静态文件 / 原文件已删）：先说「没有脚本」，不叫用户去运行一个不存在的脚本
+    expect(epsAvailability('canvas', 'Fig1.pdf', null, true)).toEqual({ ok: false, reason: 'no_script' })
+    expect(epsAvailability('canvas', null, null, true)).toEqual({ ok: false, reason: 'no_script' })
+    useAssetStore.setState({
+      byId: { 'Fig1.pdf': { id: 'Fig1.pdf', mtime: 1, script: 'fig1.py' } },
+    } as never)
+    expect(epsAvailability('canvas', 'Fig1.pdf', null, true)).toEqual({ ok: false, reason: 'figure_not_ready' })
+    expect(epsAvailability('canvas', 'runtime:abc', null, true)).toEqual({ ok: false, reason: 'figure_not_ready' })
+    // 多图档的画布范围仍是「选每张图单独导出」那句
+    expect(epsAvailability('canvas', 'Fig1.pdf', null, false)).toEqual({ ok: false, reason: 'canvas_scope' })
+    // 单图档里原图口径可用就照常给 EPS（runtime 素材天生有脚本）
+    expect(epsAvailability('original', 'runtime:abc', null, true)).toEqual({ ok: true, reason: 'none' })
   })
 
   it('SVG 素材与 PDF 同一判据：有脚本可用（字节绑定由后端逐项判，不预先禁用）、没脚本 no_script', () => {
