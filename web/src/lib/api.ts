@@ -13,6 +13,12 @@ import type { ThumbObject, ThumbPage } from '@/types/thumb'
 export interface PanelInfo {
   id: string
   name: string
+  /**
+   * 注册表认的「这个文件是哪张图」（后端 `Registry.artifact_stem`，#1251）。只在与文件名 stem 不同时才发：
+   * 同脚本里 `panel.png`（甲）与 `panel.pdf`（乙，登记为 `panel-2`）时，pdf 面板的 `stem` 是 `panel-2`。
+   * 交接 `?open=<stem>` 与「runtime 素材 ↔ 磁盘图」的配对都按它；缺省 = 文件名 stem（老项目 / 老后端）。
+   */
+  stem?: string
   folder: string
   kind: 'pdf' | 'raster' | 'svg'
   native_w_mm: number
@@ -394,6 +400,10 @@ async function jsonFetch<T>(url: string, init?: RequestInit, pj?: string | null)
 }
 
 export const fetchPanels = () => jsonFetch<PanelsResponse>('/api/panels')
+
+/** 磁盘素材文件 id → 注册表认的 stem（后端 `Registry.artifact_stem`，#1251）：权威值，清单里没有这个文件也答得出。 */
+export const fetchPanelStem = (id: string) =>
+  jsonFetch<{ id: string; stem: string }>(`/api/panel-stem?id=${encodeURIComponent(id)}`)
 
 /**
  * 项目接入就绪度。**只读诊断**：后端不跑用户脚本、不 probe、不写盘、不发事件。
@@ -3795,6 +3805,11 @@ export type ServerEvent =
       kind: 'panel.file_changed'
       scripts?: string[]
       stems?: string[]
+      /**
+       * 受影响的**磁盘素材文件 id**（与 `/api/panels` 的 `id` 相同；后端 `Registry.artifact_stem` 算出，#1251）。
+       * 有它就按 fileId 精确匹配非 runtime 面板，不依赖素材清单；老后端没有 = 退回按文件名 stem。
+       */
+      files?: string[]
       reason?: 'watcher' | 'ai' | 'script_input'
     } & ProjectScoped)
   /**
@@ -4005,6 +4020,11 @@ export function affectedStemsOf(event: ServerEvent): string[] {
     return union(event.stems)
   }
   return []
+}
+
+/** `panel.file_changed` 直接带的磁盘素材文件 id；没有（老后端 / 后端算不出）= undefined */
+export function affectedFilesOf(event: ServerEvent): string[] | undefined {
+  return event.kind === 'panel.file_changed' && Array.isArray(event.files) ? event.files : undefined
 }
 
 /** 这条事件牵涉到的**素材 id**（新增 / 删除 / 内容变化的并集） */

@@ -580,6 +580,40 @@ def _live_stem_conflicts(figures_dir: str | Path, script: str, stems: list[str])
     return out
 
 
+def descriptor_artifacts(descriptors) -> dict[str, str] | None:
+    """一次执行的描述符 → `{磁盘文件相对路径: stem}`：登记进注册表的 `artifacts`（#1251）。
+
+    每张图收它写过的**全部**文件（描述符的 `artifacts`，缺省退回只有 `original_artifact` 的旧描述符）：乙存了
+    `panel.pdf` 与 `panel.svg` 时两个文件都记到 `panel-2`，打开哪个都是乙。文件已经是按这张图**自己存过的
+    格式**绑定的（`figcapture.find_artifacts(formats=…)`，与 #1250 的「原件归属」同一份判据），pyplot 捕获没有。
+
+    同一路径被两张不同的图都声称（两张图都存过 `panel.pdf`，磁盘上只剩最后写的那个）时**不记**：这里没有
+    「谁最后写」的证据（那是捕获层 `note_savefig_writer` 的事），猜错比不记更糟——不记 = 退回按文件名 stem，
+    与没有这张表时的行为一致。
+    """
+    if descriptors is None:
+        return None  # 没有执行证据（不是「执行了、没有原件」）：调用方沿用已知映射
+    owner: dict[str, str] = {}
+    contested: set[str] = set()
+    for d in descriptors:
+        if not isinstance(d, dict):
+            continue
+        stem = d.get("stem")
+        if not (isinstance(stem, str) and stem):
+            continue
+        files = d.get("artifacts")
+        paths = list(files) if isinstance(files, (list, tuple)) else []
+        if isinstance(d.get("original_artifact"), str):
+            paths.append(d["original_artifact"])
+        for art in paths:
+            if not (isinstance(art, str) and art):
+                continue
+            art = art.replace("\\", "/")
+            if owner.setdefault(art, stem) != stem:
+                contested.add(art)
+    return {a: s for a, s in owner.items() if a not in contested}
+
+
 def _partial_fields(build_resp) -> dict:
     """build 响应里被逐图隔离的图 → `{"failed_figures": [...], "partial": True}`；没有失败时不加任何键。"""
     failed = build_resp.get("failed_figures") if isinstance(build_resp, dict) else None
@@ -713,6 +747,7 @@ def register_probed(
                 # T03：带运行配置的执行只是这个脚本的**另一份配置**——并进去，不换掉。整条替换会让
                 # 无参数 / 别的参数登记过的图当场失去编辑入口（注册表是 stem 归属的唯一权威）
                 append=append,
+                artifacts=descriptor_artifacts(result.get("descriptors")),
                 **({"on_written": written.append} if on_registered is not None else {}),
             )
             registry.load(figures_dir)
