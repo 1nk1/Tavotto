@@ -667,11 +667,43 @@ def register_probed(
         with inputremap.landing(figures_dir, result.get("remap_generation")):
             # 无参数运行整条替换（T03 已知缺口）：替换之前这个脚本名下、这次没产出的图名会就此失去关联——多半是此前**带参数**
             # 产出的。记下来如实告诉用户（`unlinked_stems`），用原参数再运行一次即可并回来；不改注册表格式（T09b）
-            before = [] if append else discover.registered_stems(figures_dir, script)
+            origins = discover.registered_stem_origins(figures_dir, script)
+            before = list(origins or {})
+            legacy_candidates = (
+                None
+                if origins is None
+                else [stem for stem, origin in origins.items() if origin != "static"]
+            )
             # 「替换掉了哪些此前真捕获过的图名」的证据在**注册表提交之前**算完：任何环节在这里失败，整次登记失败、
             # 注册表字节不变——绝不能出现「端点报失败、注册表却已丢了旧 stem」（r4220769153）
             # 一次索引：运行配置读一次、cache 目录列一次，不随被替换 stem 数 × 配置数增长（#819 r4232302927）
-            unlinked = sorted(captured_stems(figures_dir, script, set(before) - set(all_stems))[0])
+            unlinked = (
+                []
+                if append
+                else sorted(captured_stems(figures_dir, script, set(before) - set(all_stems))[0])
+            )
+            # A pre-history base cache is positive capture evidence even if discovery
+            # recorded a static candidate locally. Persist it before that cache is pruned.
+            # Cache absence is never used as evidence against an unknown legacy stem.
+            for stem in set(result["stems"]).intersection(
+                stem for stem, origin in (origins or {}).items() if origin == "static"
+            ):
+                if (
+                    runtimeasset.load_metadata(
+                        figures_dir, figcapture.runtime_asset_id(script, stem)
+                    )
+                    is not None
+                ):
+                    runconfig.record_captures(figures_dir, script, [stem])
+            # Snapshot provenance before recording the capture consumes discovery evidence. Unknown
+            # old entries stay legacy; discovery-only entries are not capture evidence.
+            runconfig.record_captures(
+                figures_dir,
+                script,
+                result["stems"],
+                str(result.get("run_config") or ""),
+                registered_stems=legacy_candidates,
+            )
             registered_config = discover.register(
                 figures_dir,
                 script,

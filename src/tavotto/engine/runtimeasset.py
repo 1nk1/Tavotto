@@ -205,6 +205,12 @@ def materialize(project_root: str | Path, descriptor: dict, svg_source: Path) ->
     try:
         if not svg_source.is_file():
             return None
+        # Document replays and native/render captures can bypass probe registration.
+        # Persist their identity outside the disposable preview cache as well.
+        if descriptor.get("stem"):
+            runconfig.record_captures(
+                project_root, script, [descriptor["stem"]], str(descriptor.get("run_config") or "")
+            )
         target = cache_dir(project_root, asset_id)
         target.mkdir(parents=True, exist_ok=True)
         _atomic_write(target / "preview.svg", svg_source.read_bytes())
@@ -448,18 +454,25 @@ def list_assets(project_root: str | Path, registry, *, worker_python: object = N
     out: list[dict] = []
     for script, info in sorted(registry.entries().items()):
         entry = info.get("entry", "main")
+        configured_only = runconfig.configured_only_stems(project_root, script)
         for stem in info.get("stems", ()):
             try:
                 asset_id = figcapture.runtime_asset_id(script, stem)
             except ValueError:
                 continue  # 坏条目不该炸掉整张清单
-            variants = [("", asset_id)]
+            base_meta = load_metadata(project_root, asset_id)
+            variants = []
             # T03：同一脚本用不同参数跑出的同名图各是一张素材。只列**真跑过、cache 里有**的配置变体
             # （登记里的配置不等于跑过）；参数值不进清单，只带不透明引用。
             for cfg in runconfig.configs_of(project_root, script):
                 variant_id = figcapture.runtime_asset_id(script, stem, cfg.id)
                 if load_metadata(project_root, variant_id) is not None:
                     variants.append((cfg.id, variant_id))
+            # Cache absence cannot erase a real argument-free identity. Suppress only
+            # stems whose durable history proves configured-only origins; legacy records
+            # without that evidence retain their placeholder even beside a cached variant.
+            if base_meta is not None or stem not in configured_only:
+                variants.insert(0, ("", asset_id))
             for run_config, variant_id in variants:
                 meta = load_metadata(project_root, variant_id)
                 desc = (meta or {}).get("descriptor") or None

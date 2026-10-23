@@ -43,7 +43,7 @@ import tokenize
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
-from . import atomicio, figcapture, inputremap, projectenv, registry, runtime, scanbudget
+from . import atomicio, figcapture, inputremap, projectenv, registry, runconfig, runtime, scanbudget
 
 #: 「什么算一份图产物」的唯一出处在 `figcapture.ARTIFACT_EXTS`（捕获描述符
 #: 判原件、handoff 找产物、这里的静态扫描必须是同一张表）；旧名保留作镜像。
@@ -1437,7 +1437,11 @@ def build_draft(figures_dir: str | Path, *, target_python: str | None = None) ->
 
 
 def write_config(
-    figures_dir: str | Path, cfg: dict, *, on_written: Callable[[str], None] | None = None
+    figures_dir: str | Path,
+    cfg: dict,
+    *,
+    static_discovery: bool = False,
+    on_written: Callable[[str], None] | None = None,
 ) -> Path:
     """注册表落盘 —— 走 `engine/atomicio`（ADR 0023 的唯一写入实现）。
 
@@ -1459,9 +1463,28 @@ def write_config(
     误认成本次写入。返回值仍是路径。
     """
     path = registry.registry_path(figures_dir)
-    revision = atomicio.write_json(path, cfg, indent=1)
-    if on_written is not None:
-        on_written(revision)
+    with inputremap.project_mutex(figures_dir):
+        discovered = {}
+        if static_discovery:
+            try:
+                previous = registry.open_registry(figures_dir).entries()
+            except FileNotFoundError:
+                previous = {}
+            except (OSError, ValueError, RuntimeError):
+                previous = None  # Unknown prior ownership is not new static evidence.
+            if previous is not None:
+                registered = {stem for entry in previous.values() for stem in entry["stems"]}
+                discovered = {
+                    script: set(entry["stems"]) - registered
+                    for script, entry in cfg["scripts"].items()
+                }
+        revision = atomicio.write_json(path, cfg, indent=1)
+        # The project keeps its four-field registry contract. Only successfully published
+        # new discoveries become local evidence; merely building a draft stays read-only.
+        if discovered:
+            runconfig.record_discovered(figures_dir, discovered)
+        if on_written is not None:
+            on_written(revision)
     return path
 
 
@@ -1544,17 +1567,36 @@ def register(
 
 
 def registered_stems(figures_dir: str | Path, script: str) -> list[str]:
-    """注册表文件里此刻登记在 `script` 名下的 stem（读不到 / 没有这条 = 空表）。只读，不加锁——要与随后的写成对时由调用方
-    持项目锁（`inputremap.landing` / `project_mutex`）。"""
+    """Current registered stems; unreadable/missing entries retain the old empty-list contract."""
+    return list(registered_stem_origins(figures_dir, script) or {})
+
+
+def registered_stem_origins(figures_dir: str | Path, script: str) -> dict[str, str] | None:
+    """Registry ownership plus local discovery evidence; unknown origins fail open.
+
+    Missing registry/entry means no previous stems; unreadable provenance is None (fail open).
+    Callers pairing this snapshot with registration hold the project mutex.
+    """
     path = registry.existing_registry_path(figures_dir)
+    if path is None:
+        return {}
     try:
-        cfg = json.loads(path.read_text(encoding="utf-8")) if path else {}
+        cfg = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return []
-    entry = (cfg.get("scripts") or {}).get(script) if isinstance(cfg, dict) else None
+        return None
+    scripts = cfg.get("scripts") if isinstance(cfg, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+    entry = scripts.get(script)
+    if entry is None:
+        return {}
     if not isinstance(entry, dict):
-        return []
-    return [str(s) for s in entry.get("stems") or []]
+        return None
+    stems = entry.get("stems") or []
+    if not isinstance(stems, list) or not all(isinstance(stem, str) for stem in stems):
+        return None
+    static = runconfig.discovered_stems(figures_dir, script)
+    return {stem: "static" if stem in static else "unknown" for stem in stems}
 
 
 def _register_locked(
@@ -1634,7 +1676,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.write:
         cfg, rep, changes = merge(args.figures_dir)
-        path = write_config(args.figures_dir, cfg)
+        path = write_config(args.figures_dir, cfg, static_discovery=True)
         print(f"已写入 {path}")
         _print_report(rep)
         if changes["added_scripts"]:
