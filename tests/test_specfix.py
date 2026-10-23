@@ -54,7 +54,10 @@ def test_raising_ticks_lifts_the_axis_label_but_never_past_its_own_ceiling():
 
 def test_legend_goes_into_the_intersection_of_both_intervals():
     """图例同时受绝对下限（> 8，所以 8.5）与图例区间（8–9）约束：取交集里的最小档。"""
-    m = _manifest(_el("a.legend", "legend", fontsize=6.0))
+    m = _manifest(
+        _el("a.legend", "legend", fontsize=6.0),
+        _el("a.legend.texts_0", "legend_text", fontsize=6.0),
+    )
     plan = specfix.plan(
         m,
         profiles.load(),
@@ -64,10 +67,51 @@ def test_legend_goes_into_the_intersection_of_both_intervals():
     assert _value(plan, "a.legend", "fontsize") == 8.5
 
 
+def test_legend_is_fixed_by_its_drawn_entries_not_the_container_setter():
+    """判的是画出来的条目，改的也得是条目：设置器 8.5 在区间里，条目 11 超了——照样要改，
+    且多条取离区间最远的那条（5 比 11 远）；隐藏的条目与标题不参与。"""
+    m = _manifest(
+        _el("a.legend", "legend", fontsize=8.5, title_fontsize=4.0),
+        _el("a.legend.title", "legend_text", fontsize=4.0),
+        _el("a.legend.texts_0", "legend_text", fontsize=11.0),
+        _el("a.legend.texts_1", "legend_text", fontsize=5.0),
+        _el("a.legend.texts_2", "legend_text", fontsize=2.0, visible=False),
+    )
+    plan = specfix.plan(m, profiles.load(), scale=1.0, targets=[("legend-font-size", "a.legend")])
+    assert _change(plan, "a.legend", "fontsize")["before"] == 5.0
+    assert _value(plan, "a.legend", "fontsize") == 8.5
+    # 标题的 title_fontsize 是设置器，不是被判的量：不顺手改
+    assert not any(p["prop"] == "title_fontsize" for p in plan["patches"])
+    # 没有画出来的条目：没有可改的量，什么都不登记
+    bare = _manifest(_el("a.legend", "legend", fontsize=6.0))
+    assert (
+        specfix.plan(bare, profiles.load(), scale=1.0, targets=[("legend-font-size", "a.legend")])[
+            "patches"
+        ]
+        == []
+    )
+
+
+def test_scaled_legend_picks_the_worst_entry_on_the_page_not_in_script_points():
+    """缩放 0.5：条目 17 / 10 pt 画在页面上是 8.5 / 5 pt。按脚本值比会挑 17（离 8–9 远）、而它页面上
+    8.5 已合规 → 不出补丁，5 pt 那条一直留着（Codex #1366 P2）。要按页面字号挑 10。"""
+    m = _manifest(
+        _el("a.legend", "legend", fontsize=10.0),
+        _el("a.legend.texts_0", "legend_text", fontsize=17.0),
+        _el("a.legend.texts_1", "legend_text", fontsize=10.0),
+    )
+    plan = specfix.plan(m, profiles.load(), scale=0.5, targets=[("legend-font-size", "a.legend")])
+    assert _change(plan, "a.legend", "fontsize")["before"] == 5.0  # 页面上的字号（10 × 0.5）
+    assert _value(plan, "a.legend", "fontsize") == 17.0  # 页面 8.5 pt / 0.5
+
+
 def test_empty_interval_is_skipped_not_forced():
     p = profiles.load()
     p["legend_policy"] = {**p["legend_policy"], "max_font_size_pt": 8.0}  # 8.5 起才过绝对下限
-    m = _manifest(_el("a.legend", "legend", fontsize=6.0))
+    m = _manifest(
+        _el("a.legend", "legend", fontsize=6.0),
+        _el("a.legend.texts_0", "legend_text", fontsize=6.0),
+    )
     plan = specfix.plan(m, p, scale=1.0, targets=[("legend-font-size", "a.legend")])
     assert plan["patches"] == []
     assert plan["skipped"] == [
