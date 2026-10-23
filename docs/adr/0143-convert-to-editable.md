@@ -78,11 +78,13 @@ outcome、corrections 个数、是否采用）——不带脚本、路径或图�
 
 替换上面 4 里的“14 包闭集 + 只两类目标”。
 
-- **名单**：只装“在名单里”的发行包。名单 = 上一轮 14 个科学计算包 ∪ PyPI 30 天下载量前 1000 的项目名快照（来源 hugovk/top-pypi-packages 的
-  `top-pypi-packages-30-days.min.json`），存成纯数据文件 `src/tavotto/engine/autoinstall_dists.txt`（PEP 503 规范名，一行一个，文件头写来源 URL / 快照日期 / 许可证），
-  随 `packaging/tavotto.spec` 的 datas 进冻结产物；`scripts/dev/refresh_autoinstall_list.py` 重新生成（开发侧工具，必须显式给 `--license`，产品运行时从不联网取名单）。
-  **本次提交只带 14 个种子**：该上游仓库没有声明任何许可证（GitHub license API 404、仓库根无 LICENSE），“许可证不允许再分发就停下”的口径下没有把 1000 条快照提交进来；
-  维护者确认可再分发后跑一条脚本命令即可并入。名单读不到时退回 14 个种子（只会更小）。名单外的包：不自动装，卡片点名“这个包不常见，确认是你要的再装”。
+- **名单**：只装“在名单里”的发行包。名单 = 上一轮 14 个科学计算包 ∪ 30 个常见大包（torch / tensorflow / jax / transformers / xgboost / sympy …，维护者 2026-10-23 裁决，不看当月排名）∪ PyPI 近 30 天下载量前 1000 的项目名 − 排除名单。数据取自 ClickHouse 公开的 PyPI 数据集
+  （源头是 PSF 在 BigQuery 公开的 `bigquery-public-data.pypi` 下载日志）；下载次数是事实数据，我们只取项目名、自己排序生成，不分发任何第三方文件。
+  存成纯数据文件 `src/tavotto/engine/autoinstall_dists.txt`（PEP 503 规范名，一行一个，文件头写来源 / 窗口天数 / 快照日期 / top N / 条数），
+  随 `packaging/tavotto.spec` 的 datas 进冻结产物；`scripts/dev/refresh_autoinstall_list.py` 重新生成（开发侧工具，产品运行时从不联网取名单）。
+  **按主键切片查询**：公开端点每次最多读 10 亿行、默认超了静默截断，全表 30 天聚合约 11 亿行——脚本按 project 切四片、每片 `read_overflow_mode='throw'`，并拿 numpy 的切片合计与单独按主键查的值交叉核对，不一致就不写文件（2026-10-23 首版名单就是被截断的数据生成的，漏了 torch / sympy）。
+  **排除名单**：pip / setuptools / wheel / virtualenv / poetry / uv / conda 等管理环境与打包工具本身不许被自动装进用户环境（脚本常量 `EXCLUDE`，文件头同列）。
+  名单读不到时退回 14 个种子（只会更小）。名单外的包：不自动装，卡片点名“这个包不常见，确认是你要的再装”。
 - **每个环境问一次**（环境按 `pool.resolve_worker_python` 此刻会跑脚本的解释器分类，`convertdeps.describe_env`）：
   `project_venv` / 已存在的受管环境一代：名单内直接装（保持上一轮口径；受管目标要新建环境或下载私有 Python 时仍问）；
   `system`（OS 自带 / `EXTERNALLY-MANAGED`）与 `builtin`（内置 runtime / 自建 worker-env / 本进程解释器）：**永不装**，卡片“这个 Python 是系统自带的……请给项目换一个环境”，
