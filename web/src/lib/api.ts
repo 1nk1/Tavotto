@@ -3071,16 +3071,45 @@ export interface AiEndpoint {
   /** 不能用、且能对上已知厂商 → 可一步迁移：`codex_responses` = 该厂商支持 Responses，原地改协议；
    *  `claude` = 只有 Anthropic 端点，改由 Claude Code 接入；null = 对不上，只能手动编辑 */
   migratable: 'codex_responses' | 'claude' | null
+  /** 图标键：地址对上厂商目录某一行就是那家，否则 'custom'（通用图标）；老后端缺省 */
+  icon_key?: string
 }
 
 export interface AiEndpointPreset {
   id: string
+  /** 品牌名（存成接口时的默认名）；界面显示的名字走 `label_key`（`dialogs:settings.agents.<label_key>`） */
   label: string
+  /** 厂商目录（`engine/ai_catalog.json`）的 i18n 键；老后端 / 测试夹具可缺省 → 回退 `label` */
+  label_key?: string
+  /** 厂商图标键（`VendorIcon`）；表外 / 缺省 = 通用图标 */
+  icon_key?: string
   agent: AiAgentId
+  /** 'custom' = 官方登录态 / 自定义两类「用户自填」行；老后端缺省 → 不分组 */
+  region?: 'cn' | 'global' | 'custom'
   base_url: string
+  /** 申请 Key 的页面（https）；空 = 没有 */
+  key_url?: string
+  /** 申请 Key 的补充一句话（i18n 键，同 `label_key` 的解析方式） */
+  key_hint_key?: string
   models: string[]
   wire_api?: 'responses'
   note?: string
+}
+
+export type AiModelsFetchReason =
+  | 'no_key'
+  | 'key_origin_mismatch'
+  | 'insecure_url'
+  | 'timeout'
+  | 'unauthorized'
+  | 'bad_response'
+  | 'network'
+
+export interface AiModelsFetchResult {
+  models: string[]
+  /** 'none' = 没取到（看 `reason`），界面保持预设 / 手填的列表不变 */
+  source: 'live' | 'cache' | 'none'
+  reason: AiModelsFetchReason | null
 }
 
 export interface AiCapabilities {
@@ -3145,6 +3174,19 @@ export const saveAiEndpoint = (rec: {
 }) =>
   jsonFetch<AiCapabilities>('/api/ai/endpoints', {
     method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rec),
+  })
+
+/** 「从服务商获取」型号：`id` 指向已存接口时缺的地址 / 密钥由后端补；永远 200，拿不到看 `reason` */
+export const fetchAiEndpointModels = (rec: {
+  id?: string
+  base_url?: string
+  api_key?: string
+  refresh?: boolean
+}) =>
+  jsonFetch<AiModelsFetchResult>('/api/ai/endpoints/models', {
+    method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(rec),
   })
