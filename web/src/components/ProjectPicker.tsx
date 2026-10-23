@@ -12,9 +12,10 @@ import {
 import { ICON_SIZE } from '@/components/ui/Icon'
 import { backendErrorText, type RecentProject } from '@/lib/api'
 import { AppMenuButton } from './AppMenuButton'
+import { ContactButton } from './contact/ContactButton'
 import { useRovingList } from './left/rovingList'
 import { ProjectRow } from './ProjectPickerRow'
-import { dragRegionProps, isDesktop, pickDirectory } from '@/lib/desktop'
+import { dragRegionProps, isDesktop, pickDirectory, WINDOW_CONTROLS_INSET, windowChrome } from '@/lib/desktop'
 import { PRODUCT_NAME } from '@/lib/brand'
 import {
   homeVariant,
@@ -71,6 +72,15 @@ export function ProjectPicker() {
   // （只给「全部项目」包过：Windows 桌面版主页因 AppMenuButton 直接崩到「界面出错了」，#1080）
   return (
     <TooltipProvider>
+      {/* 联系作者（ADR 0145）：**窗口**右上角（固定定位，不跟内容列、不随主页滚动），与左上角的应用菜单对称；两个视图（主页的新手版 / 老手版、全部项目）
+          共用这一个。Windows 的窗口按钮压在最右 138px，按钮让出去 */}
+      <div
+        data-contact-corner
+        className="fixed top-3 z-sticky"
+        style={{ right: windowChrome() === 'menu-button' ? WINDOW_CONTROLS_INSET + 12 : 12 }}
+      >
+        <ContactButton placement="home" />
+      </div>
       {view === 'home' ? (
         <HomeView
           variant={variant}
