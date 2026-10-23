@@ -40,6 +40,7 @@ safe worker 本来就是单线程串行读 stdin，这条断言对它恒真（�
 
 from __future__ import annotations
 
+import abc
 import base64
 import functools
 import hashlib
@@ -53,6 +54,7 @@ import platform
 import sys
 import threading
 import time
+import types
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
@@ -84,12 +86,16 @@ import overrides as overrides_mod
 import pathgeom
 import preview_hybrid
 import previewbudget
+import teedraw
 from axestraversal import ordered_axes
 
 
 class ArtifactSourceUnavailable(figcapture.ArtifactContextError):
     def __init__(self, reason):
         super().__init__(reason, "The selected file cannot be verified against the current figure.")
+
+
+_MPL_MODULES = ("matplotlib.", "mpl_toolkits.")
 
 
 class SvgSnapshotUnavailable(RuntimeError):
@@ -529,6 +535,22 @@ EXPORT_FONTTYPE = 42
 SVG_FONTTYPES = ("path", "none")
 
 
+def svg_rc(svg_fonttype: str) -> dict:
+    """SVG 导出的 rc：常规二次绘制（`export_font_context`）与单次绘制的 SVG 目标（`teedraw`）读同一份。"""
+    assert svg_fonttype in SVG_FONTTYPES, svg_fonttype
+    return {"svg.fonttype": svg_fonttype, "svg.image_inline": True}
+
+
+def _text_sink(path: Path):
+    """`teedraw` 的 SVG 目标落盘：按 UTF-8 / 不转换换行写（与二次绘制里 `open(..., newline="")` 同字节）。"""
+
+    def write(text: str) -> None:
+        with path.open("w", encoding="utf-8", newline="") as fh:
+            fh.write(text)
+
+    return write
+
+
 def export_font_context(fmt: str, svg_fonttype: str = "path"):
     """临时导出字体策略：PDF / PS / EPS 嵌入字体，SVG 默认用自包含字形路径。
 
@@ -539,7 +561,7 @@ def export_font_context(fmt: str, svg_fonttype: str = "path"):
     fmt = str(fmt).lower()
     if fmt == "svg":
         assert svg_fonttype in SVG_FONTTYPES, svg_fonttype
-        return matplotlib.rc_context({"svg.fonttype": svg_fonttype, "svg.image_inline": True})
+        return matplotlib.rc_context(svg_rc(svg_fonttype))
     if fmt not in ("pdf", "ps", "eps"):
         return contextlib.nullcontext()
 
@@ -678,11 +700,15 @@ def _svg_pair_native_canvas_method(method) -> bool:
     # Module-relative filenames also work for bytecode/frozen installations, where the
     # original build root and the module's installed absolute path need not coincide.
     source = code.co_filename.replace("\\", "/")
+    relative = module_name.replace(".", "/")
     return (
-        module_name.startswith("matplotlib.")
+        (module_name in ("matplotlib", "mpl_toolkits") or module_name.startswith(_MPL_MODULES))
         and module is not None
         and namespace is vars(module)
-        and ("/" + source).endswith("/" + module_name.replace(".", "/") + ".py")
+        and (
+            ("/" + source).endswith("/" + relative + ".py")
+            or ("/" + source).endswith("/" + relative + "/__init__.py")
+        )
     )
 
 
@@ -754,81 +780,289 @@ def _svg_pair_canvas_blocker(canvas) -> str | None:
     return None
 
 
-def _svg_pair_blocker(fig) -> str | None:
-    """Known draw-time code can change the scene between two serializers.
+def _svg_pair_env_blocker(fig) -> str | None:
+    """The one draw must go through Matplotlib's own `print_pdf`: custom savefig / canvas / backends can't be teed.
 
-    Never label a second draw as a frozen companion when user callbacks or custom
-    draw implementations can mutate it. The primary PDF retains its existing behavior.
+    Part of every pairing blocker. In the single-draw path (`teedraw`, ADR 0150) value-only user callbacks no longer
+    matter because PDF and SVG come out of the same draw; renderer-visible ones are still checked by `_svg_pair_blocker`.
     """
     if not _svg_pair_standard_savefig(fig):
         return "SVG pairing is unavailable for custom Figure saving methods."
-    canvas_blocker = _svg_pair_canvas_blocker(fig.canvas)
-    if canvas_blocker is not None:
-        return canvas_blocker
+    return _svg_pair_canvas_blocker(fig.canvas)
+
+
+#: 这些模块的可调用对象自己不会去跑用户代码（C 实现 / 标准库包装）；用户回调要靠 `__wrapped__` / 闭包才进得去，下面逐层核
+_PASSIVE_CALLABLE_MODULES = ("builtins", "functools", "numpy")
+#: 类对象当属性值时，这些标准库基类不会去跑用户代码
+_PASSIVE_CLASS_MODULES = (
+    "builtins",
+    "collections",
+    "collections.abc",
+    "abc",
+    "typing",
+    "enum",
+    "numbers",
+)
+
+
+_C_CALLABLES = (
+    types.BuiltinFunctionType,
+    types.MethodWrapperType,
+    types.MethodDescriptorType,
+    types.WrapperDescriptorType,
+)
+
+
+def _svg_pair_owned_c_callable(method) -> bool:
+    """C 实现的可调用（builtin 函数 / C 的 bound method / 方法描述符）：只有它**属于 matplotlib / numpy 自己的对象**才放行。
+
+    `deque.popleft`、`list.pop`、`dict.get` 之类绑在用户（或内建）对象上的，一调用就改用户状态：阻断。
+    """
+    if isinstance(method, (types.MethodDescriptorType, types.WrapperDescriptorType)):
+        owner = getattr(method, "__objclass__", None)
+        return isinstance(owner, type) and owner.__module__.startswith((*_MPL_MODULES, "numpy."))
+    owner = getattr(method, "__self__", None)
+    if owner is None or isinstance(owner, types.ModuleType):
+        return False
+    name = getattr(method, "__name__", None)
+    return (
+        type(owner).__module__.startswith((*_MPL_MODULES, "numpy."))
+        and name is not None
+        and getattr(type(owner), name, None) is not None  # 名字确实是它类型自己的方法
+    )
+
+
+def _svg_pair_owned(method, depth=0, cache=None) -> bool:
+    """这个可调用对象**确实是 matplotlib / mpl_toolkits 自己定义的**（或 Tavotto 已核过闭包的包装）。只读，不调用。
+
+    判据是代码出处（`__code__` 的文件与模块 globals 对得上），不是 `__module__`：`functools.wraps(native)` 会把
+    `__module__` 抄成 matplotlib 的，用户的包装函数就能冒充。
+    """
+    if depth > 6:
+        return False
+    if isinstance(method, type):
+        # 类对象一旦被当成属性值（`artist.get_children = SomeClass`），调用它就会跑 `__new__` / `__init__` / `__call__`：
+        # 整条 MRO 与类字典里的可调用都要是 matplotlib / numpy / 内建自己的
+        return _svg_pair_class_blocker(method, {} if cache is None else cache, extra=True) is None
+    if isinstance(method, (functools.partial, functools.partialmethod)):
+        return _svg_pair_owned(method.func, depth + 1, cache)
+    if isinstance(method, _C_CALLABLES):
+        return _svg_pair_owned_c_callable(method)
+    method = getattr(method, "__func__", method)
+    if getattr(method, "__code__", None) is not None:
+        if _svg_pair_native_canvas_method(method):
+            return True
+        # numpy 自己的纯 Python 函数（如 3D 集合的 `_zsortfunc = np.average`）：模块 globals 与文件都对得上
+        name = method.__globals__.get("__name__", "")
+        module = sys.modules.get(name)
+        if (
+            (name == "numpy" or name.startswith("numpy."))
+            and module is not None
+            and method.__globals__ is vars(module)
+            and "/numpy/" in method.__code__.co_filename.replace("\\", "/")
+        ):
+            return True
+        # Tavotto 自己装的 `FigureBase.colorbar` 观察包装（`figcapture.install_colorbar_capture`）：`@wraps` 会把
+        # `__module__` / `__qualname__` 抄成 matplotlib 的，所以按代码出处认，并核它闭包里的原方法
+        if (
+            method.__globals__ is vars(figcapture)
+            and method.__code__.co_name == "colorbar"
+            and "original" in method.__code__.co_freevars
+        ):
+            cells = dict(zip(method.__code__.co_freevars, method.__closure__ or ()))
+            return _svg_pair_owned(cells["original"].cell_contents, depth + 1, cache)
+        # Tavotto
+        return _svg_pair_standard_method(method) and getattr(method, "__module__", "") in (
+            manifest_mod.__name__,
+            overrides_mod.__name__,
+        )
+    kind = type(method)
+    wrapped = getattr(method, "__wrapped__", None)
+    if wrapped is not None:  # lru_cache 之类的 C 包装：核被包的函数
+        return _svg_pair_owned(wrapped, depth + 1, cache)
+    if kind.__module__.startswith(_MPL_MODULES):
+        return True  # matplotlib 自己的可调用对象（如 `_process_plot_var_args`）
+    return kind.__module__ in _PASSIVE_CALLABLE_MODULES and getattr(method, "__module__", None) in (
+        None,
+        "builtins",
+        "functools",
+        "numpy",
+    )
+
+
+def _svg_pair_callable_parts(value) -> list:
+    """类 / 实例上的一个属性值会跑的函数；纯数据回 `[]`。"""
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    if isinstance(value, property):
+        return [f for f in (value.fget, value.fset, value.fdel) if f is not None]
+    if isinstance(value, type):
+        return [
+            value
+        ]  # 类对象是可调用的（实例化会跑用户的 `__new__` / `__init__`）：不能当数据放过
+    if isinstance(
+        value,
+        (types.FunctionType, types.MethodType, functools.partial, functools.partialmethod),
+    ):
+        return [value]
+    return [value] if callable(value) else []
+
+
+def _svg_pair_class_blocker(cls, cache: dict, *, extra: bool = False) -> str | None:
+    """这个类的整条 MRO 都是 matplotlib 的，且类上所有可调用属性都没被换成用户的（含对 matplotlib 类的全局 monkeypatch）。
+
+    `extra=True`（类对象当属性值时）另外接受 numpy 与内建类（`dict` / `float` 之类）：它们不会去跑用户代码。
+    """
+    key = (cls, extra)
+    if key in cache:
+        return cache[key]
+    cache[key] = None  # 自引用的类（类字典里又引用自己）不递归
+    allowed = (*_MPL_MODULES, "numpy.") if extra else _MPL_MODULES
+    result = None
+    for klass in cls.__mro__:
+        if klass is object:
+            continue
+        module = klass.__module__
+        if extra and module in _PASSIVE_CLASS_MODULES:
+            continue  # 标准库基类（`Sequence` / `dict` / `Enum`……）：不扫它们的类字典
+        if not module.startswith(allowed):
+            result = f"custom class {klass.__qualname__}"
+            break
+        if type(klass) not in (type, abc.ABCMeta) and not type(klass).__module__.startswith(
+            allowed
+        ):
+            result = f"custom metaclass of {klass.__qualname__}"
+            break
+        for name, value in vars(klass).items():
+            if (
+                name == "savefig"
+            ):  # Figure.savefig 由 `_svg_pair_standard_savefig` 专门核（采集钩子的包装）
+                continue
+            if any(not _svg_pair_owned(part, 0, cache) for part in _svg_pair_callable_parts(value)):
+                result = f"custom {klass.__qualname__}.{name}"
+                break
+        if result is not None:
+            break
+    cache[key] = result
+    return result
+
+
+def _is_list_remove(value) -> bool:
+    """封闭例外表（三档 matplotlib 常规图实测，实例字典里的 builtin / C bound method 只有这一种）：`artist._remove_method = <list>.remove`。"""
+    return (
+        isinstance(value, types.BuiltinFunctionType)
+        and getattr(value, "__name__", None) == "remove"
+        and isinstance(getattr(value, "__self__", None), list)
+    )
+
+
+def _svg_pair_artist_blocker(artist, cache: dict) -> str | None:
+    """一个 artist 的类与实例两层：任何可调用属性都必须是 matplotlib 自己的（白名单）。只读，不调用。
+
+    能看到 renderer 的方法（draw / get_window_extent / get_tightbbox / get_children / 滤镜 / 注解坐标 / axes locator……）
+    不用逐个列：只要被用户换过（实例上的 monkeypatch 或自定义子类），这里都会拦住。
+    """
+    why = _svg_pair_class_blocker(type(artist), cache)
+    if why is not None:
+        return why
+    for name, value in (getattr(artist, "__dict__", None) or {}).items():
+        if name == "_remove_method" and _is_list_remove(value):
+            continue  # matplotlib 自己放进实例字典的唯一 C bound method（`Artist.remove` 时才调用，绘制不调用）
+        if any(not _svg_pair_owned(part, 0, cache) for part in _svg_pair_callable_parts(value)):
+            return f"custom instance attribute {type(artist).__qualname__}.{name}"
+    # path effect 对象不是可调用属性，但它们的 draw_path 拿着 renderer：按类核
+    for effect in getattr(artist, "_path_effects", None) or ():
+        why = _svg_pair_class_blocker(type(effect), cache)
+        if why is not None:
+            return f"custom path effect ({why})"
+    return None
+
+
+def _svg_pair_value_blocker(artist, seen_transforms, *, tick_slots: bool) -> str | None:
+    """用户的 transform / scale 函数与 Transform 子类。**两种口径都要核**：renderer 拿到的是 transform 对象并**自己求值**
+    （PDF 与每个 SVG 各求一遍），有状态的 `transform_path` 会让几何各不相同——它们不是「已算好的值」。
+
+    `tick_slots=True`（二次绘制口径）再核刻度 formatter / locator：二次绘制里它们会在两遍里各算一次。
+    单次绘制下它们在 `Axis.draw` 阶段只算一次、产出 Text / 数值后才进 renderer，所以是唯一的值槽例外。
+    """
+    cls = type(artist)
+    if not all(
+        _svg_pair_standard_transform(transform, seen_transforms)
+        for transform in (
+            cls.get_transform(artist),
+            cls.get_clip_box(artist),
+            cls.get_clip_path(artist),
+        )
+    ):
+        return "SVG pairing is unavailable for user transform callbacks."
+    if isinstance(artist, Axis):
+        scale = artist._scale
+        if not type(scale).__module__.startswith(_MPL_MODULES) or not (
+            _svg_pair_standard_method(scale.get_transform)
+            and _svg_pair_standard_transform(type(scale).get_transform(scale), seen_transforms)
+        ):
+            return "SVG pairing is unavailable for user scale callbacks."
+        if not tick_slots:
+            return None
+        for component in (
+            cls.get_major_formatter(artist),
+            cls.get_minor_formatter(artist),
+            cls.get_major_locator(artist),
+            cls.get_minor_locator(artist),
+        ):
+            if not type(component).__module__.startswith(_MPL_MODULES):
+                return "SVG pairing is unavailable for custom tick formatters or locators."
+            if not _svg_pair_standard_method(component.__call__):
+                return "SVG pairing is unavailable for custom tick drawing methods."
+            if isinstance(component, ticker.FuncFormatter) and not _svg_pair_standard_method(
+                component.func
+            ):
+                return "SVG pairing is unavailable for user tick-formatting callbacks."
+    return None
+
+
+def _svg_pair_blocker(fig, *, single_draw: bool = False) -> str | None:
+    """Can PDF and SVG be certified as the same Figure?  Read-only: nothing here calls user code.
+
+    **Whitelist, not blacklist.**  Every artist in the figure (figure, axes, axis, text, collections, …) must have its
+    class chain and every callable attribute — on the class *and* on the instance — defined by matplotlib /
+    mpl_toolkits themselves (`_svg_pair_artist_blocker`).  Anything else (an instance-level monkeypatch, a user
+    subclass, a user `agg_filter` / axes locator / annotation-coordinate callable, a custom path effect, …) blocks:
+    those can see the renderer, can run once per renderer the tee forwards to, or can differ between two passes.
+    `draw_event` handlers block for the same reason.
+
+    Transforms and scales are checked in **both** modes (`_svg_pair_value_blocker`): a renderer receives the transform
+    *object* and evaluates it itself (PDF and every SVG each once), so a stateful `transform_path` would give each
+    output different geometry.
+
+    The one closed exception is the *tick slots*: an Axis' formatter and locator (including a `FuncFormatter`'s user
+    function or a Formatter / Locator subclass).  In a single draw they run once, in `Axis.draw`, and only their
+    output (Text / numbers) reaches the renderer.
+
+    * Single draw (`single_draw=True`, `teedraw`, ADR 0150): whitelist + transform / scale; tick slots allowed.
+    * Two-pass (the legacy pairing, and the #1185 witness which is an independent savefig): tick slots may differ
+      between two draws, so they are checked as well.
+    """
+    env_blocker = _svg_pair_env_blocker(fig)
+    if env_blocker is not None:
+        return env_blocker
     if fig.canvas.callbacks.callbacks.get("draw_event"):
         return "SVG pairing is unavailable for figures with draw-event callbacks."
-    pending, seen, seen_transforms = [fig], set(), set()
+    pending, seen, seen_transforms, cache = [fig], set(), set(), {}
     while pending:
         artist = pending.pop()
         if id(artist) in seen:
             continue
         seen.add(id(artist))
-        # Built-in artist families remain supported; a custom Artist may draw different
-        # content each time even without leaving any inspectable state on the Figure.
-        if not type(artist).__module__.startswith(("matplotlib.", "mpl_toolkits.")):
-            return "SVG pairing is unavailable for custom artist implementations."
-        for name in _ARTIST_METHODS:
-            if not _svg_pair_standard_method(getattr(artist, name)):
-                return "SVG pairing is unavailable for custom artist drawing methods."
-        if not all(
-            _svg_pair_standard_transform(transform, seen_transforms)
-            for transform in (artist.get_transform(), artist.get_clip_box(), artist.get_clip_path())
-        ):
-            return "SVG pairing is unavailable for user transform callbacks."
-        if isinstance(artist, Axis):
-            scale = artist._scale
-            if not type(scale).__module__.startswith(("matplotlib.", "mpl_toolkits.")) or not (
-                _svg_pair_standard_method(scale.get_transform)
-                and _svg_pair_standard_transform(scale.get_transform(), seen_transforms)
-            ):
-                return "SVG pairing is unavailable for user scale callbacks."
-            for component in (
-                artist.get_major_formatter(),
-                artist.get_minor_formatter(),
-                artist.get_major_locator(),
-                artist.get_minor_locator(),
-            ):
-                if not type(component).__module__.startswith(("matplotlib.", "mpl_toolkits.")):
-                    return "SVG pairing is unavailable for custom tick formatters or locators."
-                if not _svg_pair_standard_method(component.__call__):
-                    return "SVG pairing is unavailable for custom tick drawing methods."
-                if isinstance(component, ticker.FuncFormatter) and not _svg_pair_standard_method(
-                    component.func
-                ):
-                    return "SVG pairing is unavailable for user tick-formatting callbacks."
-        if isinstance(artist, Axes):
-            locator = artist.get_axes_locator()
-            if locator is not None and not _svg_pair_standard_method(locator):
-                return "SVG pairing is unavailable for user axes-location callbacks."
-        agg_filter = artist.get_agg_filter()
-        if agg_filter is not None and not _svg_pair_standard_method(agg_filter):
-            return "SVG pairing is unavailable for user image-filter callbacks."
-        if isinstance(artist, Annotation):
-            coordinates = [artist.xycoords, artist.get_anncoords()]
-            while coordinates:
-                coord = coordinates.pop()
-                if isinstance(coord, tuple):
-                    coordinates.extend(coord)
-                elif callable(coord) and not _svg_pair_standard_method(coord):
-                    return "SVG pairing is unavailable for annotation coordinate callbacks."
-        # Standard collections use None to mean no path effects.
-        effects = artist.get_path_effects()
-        for effect in () if effects is None else effects:
-            if not type(effect).__module__.startswith(("matplotlib.", "mpl_toolkits.")) or not (
-                _svg_pair_standard_method(effect.draw_path)
-            ):
-                return "SVG pairing is unavailable for custom path-effect callbacks."
-        pending.extend(artist.get_children())
+        why = _svg_pair_artist_blocker(artist, cache)
+        if why is not None:
+            return f"SVG pairing is unavailable for custom code in the figure ({why})."
+        why = _svg_pair_value_blocker(artist, seen_transforms, tick_slots=not single_draw)
+        if why is not None:
+            return why
+        # `get_children` is Matplotlib's own here (checked above), so walking with it runs no user code
+        # 经**类**上 matplotlib 自己的函数取子节点，不经实例属性：实例字典里的任何东西（含 C 的 bound method）都不会被调用
+        pending.extend(type(artist).get_children(artist))
     return None
 
 
@@ -1919,13 +2153,40 @@ class LiveFigureSession:
             )
             out.parent.mkdir(parents=True, exist_ok=True)
             blocker = None
+            strict_blocker = None
+            single_draw = False
             if companion is not None:
+                # ADR 0150：PDF 与 SVG 出自**同一次 draw**（`teedraw`），只算值的回调（刻度格式化 / 定位 / scale / transform）不再需要被证明是纯的；
+                # 能看到 renderer 的回调（draw_event、自定义 Artist.draw、path effect……）仍阻断；
+                # 自检不过才退回二次绘制 + 回调阻断，并把自检结论带进原因（进诊断）。
+                single_ok, single_why = teedraw.status()
+                single_draw = single_ok
                 try:
-                    blocker = _svg_pair_blocker(state.fig)
+                    blocker = _svg_pair_blocker(state.fig, single_draw=single_ok)
+                    # 完整（二次绘制口径）阻断另算一份交给调用方：#1185 的等价证人是独立 savefig，
+                    # 有用户回调（哪怕是只算值的）就不能拿它去绑磁盘素材
+                    strict_blocker = blocker if not single_ok else _svg_pair_blocker(state.fig)
                 except Exception as exc:  # noqa: BLE001 — a companion check cannot block the PDF
                     blocker = f"SVG pairing state could not be verified: {type(exc).__name__}"
+                    strict_blocker = blocker
+                if blocker is not None and not single_ok:
+                    blocker = f"{blocker} (single-draw pairing unavailable: {single_why})"
                 if snapshot_only and blocker is not None:
                     raise SvgSnapshotUnavailable(blocker)
+            tee_targets: list = []
+            tee_results: list = []
+            prep_error: OSError | None = None
+            if single_draw and blocker is None:
+                try:
+                    companion.parent.mkdir(parents=True, exist_ok=True)
+                    targets = [teedraw.SvgTarget(svg_rc("path"), _text_sink(companion))]
+                    if svg_text_path is not None:
+                        text_out = Path(svg_text_path)
+                        text_out.parent.mkdir(parents=True, exist_ok=True)
+                        targets.append(teedraw.SvgTarget(svg_rc("none"), _text_sink(text_out)))
+                    tee_targets = targets
+                except OSError as exc:  # 目录建不出来只是 SVG 这一项的失败，PDF 照常
+                    prep_error = exc
             # 两份产物共用一次 override 应用和同一个 owner-thread 命令；不走编辑预览，
             # 也不在两次独立请求之间重新应用 patches / 运行脚本。发布与失败清理由导出事务负责。
             with self.real_output():
@@ -1941,17 +2202,35 @@ class LiveFigureSession:
                         if str(fmt).lower() == "svg"
                         else nullcontext(out)
                     ) as fh:
-                        state.fig.savefig(
-                            fh,
-                            format=fmt,
-                            dpi=int(dpi),
-                            **export_format_kwargs(fmt),
-                            **pathgeom.output_kwargs(state.fig),
-                        )
+                        with (
+                            teedraw.single_draw(state.fig, tee_targets)
+                            if tee_targets
+                            else nullcontext()
+                        ) as tee_session:
+                            state.fig.savefig(
+                                fh,
+                                format=fmt,
+                                dpi=int(dpi),
+                                **export_format_kwargs(fmt),
+                                **pathgeom.output_kwargs(state.fig),
+                            )
+                        if tee_session is not None:
+                            tee_results = tee_session.errors()
             if companion is not None:
                 try:
                     if blocker is not None:
                         raise ValueError(blocker)
+                    if prep_error is not None:
+                        raise prep_error
+                    if tee_targets:
+                        if tee_results[0] is not None:
+                            raise ValueError(f"single-draw SVG failed: {tee_results[0]}")
+                        result["svg_pairing"] = "single_draw"
+                        if strict_blocker is not None:
+                            # 有用户回调（只算值的也算）：调用方不得拿独立 savefig 的证人去绑磁盘素材（#1185）
+                            result["svg_strict_blocker"] = strict_blocker
+                    else:
+                        result["svg_pairing"] = "two_pass"
                     companion.parent.mkdir(parents=True, exist_ok=True)
 
                     # The PDF draw has already established the layout. Re-running
@@ -1966,18 +2245,19 @@ class LiveFigureSession:
                             else _NULL_CTX
                         )
 
-                    with (
-                        self.real_output(),
-                        export_font_context("svg"),
-                        layout_context(),
-                        companion.open("w", encoding="utf-8", newline="") as fh,
-                    ):
-                        state.fig.savefig(
-                            fh,
-                            format="svg",
-                            dpi=int(dpi),
-                            **pathgeom.output_kwargs(state.fig),
-                        )
+                    if not tee_targets:
+                        with (
+                            self.real_output(),
+                            export_font_context("svg"),
+                            layout_context(),
+                            companion.open("w", encoding="utf-8", newline="") as fh,
+                        ):
+                            state.fig.savefig(
+                                fh,
+                                format="svg",
+                                dpi=int(dpi),
+                                **pathgeom.output_kwargs(state.fig),
+                            )
                     digest = hashlib.sha256()
                     size_bytes = 0
                     with companion.open("rb") as stream:
@@ -1995,18 +2275,22 @@ class LiveFigureSession:
                         try:
                             text_out = Path(svg_text_path)
                             text_out.parent.mkdir(parents=True, exist_ok=True)
-                            with (
-                                self.real_output(),
-                                export_font_context("svg", "none"),
-                                layout_context(),
-                                text_out.open("w", encoding="utf-8", newline="") as fh,
-                            ):
-                                state.fig.savefig(
-                                    fh,
-                                    format="svg",
-                                    dpi=int(dpi),
-                                    **pathgeom.output_kwargs(state.fig),
-                                )
+                            if tee_targets:
+                                if tee_results[1] is not None:
+                                    raise ValueError(str(tee_results[1]))
+                            else:
+                                with (
+                                    self.real_output(),
+                                    export_font_context("svg", "none"),
+                                    layout_context(),
+                                    text_out.open("w", encoding="utf-8", newline="") as fh,
+                                ):
+                                    state.fig.savefig(
+                                        fh,
+                                        format="svg",
+                                        dpi=int(dpi),
+                                        **pathgeom.output_kwargs(state.fig),
+                                    )
                             raw = text_out.read_bytes()
                             result["svg_text"] = {
                                 "path": str(text_out),

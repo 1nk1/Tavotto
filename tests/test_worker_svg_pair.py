@@ -87,7 +87,7 @@ boot = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(boot)
 pkg = boot.load_engine_modules(engine, ("figcapture", "patchspec", "pathgeom", "axestraversal",
     "spinemodel", "tickmodel", "colorbarmodel", "legendmodel", "overrides", "manifest",
-    "preview_hybrid", "figsession", "wireproto"))
+    "preview_hybrid", "teedraw", "figsession", "wireproto"))
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -128,6 +128,14 @@ def apply(state, values):
     calls.append(values)
     return real_apply(state, values)
 
+if mode == "failure":
+    # 单次绘制下 SVG 那一路在 draw 里失败：先把自检跑完（自检不该被注入影响），再让 SVG renderer 画路径时抛错
+    assert pkg.teedraw.status() == (True, "ok")
+    from matplotlib.backends import backend_svg
+    def boom(self, *args, **kwargs):
+        raise RuntimeError("companion save failed")
+    backend_svg.RendererSVG.draw_path = boom
+
 def observe_savefig(frame, event, value):
     # Observe the real serializer without replacing the method pair eligibility checks.
     if frame.f_code is not real_savefig.__func__.__code__:
@@ -143,8 +151,6 @@ def observe_savefig(frame, event, value):
                       "pdf_fonttype": matplotlib.rcParams["pdf.fonttype"]})
     elif event == "return":
         saves[-1]["axes_after"] = list(ax.get_position().bounds)
-        if mode == "failure" and kw["format"] == "svg":
-            raise RuntimeError("companion save failed")
 
 def forbid_preview(*args, **kw):
     raise AssertionError("full-quality export used preview_hybrid")
@@ -188,6 +194,111 @@ elif mode in {"formatter", "snapshot_formatter", "standalone_formatter"}:
         counter[0] += 1
         return str(counter[0])
     ax.xaxis.set_major_formatter(FuncFormatter(changing_formatter))
+elif mode in {"deque_children", "snapshot_deque_children"}:
+    # C 的 bound method（deque.popleft）当 get_children：判定遍历既不能经实例属性调用它，也不能把它当数据放过
+    import collections
+    held = collections.deque([1, 2])
+    ax.lines[0].get_children = held.popleft
+elif mode in {"list_pop_getter", "snapshot_list_pop_getter"}:
+    held = [1, 2]
+    ax.lines[0].get_label = held.pop
+elif mode in {"children_class", "snapshot_children_class"}:
+    # 类对象当 get_children：调用它跑的是 __new__（类对象不是「非可调用数据」）
+    counter = [0]
+    native_children = ax.get_children
+    class StatefulChildren:
+        def __new__(cls):
+            counter[0] += 1
+            return native_children()
+    ax.get_children = StatefulChildren
+elif mode in {"filter_class", "snapshot_filter_class"}:
+    counter = [0]
+    class StatefulFilter:
+        def __init__(self, image, dpi):
+            counter[0] += 1
+            self.result = (image, 0, 0)
+        def __iter__(self):
+            return iter(self.result)
+    ax.lines[0].set_agg_filter(StatefulFilter)
+elif mode in {"partial_user", "snapshot_partial_user"}:
+    import functools
+    counter = [0]
+    def user_filter(image, dpi, tag=None):
+        counter[0] += 1
+        return image, 0, 0
+    ax.lines[0].set_agg_filter(functools.partial(user_filter, tag="x"))
+elif mode in {"callable_object", "snapshot_callable_object"}:
+    counter = [0]
+    class UserFilter:
+        def __call__(self, image, dpi):
+            counter[0] += 1
+            return image, 0, 0
+    ax.lines[0].set_agg_filter(UserFilter())
+elif mode in {"stateful_transform", "snapshot_stateful_transform"}:
+    # 有状态的自定义 Transform：renderer 拿到 transform 对象并各自求值，几何会不同
+    from matplotlib.transforms import Affine2D
+    counter = [0]
+    class Shifty(Affine2D):
+        def transform_path(self, path):
+            counter[0] += 1
+            return super().transform_path(path)
+    ax.lines[0].set_transform(Shifty().translate(0, 0) + ax.transData)
+elif mode in {"window_extent", "snapshot_window_extent"}:
+    # 实例级覆盖 get_window_extent（能看到 renderer、会在布局里被调用）：白名单拦住，且判定不调用它
+    counter = [0]
+    native_extent = ax.title.get_window_extent
+    def counting_extent(renderer=None):
+        counter[0] += 1
+        return native_extent(renderer)
+    ax.title.get_window_extent = counting_extent
+elif mode in {"text_subclass", "snapshot_text_subclass"}:
+    from matplotlib.text import Text
+    class MyText(Text):
+        pass
+    ax.add_artist(MyText(.5, .5, "custom"))
+elif mode in {"wraps_draw", "snapshot_wraps_draw"}:
+    # functools.wraps 会把 __module__ 抄成 matplotlib 的：按代码出处认，冒充不了
+    import functools
+    native_line_draw = ax.lines[0].draw
+    ax.lines[0].draw = functools.wraps(native_line_draw)(lambda renderer: native_line_draw(renderer))
+elif mode in {"class_patch", "snapshot_class_patch"}:
+    # 对 matplotlib 的类做全局 monkeypatch（不是自定义子类）
+    from matplotlib.text import Text
+    native_text_extent = Text.get_window_extent
+    def patched_extent(self, renderer=None, dpi=None):
+        return native_text_extent(self, renderer, dpi)
+    Text.get_window_extent = patched_extent
+elif mode == "formatter_subclass":
+    from matplotlib.ticker import Formatter
+    counter = [0]
+    class CountingFormatter(Formatter):
+        def __call__(self, x, pos=None):
+            counter[0] += 1
+            return f"s{counter[0]}"
+    ax.xaxis.set_major_formatter(CountingFormatter())
+elif mode in {"agg_filter", "snapshot_agg_filter"}:
+    # 有状态的图像滤镜：tee 会把 stop_filter 广播给每个目标，每个目标各跑一次——仍须阻断，且判定不得调用它
+    counter = [0]
+    def counting_filter(image, dpi):
+        counter[0] += 1
+        return image, 0, 0
+    ax.lines[0].set_agg_filter(counting_filter)
+elif mode in {"get_children", "snapshot_get_children"}:
+    # 实例级、有状态的 get_children：判定遍历本身不得调用它（常规 savefig 的遍历里没有这次调用）
+    counter = [0]
+    native_children = ax.get_children
+    def counting_children():
+        counter[0] += 1
+        return native_children()
+    ax.get_children = counting_children
+elif mode in {"renderer_dispatch", "snapshot_renderer_dispatch"}:
+    from matplotlib.artist import Artist
+    from matplotlib.backends.backend_mixed import MixedModeRenderer
+    class Dispatch(Artist):
+        def draw(self, renderer):
+            # 按 renderer 的类分派：tee 传进来的不是 MixedModeRenderer 时 PDF 自己就会变
+            title.set_text("Mixed" if isinstance(renderer, MixedModeRenderer) else "Other")
+    ax.add_artist(Dispatch())
 elif mode == "standalone_artist":
     from matplotlib.artist import Artist
     from matplotlib.path import Path as MplPath
@@ -247,6 +358,12 @@ elif mode == "fixed_labels":
 elif mode == "mkdir_failure":
     (out / "blocker").write_text("not a directory")
     svg = out / "blocker" / "pair.svg"
+#: 只算值的回调：单次绘制下 PDF 与 SVG 配对（ADR 0150）
+PAIRED = {"formatter", "locator", "formatter_subclass"}
+PAIRED |= {"snapshot_" + name for name in PAIRED}
+#: 能看到 renderer 的回调：仍阻断（它们可能按 renderer 的类分派，tee 与 PDF renderer 不是同一个类）
+BLOCKED = {"callback", "custom_draw", "annotation", "effect", "renderer_dispatch", "get_children", "agg_filter", "window_extent", "text_subclass", "wraps_draw", "class_patch", "scale", "transform", "stateful_transform", "children_class", "filter_class", "partial_user", "callable_object", "deque_children", "list_pop_getter"}
+BLOCKED |= {"snapshot_" + name for name in ("callback", "custom", "annotation", "effect", "renderer_dispatch", "get_children", "agg_filter", "window_extent", "text_subclass", "wraps_draw", "class_patch", "scale", "transform", "stateful_transform", "children_class", "filter_class", "partial_user", "callable_object", "deque_children", "list_pop_getter")}
 result = None
 if mode == "invalid":
     handler = pkg.wireproto.V1Handler(session)
@@ -283,8 +400,8 @@ else:
         "cmd": "export", "stem": "F", "payload": {"patches": patches, "path": str(pdf),
         "format": "pdf", "dpi": 300, "svg_path": str(svg),
         "require_built": True, "snapshot_only": mode.startswith("snapshot_"),
-        **({"svg_text_path": str(out / "pair.text.svg")} if mode == "pair_text" else {})}})
-    if mode.startswith("snapshot_") and mode != "snapshot_ok":
+        **({"svg_text_path": str(out / "pair.text.svg")} if mode == "pair_text" or (mode in PAIRED and not mode.startswith("snapshot_")) else {})}})
+    if mode in BLOCKED and mode.startswith("snapshot_"):
         assert not response["ok"] and response["error"]["code"] == "svg_source_unavailable", response
         assert response["error"]["retryable"] is False
         assert not saves and not pdf.exists() and not svg.exists()
@@ -292,13 +409,22 @@ else:
         assert response["ok"], response
         assert response["worker_generation"] == 7 and response["render_revision"] == 12
         assert response["unrestored"] == 0
-    if mode in {"failure", "mkdir_failure", "callback", "custom_draw", "formatter", "locator", "scale", "transform", "annotation", "effect"}:
+    if mode in {"failure", "mkdir_failure"} or (mode in BLOCKED and not mode.startswith("snapshot_")):
         assert "svg" not in response and response["svg_error"]["code"] == "svg_export_failed", response
         assert pdf.is_file() and not svg.is_file()
+    elif mode in PAIRED:
+        assert "svg_error" not in response and response["svg"]["path"] == str(svg), response
+        assert response["svg_pairing"] == "single_draw"
+        # 有用户回调：调用方不得拿独立 savefig 的证人绑磁盘素材（#1185）
+        assert response.get("svg_strict_blocker")
     result = response
     assert calls == [patches, previous], calls
-if mode in {"snapshot_formatter", "snapshot_locator", "snapshot_scale", "snapshot_transform", "snapshot_annotation", "snapshot_effect"}:
-    assert counter[0] == 0
+if mode in {"snapshot_formatter", "snapshot_locator"}:
+    assert counter[0] > 0  # 单次绘制：画了，而且只画一次的结果同时进 PDF 与 SVG
+if mode in {"deque_children", "snapshot_deque_children", "list_pop_getter", "snapshot_list_pop_getter"}:
+    assert len(held) == 2  # 判定没有调用它（既不经实例属性，也不把它当数据放过）
+if mode in {"snapshot_annotation", "snapshot_effect", "snapshot_get_children", "snapshot_agg_filter", "snapshot_window_extent", "snapshot_scale", "snapshot_transform", "snapshot_stateful_transform", "snapshot_children_class", "snapshot_filter_class", "snapshot_partial_user", "snapshot_callable_object"}:
+    assert counter[0] == 0  # 阻断发生在任何绘制 / 遍历调用用户方法之前
 assert session.snapshot("F") == previous
 assert title.get_text() == "Hot title"
 assert dict(matplotlib.rcParams) == before_rc
@@ -340,12 +466,11 @@ def _probe(tmp_path, mode):
 )
 def test_paired_export_keeps_frame_full_quality_and_state(tmp_path, mode):
     result = _probe(tmp_path, mode)
-    assert [save["format"] for save in result["saves"]] == ["pdf", "svg"]
+    # ADR 0150：PDF 与 SVG 出自同一次 draw，只有一次 savefig
+    assert [save["format"] for save in result["saves"]] == ["pdf"]
     assert {save["title"] for save in result["saves"]} == {"Export title"}
     assert {save["dpi"] for save in result["saves"]} == {300}
-    assert result["saves"][0]["frame"] == result["saves"][1]["frame"]
-    assert result["saves"][0]["axes_after"] == result["saves"][1]["axes_after"]
-    assert result["saves"][1]["fonttype"] == "path"
+    assert result["result"]["svg_pairing"] == "single_draw"
     assert result["saves"][0]["pdf_fonttype"] == (3 if mode == "snapshot_ok" else 42)
     svg = tmp_path / "pair.svg"
     data = svg.read_bytes()
@@ -355,6 +480,7 @@ def test_paired_export_keeps_frame_full_quality_and_state(tmp_path, mode):
         "size_bytes": len(data),
     }
     root = ET.fromstring(data)
+    # 脚本把 svg.fonttype 设成了 none，SVG 目标自己的 rc 仍把它写成 path（基准字节是 path）
     assert not root.findall(".//{http://www.w3.org/2000/svg}text")
     assert root.findall(".//{http://www.w3.org/2000/svg}path")
     assert root.findall(".//{http://www.w3.org/2000/svg}image")
@@ -375,20 +501,55 @@ def test_svg_failure_preserves_pdf_and_restores_state(tmp_path, mode):
 
 
 @needs_user_python
+@pytest.mark.parametrize("mode", ["formatter", "locator", "formatter_subclass"])
+def test_value_callbacks_are_paired_from_one_draw(tmp_path, mode):
+    """ADR 0150：只算值的回调再不纯，PDF 与 SVG 看到的也是同一个场景。"""
+    result = _probe(tmp_path, mode)
+    assert [save["format"] for save in result["saves"]] == ["pdf"]
+    assert result["result"]["svg"]["path"] == str(tmp_path / "pair.svg")
+    assert "svg_error" not in result["result"]
+    with pymupdf.open(tmp_path / "pair.pdf") as pdf:
+        pdf_words = sorted(
+            "".join(pdf[0].get_text().split())
+        )  # 按字符：密集刻度标签在 PDF 抽文字时会粘在一起
+    root = ET.fromstring((tmp_path / "pair.text.svg").read_bytes())
+    svg_words = sorted(
+        "".join(
+            "".join("".join(node.itertext()).split())
+            for node in root.iter("{http://www.w3.org/2000/svg}text")
+        )
+    )
+    assert pdf_words == svg_words, (pdf_words, svg_words)
+
+
+@needs_user_python
 @pytest.mark.parametrize(
     "mode",
     [
         "callback",
         "custom_draw",
-        "formatter",
-        "locator",
-        "scale",
-        "transform",
         "annotation",
         "effect",
+        "renderer_dispatch",
+        "get_children",
+        "agg_filter",
+        "window_extent",
+        "text_subclass",
+        "wraps_draw",
+        "class_patch",
+        "scale",
+        "transform",
+        "stateful_transform",
+        "children_class",
+        "filter_class",
+        "partial_user",
+        "callable_object",
+        "deque_children",
+        "list_pop_getter",
     ],
 )
-def test_dynamic_draw_is_not_certified_as_a_paired_snapshot(tmp_path, mode):
+def test_renderer_visible_callbacks_still_block_pairing(tmp_path, mode):
+    """能看到 renderer 的回调（draw_event、自定义 Artist.draw、注解坐标、path effect、按 renderer 类分派）仍不授予 SVG 资格。"""
     result = _probe(tmp_path, mode)
     assert [save["format"] for save in result["saves"]] == ["pdf"]
     assert "svg" not in result["result"]
@@ -428,9 +589,7 @@ def test_export_svg_bytes_do_not_translate_newlines(tmp_path, mode):
     data = (tmp_path / "pair.svg").read_bytes()
     assert b"\n" in data and b"\r\n" not in data
     assert result["svg_opens"] == [{"encoding": "utf-8", "newline": ""}]
-    assert [save["format"] for save in result["saves"]] == (
-        ["pdf", "svg"] if mode == "pair" else ["svg"]
-    )
+    assert [save["format"] for save in result["saves"]] == (["pdf"] if mode == "pair" else ["svg"])
     if mode == "pair":
         assert result["result"]["svg"]["size_bytes"] == len(data)
         assert result["result"]["svg"]["sha256"] == hashlib.sha256(data).hexdigest()
@@ -524,20 +683,40 @@ def test_capture_export_never_reopens_expired_workerd_session(monkeypatch, tmp_p
 
 
 @needs_user_python
+@pytest.mark.parametrize("mode", ["snapshot_formatter", "snapshot_locator"])
+def test_automatic_snapshot_pairs_value_callbacks_from_one_draw(tmp_path, mode):
+    result = _probe(tmp_path, mode)
+    assert [save["format"] for save in result["saves"]] == ["pdf"]
+    assert result["result"]["svg"]["path"] == str(tmp_path / "pair.svg")
+
+
+@needs_user_python
 @pytest.mark.parametrize(
     "mode",
     [
         "snapshot_callback",
         "snapshot_custom",
-        "snapshot_formatter",
-        "snapshot_locator",
-        "snapshot_scale",
-        "snapshot_transform",
         "snapshot_annotation",
         "snapshot_effect",
+        "snapshot_renderer_dispatch",
+        "snapshot_get_children",
+        "snapshot_agg_filter",
+        "snapshot_window_extent",
+        "snapshot_text_subclass",
+        "snapshot_wraps_draw",
+        "snapshot_class_patch",
+        "snapshot_scale",
+        "snapshot_transform",
+        "snapshot_stateful_transform",
+        "snapshot_children_class",
+        "snapshot_filter_class",
+        "snapshot_partial_user",
+        "snapshot_callable_object",
+        "snapshot_deque_children",
+        "snapshot_list_pop_getter",
     ],
 )
-def test_automatic_snapshot_declines_dynamic_draw_without_drawing(tmp_path, mode):
+def test_automatic_snapshot_declines_renderer_visible_callbacks_without_drawing(tmp_path, mode):
     result = _probe(tmp_path, mode)
     assert result["saves"] == []
 
@@ -590,11 +769,8 @@ def test_cold_execution_worker_never_runs_script_for_capture(tmp_path, legacy):
 def test_text_variant_is_a_separate_serialization_and_the_path_baseline_is_untouched(tmp_path):
     """ADR 0144：`svg_text_path` 另写一份 `svg.fonttype=none`；path 基准字节（#1185 等价证人）仍是 path。"""
     result = _probe(tmp_path, "pair_text")
-    assert [save["format"] for save in result["saves"]] == ["pdf", "svg", "svg"]
-    assert [save["fonttype"] for save in result["saves"][1:]] == ["path", "none"]
-    # 同一份布局：三次保存之后坐标轴位置、取景框一字不差
-    assert len({tuple(save["axes_after"]) for save in result["saves"]}) == 1
-    assert len({tuple(save["frame"]) for save in result["saves"]}) == 1
+    # ADR 0150：一次 draw 同时出 PDF / path 基准 / 保留文字三份，不再有「三次保存」
+    assert [save["format"] for save in result["saves"]] == ["pdf"]
     baseline = (tmp_path / "pair.svg").read_bytes()
     text = (tmp_path / "pair.text.svg").read_bytes()
     ns = "{http://www.w3.org/2000/svg}text"
@@ -622,3 +798,55 @@ def test_standalone_svg_can_keep_text_without_touching_the_default(tmp_path):
     (tmp_path / "plain").mkdir()
     plain = _probe(tmp_path / "plain", "standalone")
     assert [save["fonttype"] for save in plain["saves"]] == ["path"]
+
+
+WHITELIST_PROBE = r"""
+import importlib.util, json, sys
+from pathlib import Path
+engine = sys.argv[1]
+spec = importlib.util.spec_from_file_location("boot", Path(engine) / "bridgeboot.py")
+boot = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(boot)
+pkg = boot.load_engine_modules(engine, ("figcapture", "patchspec", "pathgeom", "axestraversal",
+    "spinemodel", "tickmodel", "colorbarmodel", "legendmodel", "overrides", "manifest",
+    "preview_hybrid", "teedraw", "figsession", "wireproto"))
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+blocker = pkg.figsession._svg_pair_blocker
+out = {}
+x = np.linspace(-1, 1, 8)
+X, Y = np.meshgrid(x, x)
+fig, ax = plt.subplots(constrained_layout=True)
+ax.plot([0, 1], label="a"); ax.legend(); ax.set_yscale("log")
+ax.annotate("n", (1, 1), (1.5, 1.5), arrowprops={"arrowstyle": "->"})
+ax.bar([1], [1], hatch="//"); ax.errorbar([1], [1], yerr=.1)
+ax.text(.5, .5, "$x^2$", bbox={"boxstyle": "round"})
+fig.colorbar(ax.imshow(np.random.rand(3, 3)))
+out["stock"] = blocker(fig, single_draw=True)
+f3 = plt.figure(); a3 = f3.add_subplot(projection="3d"); a3.plot_surface(X, Y, X * Y)
+out["mplot3d"] = blocker(f3, single_draw=True)
+f4, a4 = plt.subplots(); a4.contourf(X, Y, np.sin(X * Y)); a4.pcolormesh(np.random.rand(4, 4))
+out["collections"] = blocker(f4, single_draw=True)
+print(json.dumps(out))
+"""
+
+
+@needs_user_python
+def test_whitelist_accepts_stock_matplotlib_figures(tmp_path):
+    """白名单反转后不能误伤：常规的 matplotlib 图（含 constrained layout、colorbar、3D、集合……）仍可配对。"""
+    completed = subprocess.run(
+        [USER_PYTHON, "-c", WHITELIST_PROBE, str(pool.WORKER_PY.parent)],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=child_env(),
+        timeout=120,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert json.loads(completed.stdout.splitlines()[-1]) == {
+        "stock": None,
+        "mplot3d": None,
+        "collections": None,
+    }

@@ -59,10 +59,16 @@ order: 210
     path 基准字节与等价证人不动）；
     画布写入与有限产物验证见 `rendercore.md`，不承诺已通过真实 Office 验证。
     Figure 的 PDF/SVG 必须在一个 owner-thread 命令里、一次 overrides 应用下生成，沿用同一页面框、
-    执行回执与 generation；SVG 复用 PDF draw 已确定的布局，临时 `svg.fonttype=path` 和 Figure 状态在结束时还原。
+    执行回执与 generation；**PDF 与 SVG（path 基准 + 保留文字）出自同一次 `Figure.draw`**（ADR 0150，`engine/teedraw`：
+    `print_pdf` 里的 `MixedModeRenderer` 换成 `TeeRenderer`，版面度量取自 PDF），**单次绘制资格是白名单**（`_svg_pair_artist_blocker`）：图里每个 artist 的类与实例两层、所有可调用属性都必须是 matplotlib / mpl_toolkits 自己定义的
+    （按代码出处认，不看 `__module__`；只读、不调用用户代码），否则阻断——能看到 renderer / 会被每个目标各跑一次 / 两遍之间会不同的代码（`draw_event`、自定义子类、
+    `get_window_extent` 等实例覆盖、`agg_filter`、axes locator、注解坐标回调、path effect……）靠这一条整体覆盖，不再逐个列黑名单。transform / scale（用户 Transform 子类、FuncScale / FuncTransform 的用户函数：renderer 拿对象自己求值）两种口径都核；
+    唯一例外是封闭的值槽 = Axis 的 formatter 与 locator（它们在 Axis.draw 阶段只算一次，计数器 FuncFormatter 照常放行）；另保留 `_svg_pair_env_blocker`（自定义 `Figure.savefig` / canvas / 打印方法 / 注册后端）。`teedraw.status()` 自检先于任何导出，
+    不过就退回「二次绘制 + 完整回调阻断」并把自检结论带进原因。响应里 `svg_pairing` = `single_draw` | `two_pass`。
+    `teedraw` 的替身只对「当前线程会话 + 会话那张 figure」生效，别的线程 / 别的 figure 的 `savefig` 原样。
+    **#1185 SVG 素材字节绑定的等价证人不走 tee**（独立 savefig，见 ADR 0150「为什么不走 tee」），且**有任何用户回调就不绑**（响应 `svg_strict_blocker`）。
     **自动捕获和导出要求 `require_built`**：只用已经运行并接纳的 Figure 或已验证的冻结对，冷 worker /
-    过期会话 / 缺失表示不能触发脚本重跑。动态 draw 回调、自定义 draw 等无法保证配对稳定的 Figure
-    不授予 SVG 资格，自动捕获在 draw 之前拒绝。**未知当前回执不是旧配对的许可**：磁盘 current marker
+    过期会话 / 缺失表示不能触发脚本重跑；自动捕获遇到被保留的阻断在 draw 之前拒绝。**未知当前回执不是旧配对的许可**：磁盘 current marker
     与预览 metadata 不能补造当前执行证据；没有文档引用时，执行源必须有当前进程实际观察到的回执。
     文档面板的 `figureSnapshot` 经请求字段 `figure_snapshot` 传入，闭集结构与存储合同见
     `layout-versions-and-documents.md`。冷态且当前回执未知时，明确引用可导出保存时的版本；
