@@ -101,6 +101,7 @@ def tavotto_observe(project: Path, script: str, deep: dict | None = None) -> dic
                 manifest = worker.override(stem, [])["manifest"]
                 manifests[stem] = manifest
                 obs["stems"][stem] = {"titles": _titles(manifest)}
+            obs["savefig_calls"] = _savefig_calls(worker)
             if deep:
                 _observe_deep(obs, worker, manifests, deep, project, script, entry)
         finally:
@@ -109,6 +110,20 @@ def tavotto_observe(project: Path, script: str, deep: dict | None = None) -> dic
         code = getattr(exc, "code", None) or type(exc).__name__
         obs["error"] = {"code": str(code), "message": str(exc)[:300]}
     return obs
+
+
+def _savefig_calls(worker) -> dict:
+    """Per captured stem: the savefig calls the product recorded (their `format`), as `{stem: [format|None, ...]}`.
+
+    Straight from the build descriptors, so this is what the product itself knows about how the
+    figure was saved; a stem whose calls were not observed is absent.
+    """
+    out: dict = {}
+    for d in getattr(worker, "last_build_descriptors", None) or []:
+        calls = d.get("savefig_calls")
+        if d.get("stem") and calls is not None:
+            out[d["stem"]] = [c.get("format") for c in calls if isinstance(c, dict)]
+    return out
 
 
 def _observe_deep(obs, worker, manifests, deep, project, script, entry) -> None:
@@ -161,7 +176,64 @@ def native_facts(result: dict) -> dict:
         "titles": [t for v in (result.get("semantics") or {}).values() for t in v["titles"]],
         "last_writer": result.get("savefig_last_writer") or {},
         "artifacts": sorted(a["path"] for a in result.get("artifacts", [])),
+        "formats": _formats_by_stem(result.get("artifacts", [])),
+        "pdf_pages": sum(a.get("pdf_pages") or 0 for a in result.get("artifacts", [])),
     }
+
+
+_IMAGE_FORMATS = {"png", "pdf", "svg", "eps", "ps", "jpg", "jpeg", "tif", "tiff"}
+
+
+def _formats_by_stem(artifacts: list[dict]) -> dict[str, list[str]]:
+    """`{stem: [format, ...]}` of the image files the script wrote (stem = path without extension)."""
+    out: dict[str, set[str]] = {}
+    for a in artifacts:
+        stem, _, ext = a["path"].rpartition(".")
+        if ext.lower() in _IMAGE_FORMATS:
+            out.setdefault(stem, set()).add(ext.lower())
+    return {stem: sorted(v) for stem, v in sorted(out.items())}
+
+
+def output_call_differences(chain: list[str], nat: dict, tavotto: dict) -> list[dict]:
+    """The multi-output transforms are only worth running if the outputs themselves are compared.
+
+    * `multi_format`: every format the script wrote for a stem must be among the savefig formats
+      the product recorded for that stem (`format_set_mismatch`);
+    * `pdfpages`: the pages of the PDF the script wrote must equal the pdf saves the product
+      recorded (`page_count_mismatch`; `PdfPages.savefig` is not a recorded savefig, so today the
+      product knows 0 pages — a real, registered gap, not a template artefact).
+
+    A stem whose calls the product did not observe is skipped here (`zero_figures` etc. cover it).
+    """
+    seen = tavotto.get("savefig_calls") or {}
+    diffs = []
+    if "multi_format" in chain:
+        for stem, formats in sorted(nat["formats"].items()):
+            known = seen.get(Path(stem).name) or seen.get(stem)
+            if len(formats) < 2 or known is None:
+                continue
+            got = sorted({str(f).lower() for f in known if f})
+            if got != formats:
+                diffs.append(
+                    _diff(
+                        "format_set_mismatch",
+                        f"native wrote {stem} as {formats} / Tavotto recorded {got}",
+                        "partial_capture",
+                        {"stem": stem, "native_formats": formats, "tavotto_formats": got},
+                    )
+                )
+    if "pdfpages" in chain and nat["pdf_pages"] > 1:
+        pages = sum(1 for calls in seen.values() for f in calls if f and str(f).lower() == "pdf")
+        if pages != nat["pdf_pages"]:
+            diffs.append(
+                _diff(
+                    "page_count_mismatch",
+                    f"native PDF has {nat['pdf_pages']} pages / Tavotto recorded {pages} pdf save(s)",
+                    "partial_capture",
+                    {"native_pages": nat["pdf_pages"], "tavotto_pages": pages},
+                )
+            )
+    return diffs
 
 
 def compare(
@@ -170,6 +242,7 @@ def compare(
     tavotto: dict,
     parent_native: dict | None,
     extra: list[dict] | None = None,
+    chain: list[str] | None = None,
 ) -> dict:
     """Pure judgment of one executed candidate. Never decides anything about the baseline.
 
@@ -267,6 +340,8 @@ def compare(
                         {"title": title},
                     )
                 )
+    if stems:
+        diffs.extend(output_call_differences(chain or [], nat, tavotto))
     diffs.extend(extra or [])
     if not diffs and tavotto.get("error") and stems:
         # 观察到一部分图之后 Tavotto 报错（后面的图没观察到）：不是「无差异」，是没比完（Codex #1135 r4310366048）
@@ -532,6 +607,7 @@ def execute_request(request: dict) -> dict:
         result["tavotto"],
         parent_native,
         layers["differences"] if layers else None,
+        [s["name"] for s in manifest["chain"]],
     )
     result["judgment"] = audited_judgment(
         manifest["class"], result["judgment"], result["executions"]
@@ -575,20 +651,37 @@ def _parent_snapshot_request(request: dict, work: Path) -> dict:
 
 
 def select(candidates: list[dict], limit: int | None) -> list[dict]:
-    """Deterministic, family-balanced selection so a small limit still spans every axis."""
+    """Deterministic, family-balanced selection so a small limit still spans every family.
+
+    Round-robin over families (by the first transform's family), and inside a family over its
+    transforms (their order is a hash of the seed, so nightly seeds rotate which ones run); inside one transform the candidates are ordered by a hash of (seed, id) so a
+    small limit does not always land on the alphabetically first parent.
+    """
     if limit is not None and limit < 1:
         raise cg.EvidenceError(f"--limit must be a positive integer, got {limit}")
     if limit is None or limit >= len(candidates):
         return candidates
-    buckets: dict[str, list[dict]] = {}
-    for c in candidates:
-        buckets.setdefault(c["axis_vector"][0], []).append(c)
+    tree: dict[str, dict[str, list[dict]]] = {}
+    for c in sorted(
+        candidates, key=lambda c: cg.digest(f"{c['seed']}|{c['candidate_id']}".encode())
+    ):
+        family = c["chain"][0]["family"]
+        tree.setdefault(family, {}).setdefault(c["axis_vector"][0], []).append(c)
     chosen: list[dict] = []
-    keys = sorted(buckets)
-    while len(chosen) < limit and any(buckets.values()):
-        for key in keys:
-            if buckets[key] and len(chosen) < limit:
-                chosen.append(buckets[key].pop(0))
+    turn = {family: 0 for family in tree}
+    while len(chosen) < limit:
+        for family in sorted(tree):
+            keys = sorted(
+                tree[family], key=lambda k: cg.digest(f"{candidates[0]['seed']}|{k}".encode())
+            )
+            for _ in keys:
+                key = keys[turn[family] % len(keys)]
+                turn[family] += 1
+                if tree[family][key]:
+                    chosen.append(tree[family][key].pop(0))
+                    break
+            if len(chosen) >= limit:
+                break
     return sorted(chosen, key=lambda c: candidates.index(c))
 
 

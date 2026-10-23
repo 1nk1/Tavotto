@@ -242,6 +242,46 @@ class Dedup(unittest.TestCase):
         singles = [c for c in generated["candidates"] if len(c["chain"]) == 1]
         self.assertTrue(all(c["parent"]["case"] == "twin_a" for c in singles))
 
+    def spec_parent(self, case, **spec) -> xt.Parent:
+        parent = fake_parent(case)
+        return xt.Parent(
+            parent.suite, case, parent.category, parent.files, parent.script, parent.entry,
+            parent.executable, parent.provenance, {"id": case, "notes": case, **spec},
+        )  # fmt: skip
+
+    def test_parents_sharing_a_script_but_judged_differently_each_keep_their_candidates(self):
+        """一个脚本服务多个 must 用例（ca_basic_series.py）：stem / 期望 / 变更不同就是不同的测试（Codex #1368 P2）。"""
+        a = self.spec_parent(
+            "case_a", stem="fig_a", mutations=[{"gid": "g", "prop": "p", "value": 1}]
+        )
+        b = self.spec_parent(
+            "case_b", stem="fig_b", mutations=[{"gid": "g", "prop": "p", "value": 2}]
+        )
+        generated = xt.generate(1, [a, b])
+        self.assertEqual(generated["dropped_duplicates"], [])
+        by_parent = {"case_a": 0, "case_b": 0}
+        for c in generated["candidates"]:
+            by_parent[c["parent"]["case"]] += 1
+        self.assertGreater(by_parent["case_a"], 0)
+        singles = {
+            case: {
+                c["chain"][0]["name"]
+                for c in generated["candidates"]
+                if len(c["chain"]) == 1 and c["parent"]["case"] == case
+            }
+            for case in by_parent
+        }
+        self.assertEqual(singles["case_a"], singles["case_b"])
+        self.assertGreater(len(singles["case_b"]), 0)
+
+    def test_parents_judged_the_same_still_collapse_whatever_their_ids(self):
+        a = self.spec_parent("case_a", stem="fig", expected={}, mutations=[])
+        b = self.spec_parent("case_b", stem="fig", expected={}, mutations=[])
+        generated = xt.generate(1, [a, b])
+        self.assertGreater(len(generated["dropped_duplicates"]), 0)
+        singles = [c for c in generated["candidates"] if len(c["chain"]) == 1]
+        self.assertTrue(all(c["parent"]["case"] == "case_a" for c in singles))
+
     def test_coverage_exposes_bias_by_family_axis_and_parent_category(self):
         cov = xt.generate(1)["coverage"]
         self.assertGreaterEqual(len(cov["by_family"]), 7)
@@ -250,12 +290,13 @@ class Dedup(unittest.TestCase):
             self.assertIn("axis", fam)
         self.assertIn("script_shapes", cov["parents"]["used_by_manifest_category"])
         self.assertGreater(cov["parents"]["corpus_by_manifest_category"]["core_artists"], 0)
-        # 偏向说明：父本现在覆盖 core_artists / axes_layout，仍然没有 metamorphic / scientific_stack
+        # CG-08：父本按规则选（tier=must 且无声明为假的阶段），四类都有；metamorphic 在语料里没有 must 用例
         used = cov["parents"]["used_by_manifest_category"]
-        self.assertIn("core_artists", used)
-        self.assertIn("axes_layout", used)
+        for category in ("script_shapes", "core_artists", "axes_layout", "scientific_stack"):
+            self.assertGreater(used[category], 0, category)
         self.assertNotIn("metamorphic", used)
-        self.assertNotIn("scientific_stack", used)
+        self.assertEqual(cov["parents"]["categories_without_parent"], ["metamorphic"])
+        self.assertEqual(cov["pairwise"]["covered"], cov["pairwise"]["feasible"])
         self.assertIn("bias_note", cov)
         self.assertEqual(set(cov["by_class"]), {"shape_preserving", "axis_changing"})
 
