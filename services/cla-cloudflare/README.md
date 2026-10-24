@@ -78,7 +78,24 @@ Refresh is limited to the same head and an existing, exactly identified owned ch
 
 Resource limits remain 20 work SQL statements / 40 total and 35 work external calls / 40 total per invocation. Dispatch needs 13 + 2N work SQL statements, where N is the number of non-exempt contributors. Confirmation needs 14 + 2N, plus two reserved reads if withdrawal becomes necessary. Consequently this initial automatic refresh path admits at most two non-exempt contributors. More contributors or complex remote reads can exhaust the unchanged budget: no fresh publication is sent, retries are bounded to three with 60-second backoff, then manual review is required. This is a resource/capability boundary, not a negative legal or eligibility determination. There is no automatic clearing of manual states.
 
-Dynamic success-publication-across-expiry integration validation is not part of this candidate's passing evidence. New tests are restricted to offline rejection, budget, durable deduplication and uncertainty handling with failed proposals; they do not establish successful end-to-end refresh behavior. Live GitHub/Cloudflare acceptance and the excluded integration scenario remain activation gates.
+The [offline lifecycle acceptance](../../docs/implementation/cla-offline-acceptance/README.md)
+now exercises successful synthetic publication, independent confirmation, expiry
+withdrawal, exact negative-witness release, fresh same-head publication and both
+CI authority reads, with personal and delegated evidence. It also covers lost
+responses without replay and OAuth consume-time expiry. The native adapter,
+journal and verifiers execute against an in-process peer and SQLite; this is not
+live GitHub/Cloudflare acceptance or actual CPU evidence. The default-off native
+merge-group path now has synthetic positive publication, recovery, authority and
+CI coverage as described in that evidence. It reuses the complete-prefix reader,
+existing outbox/journal and shared confirmation slot; no workflow is activated.
+Group publication reserves 14 fixed/withdrawal work SQL plus qualification cost;
+the SQL ceiling is three personal or two delegated non-exempt contributors, with
+the full two-person lifecycle verified in both modes and every prefix member
+retained. These are whole-group bounds, not per-wakeup batches. Unissued SQL/HTTP
+capacity exhaustion now uses three bounded retries and retains the exhausted
+outbox; a busy shared slot remains a durable wait. No stale qualification cache
+is reused across wakeups. Real
+queue-schema/permission, CPU, D1, OAuth and timing acceptance remain separate gates.
 
 ### Public endpoints: abuse limits and pinned agreement asset
 
