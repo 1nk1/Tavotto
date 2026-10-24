@@ -1382,6 +1382,10 @@ export default interface Resources {
       "reprobe": "重新试运行",
       "rescan": "重新扫描",
       "retry": "重试",
+      "revealFailed": "没能打开文件管理器。这张图在：{{path}}",
+      "revealInExplorer": "在文件资源管理器中显示",
+      "revealInFileManager": "在文件管理器中显示",
+      "revealInFinder": "在 Finder 中显示",
       "running": "运行中…",
       "scanUnavailable": "没能读完项目里的脚本，状态可能不完整。",
       "scope": {

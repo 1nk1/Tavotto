@@ -887,6 +887,10 @@
     "reprobe": "Run again",
     "rescan": "Rescan",
     "retry": "Try again",
+    "revealFailed": "Couldn't open the file manager. This figure is at: {{path}}",
+    "revealInExplorer": "Show in File Explorer",
+    "revealInFileManager": "Show in file manager",
+    "revealInFinder": "Show in Finder",
     "running": "Running…",
     "scanUnavailable": "Couldn’t read the project’s scripts. The status below may be incomplete.",
     "scope": {
