@@ -81,6 +81,11 @@ class FixContext:
     call_meta: dict = field(default_factory=dict)
     #: 本会话允许的档；裸构造只放行 observe（只读），修复会话用 `for_fix_session` 加上 run
     allowed_tiers: frozenset[str] = frozenset({"observe"})
+    #: 用户在 `propose_fix` 卡上已同意安装的包：规范名 -> 同意它的那一步（`install_packages` 名单外的包只要都在这里就不再问第二遍）
+    approved_installs: dict = field(default_factory=dict)
+    #: 本会话持有的环境租约 `[(解释器, 租约 id)]`：`change_python` 动手前给项目当前用的受管环境那一代加租约（`envlease`），
+    #: 换到新一代后 `retire_unused` 才不会删掉旧代、`rollback` 才有地方回去；会话收尾时 `release_leases()`
+    leases: list = field(default_factory=list)
     #: 项目外的读取清单（供卡片详情列出）
     reads: list[dict] = field(default_factory=list)
     step: int = 0
@@ -103,6 +108,19 @@ class FixContext:
         """修复会话的构造帮手：放行 `FIX_SESSION_TIERS`（需要用户点头的动作由各工具经 `ctx.ask` 把关）；其余字段同构造。"""
         kw.setdefault("allowed_tiers", FIX_SESSION_TIERS)
         return cls(session_id=session_id, project_root=project_root, **kw)
+
+    def release_leases(self, only: list[tuple[str, str]] | None = None) -> None:
+        """释放本会话的环境租约（幂等）。不带参数 = 全部，会话任何一种收尾（finish / 取消 / 失败 / 自动取消）都要调；
+        `only` = 只放这几条（一次换代失败时撤销它自己新加的，此前成功换代保留的不动）。"""
+        from .. import envlease
+
+        if only is None:
+            leases, self.leases = self.leases, []
+        else:
+            leases = [x for x in only if x in self.leases]
+            self.leases = [x for x in self.leases if x not in leases]
+        for python, owner in leases:
+            envlease.release_retain(python, owner)
 
     def python_of(self, env_id: object) -> str | None:
         return self.environments.get(env_id) if isinstance(env_id, str) else None

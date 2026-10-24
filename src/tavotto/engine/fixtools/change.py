@@ -8,9 +8,7 @@
   （`autoinstall_dists.txt`，PyPI 公开下载量生成）：名单内不问，名单外与 `select_environment` 经 `ctx.ask` 问用户。
 * 切运行方式：`execpolicy.set_mode`（项目级 `execution_policy`；`safe` = `safe_only`，`native` = `compatible`，即允许 safe 被自己的守卫拦下时回退 native）。
 * 换环境：`projectenv.remember(..., automatic=False)`（与界面「选择运行环境」同一个写入）。
-* 换 Python：缺省执行器 = `pyversionfix`（`executors._default_python_changer`，只在 Tavotto 自己的受管环境里另建），
-  `FixContext.python_changer` 可注入替换（测试一律用假的）。
-* 转写：执行器由 `FixContext.script_converter` 注入，没有就 `unavailable`；本模块不自己造。
+* 换 Python / 转写：执行器由 `FixContext` 注入（`python_changer` / `script_converter`），没有就 `unavailable`；本模块不自己造。
 
 所有会改东西的工具在执行前打快照（`snapshots.py`），快照 id 进审计行与工具返回，`rollback` 用它恢复。
 **没有 `ctx.ask`（无界面）= 未获同意**：需要点头的动作一律 `needs_approval`，审计记 `blocked`。
@@ -87,6 +85,10 @@ def _forget_env_caches(ctx: FixContext) -> None:
 
 
 # --------------------------------------------------------------------------- install_packages
+def canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
 def install_packages(ctx: FixContext, args: dict) -> ToolResult:
     from .. import convertdeps, depresolve
 
@@ -127,7 +129,12 @@ def install_packages(ctx: FixContext, args: dict) -> ToolResult:
             "Choose another environment (list_environments) or create one with change_python.",
         )
     outside = sorted({n for n in names if not convertdeps.in_allowlist(n)})
-    if outside:  # 名单外 = user_env：一律问
+    agreed = [ctx.approved_installs.get(canonical_name(n)) for n in outside]
+    if outside and all(a is not None for a in agreed):
+        # 这些包用户已在 propose_fix 卡上点过头（完全同名才算）：不再弹第二张卡，审计记 user 与同意它的那一步
+        ctx.call_meta["approved_by"] = "user"
+        ctx.call_meta["approved_step"] = max(a for a in agreed if a is not None)
+    elif outside:  # 名单外 = user_env：一律问
         denied = approve(
             ctx,
             "install_packages",
@@ -199,27 +206,74 @@ def switch_execution(ctx: FixContext, args: dict) -> ToolResult:
 
 
 # --------------------------------------------------------------------------- change_python
+def _script_rel(ctx: FixContext) -> str:
+    """被诊断脚本的项目相对路径（执行器据此读脚本声明的 `requires-python`）；没有脚本回空串。"""
+    if ctx.script_path is None:
+        return ""
+    try:
+        return Path(ctx.script_path).relative_to(ctx.project_root).as_posix()
+    except ValueError:
+        return ""
+
+
+def _lease_current_environment(ctx: FixContext) -> list[tuple[str, str]]:
+    """项目当前用的受管环境那一代，在本修复会话结束前加**保留型**租约（`envlease.acquire_retain`）：
+    换到新一代后 `managedenv.retire_unused` 经 `deprepair._generation_in_use` 看到它就不删旧代，`rollback` 才能把项目指回去。
+    保留型不挡换代事务自己的 `envlease.mutating()`（用 native 租约会把 `change_python` 自己挡死）。"""
+    from .. import envlease, managedenv, projectenv
+
+    root = ctx.project_root
+    targets: list[str] = []
+    active = managedenv.python_of(root)
+    if active:
+        targets.append(str(active))
+    try:
+        remembered = projectenv.remembered(root)
+    except Exception:  # noqa: BLE001 - 取不到只是少租一个
+        remembered = None
+    if remembered and managedenv.is_managed_python(root, remembered):
+        targets.append(str(remembered))
+    owner = f"fix:{ctx.session_id}"
+    added: list[tuple[str, str]] = []
+    for python in dict.fromkeys(targets):
+        if (python, owner) in ctx.leases:
+            continue  # 本会话此前的换代已经保留着它
+        envlease.acquire_retain(python, owner)
+        ctx.leases.append((python, owner))
+        added.append((python, owner))
+    return added
+
+
 def change_python(ctx: FixContext, args: dict) -> ToolResult:
     version = args.get("version")
-    if not isinstance(version, str) or not _VERSION_RE.fullmatch(version.strip()):
-        return err("bad_arguments", "`version` must look like `3.12` or `3.12.4`.")
+    if version is not None and (
+        not isinstance(version, str) or not _VERSION_RE.fullmatch(version.strip())
+    ):
+        return err("bad_arguments", "`version` must look like `3.12` or `3.12.4`, or be left out.")
+    version = version.strip() if isinstance(version, str) else None
     bad = _snapshot_or_error(ctx, "change_python")
     if bad is not None:
         return bad
-    req = {"version": version.strip(), "project": str(ctx.project_root)}
-    if ctx.script_path is not None and _inside(ctx.project_root, Path(ctx.script_path)):
-        # 脚本 / 项目声明的 requires-python 要与所要的版本求交（冲突就不换）
-        rel = os.path.relpath(os.path.realpath(ctx.script_path), os.path.realpath(ctx.project_root))
-        req["script"] = rel.replace(os.sep, "/")
-    res = executors.run_python_changer(ctx, req)
+    added = _lease_current_environment(ctx)
+    res = executors.run_python_changer(
+        ctx,
+        {
+            "version": version,  # None = 由执行器按脚本 / 项目声明和 Tavotto 支持区间挑
+            "project": str(ctx.project_root),
+            "script": _script_rel(ctx),
+        },
+    )
     if not res.get("ok"):
+        # 没换成：只撤销**这一次**新加的租约；本会话此前成功换代保留的旧代要留到会话收尾，否则它的快照回滚不了
+        ctx.release_leases(added)
         return err(
             str(res.get("code") or "change_python_failed")[:60],
             _with_snapshot(
                 ctx, str(res.get("message") or "The new environment could not be created.")
             ),
         )
-    text = str(res.get("message") or f"Created a Tavotto environment with Python {version}.")
+    shown = version or str(res.get("to") or "")
+    text = str(res.get("message") or f"Created a Tavotto environment with Python {shown}.")
     python = res.get("python")
     if isinstance(python, str) and python:
         from .. import userenvs
@@ -230,7 +284,7 @@ def change_python(ctx: FixContext, args: dict) -> ToolResult:
         )
         text += f"\nnew environment id: {eid}"
     _forget_env_caches(ctx)
-    return _done(ctx, text, f"python {version}")
+    return _done(ctx, text, f"python {shown or 'new'}")
 
 
 # --------------------------------------------------------------------------- select_environment
@@ -447,9 +501,14 @@ CHANGE_TOOLS: tuple[FixTool, ...] = (
     ),
     FixTool(
         "change_python",
-        "Create a Tavotto-managed environment with another Python version for this project (for example when "
-        "the packages need Python 3.12). Does not touch the user's own Pythons. Takes a snapshot.",
-        obj({"version": {"type": "string", "description": "For example `3.12`."}}, ["version"]),
+        "Create a Tavotto-managed Python environment for this project, also installing what the script imports. Use it "
+        "when there is no usable environment (list_environments is empty, or none can run the script) or when the "
+        "packages need another Python version. Does not touch the user's own Pythons. Takes a snapshot; the result "
+        "gives the new environment id for install_packages / try_run. `version` is optional (for example `3.12`): "
+        "leave it out and Tavotto picks one that suits the script and the project.",
+        obj(
+            {"version": {"type": "string", "description": "Optional, for example `3.12`."}},
+        ),
         change_python,
         tier="tavotto",
     ),

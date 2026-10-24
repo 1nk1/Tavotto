@@ -3219,6 +3219,8 @@ export interface AiFixCard {
   details?: string
   reads?: string[]
   not_read?: string
+  /** `propose_fix` 说明将要安装的包（规范名 + 版本约束）；用户确认后同名的包不再二次确认 */
+  packages?: string[]
   options?: { id: string; label: string }[]
   allow_other?: boolean
   pick?: 'file' | 'dir'
@@ -3238,6 +3240,10 @@ export interface AiFixState {
   reason: string
   steps: number
   seq: number
+  /** 最近一次工具活动（界面按 tool 映射成一句话）；还没有 = null。`detail` 只可能是包名 / 模块名 */
+  activity?: { tool: string; phase: 'start' | 'end' | 'denied'; detail: string; at_ms: number } | null
+  /** 现在卡住了：`reason` 闭集；没卡住 = null */
+  stalled?: { reason: 'cli_waiting_approval' | 'cli_tool_not_delivered' | 'stalled'; detail: string } | null
 }
 
 /** 三个读写都可显式指定项目（`pj`）：切项目之后要取消 / 重读的是发起时那个项目的修复，不是当前项目的 */

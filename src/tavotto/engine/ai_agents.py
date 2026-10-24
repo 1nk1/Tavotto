@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -183,6 +184,58 @@ class SpawnSpec:
 
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
+
+
+def toml_string(text: str) -> str:
+    """TOML 基本字符串。不用 `json.dumps`：它对非 BMP 字符（🧪）输出 UTF-16 代理对转义，TOML 不接受。
+    这里：`\\` `"` 与全部控制字符（含 DEL）转义，其余 Unicode 原样（命令行经 UTF-8 传递）。"""
+    out = ['"']
+    for ch in text:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif o in (8, 9, 10, 12, 13):
+            out.append({8: "\\b", 9: "\\t", 10: "\\n", 12: "\\f", 13: "\\r"}[o])
+        elif o < 0x20 or o == 0x7F:
+            out.append(f"\\u{o:04X}")
+        else:
+            out.append(ch)
+    out.append('"')
+    return "".join(out)
+
+
+def toml_value(value: object) -> str:
+    if isinstance(value, str):
+        return toml_string(value)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    raise TypeError(type(value).__name__)
+
+
+@dataclass(frozen=True)
+class FixRunContext:
+    """「使用你的 AI 来修复」经 MCP 起 CLI 的输入（ADR 0149 D3）。**这里没有任何密钥**：令牌只以环境变量**名**出现，
+    值由调用方放进子进程环境（`SpawnSpec.env` 之外的那一份），绝不进 argv。"""
+
+    argv: list[str]  # 已通过启动验证的 CLI 启动 argv
+    prompt: str
+    cwd: str
+    #: 本地 MCP 修复模式服务的启动命令（可执行文件 + 参数，不含令牌）
+    mcp_command: list[str]
+    #: MCP 服务在 CLI 配置里的名字；工具在 Claude 里叫 `mcp__<名字>__<工具>`
+    mcp_name: str
+    #: 令牌所在的环境变量名（CLI 要把它转交给 MCP 子进程）
+    token_env: str
+    #: 单次工具调用的上限秒数（要比弹卡等用户的上限长）
+    tool_timeout_s: int
+    #: 硬拦表（`fixtools.readscope.deny_spec()` 的结果）；适配器把它翻成自家的权限语法
+    deny: dict = field(default_factory=dict)
+    endpoint_args: list[str] = field(default_factory=list)
+    endpoint_env: dict[str, str] = field(default_factory=dict)
+    #: 用户给这个 Agent 选了第三方接口时的型号（接口自己的型号名）；官方登录态为 None（CLI 用自己的默认）
+    model: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +524,16 @@ class AgentDefinition:
     def build_command(self, ctx: RunContext) -> SpawnSpec:
         raise NotImplementedError
 
+    def build_fix_command(self, ctx: FixRunContext) -> SpawnSpec | None:
+        """AI 修复会话里起 CLI 的命令（MCP 接法，ADR 0149 D3）。**默认 None = 不支持**。"""
+        return None
+
+    def fix_event_parser(self) -> Callable[[str], list[dict]] | None:
+        """修复会话读 CLI 结构化输出（stdout 一行一个事件）用的解析器工厂；每次会话取一个新的（可带状态）。
+        解析器把一行变成 0..n 个 `{"kind": "mcp_begin"|"mcp_end"|"approval"|"denied"|"output", "tool": 工具名(不带前缀)}`。
+        **事件只用来显示进度和发现卡住，从不当结论**（结论只认 `finish` 工具）。默认 None = 不解析。"""
+        return None
+
     def classify_event(self, line: str, state: dict) -> list[tuple[str, str]]:
         raise NotImplementedError
 
@@ -680,6 +743,75 @@ class CodexAgent(AgentDefinition):
         if ctx.effort and _effort_supported(self._catalog(), ctx.model, ctx.effort):
             cmd += ["-c", f"model_reasoning_effort={ctx.effort}"]
         return SpawnSpec(cmd + [ctx.prompt], dict(ctx.endpoint_env))
+
+    def build_fix_command(self, ctx: FixRunContext) -> SpawnSpec | None:
+        """修复会话：`--sandbox read-only`（Codex 自带的命令行读不受限、写被沙盒拦——维护者已知并接受，ADR 0149 D3），
+        MCP 服务只出现在**本次**的 `-c mcp_servers.<名>.…` 里（TOML 值；绝不写 `~/.codex/config.toml`）。令牌不在 argv：
+        `env_vars` 只列变量**名**，值由 Codex 从它自己的环境转给 MCP 子进程。"""
+        pre = f"mcp_servers.{ctx.mcp_name}"
+
+        def toml(value: object) -> str:
+            return toml_value(value)
+
+        cmd = [
+            *ctx.argv,
+            "exec",
+            "-C",
+            ctx.cwd,
+            "--json",  # JSONL 事件：只用来显示进度 / 发现卡住，不当结论
+            "--sandbox",
+            "read-only",
+            "--skip-git-repo-check",
+            "-c",
+            f"{pre}.command={toml(ctx.mcp_command[0])}",
+            "-c",
+            f"{pre}.args={toml(list(ctx.mcp_command[1:]))}",
+            "-c",
+            f"{pre}.env_vars={toml([ctx.token_env])}",
+            "-c",
+            f"{pre}.tool_timeout_sec={int(ctx.tool_timeout_s)}",
+            "-c",
+            f"{pre}.startup_timeout_sec=60",
+            # 本服务的工具一律免 Codex 自己的审批（exec 模式没人点，不放行就一直挂着——10-24 真机跑出来的）；
+            # 要用户点头的改动由 Tavotto 自己弹卡（fixtools 的档位 + ctx.ask），不靠 Codex 这一层
+            "-c",
+            f'{pre}.default_tools_approval_mode="approve"',
+            "-c",
+            'approval_policy="never"',
+        ]
+        cmd += ctx.endpoint_args
+        if ctx.endpoint_args:
+            # Tavotto 已把 provider（-c model_provider…）和型号都显式给了：不再加载用户的 config.toml——
+            # 去掉用户自己的 MCP 服务与 hooks（它们会被拉进修复会话），登录态仍在 CODEX_HOME，Tavotto 不读。
+            # 官方登录态（没有 endpoint_args）不加：默认型号 / 认证方式可能就写在用户 config.toml 里，忽略它会换掉用户的设定
+            cmd += ["--ignore-user-config"]
+            if ctx.model:
+                cmd += ["-m", ctx.model]
+        return SpawnSpec(cmd + [ctx.prompt], dict(ctx.endpoint_env))
+
+    def fix_event_parser(self) -> Callable[[str], list[dict]] | None:
+        def parse(line: str) -> list[dict]:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                return []
+            if not isinstance(ev, dict):
+                return []
+            etype = str(ev.get("type", ""))
+            item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+            itype = str(item.get("type") or item.get("item_type") or "")
+            tool = str(item.get("tool") or ev.get("tool") or "")
+            low = (etype + " " + itype).lower()
+            if "approval" in low or "elicitation" in low:
+                return [{"kind": "approval", "tool": tool}]
+            if "mcp" in itype.lower() and str(item.get("server") or "tavotto_fix") == "tavotto_fix":
+                if etype.endswith(".started") or etype.endswith("begin"):
+                    return [{"kind": "mcp_begin", "tool": tool}]
+                if etype.endswith(".completed") or etype.endswith("end"):
+                    return [{"kind": "mcp_end", "tool": tool}]
+            return [{"kind": "output", "tool": ""}]
+
+        return parse
 
     def classify_event(self, line: str, state: dict) -> list[tuple[str, str]]:
         try:
@@ -902,6 +1034,138 @@ class ClaudeAgent(AgentDefinition):
         if ctx.effort and not (ctx.endpoint_args or ctx.endpoint_env) and self._effort_ok(ctx):
             cmd += ["--effort", ctx.effort]
         return SpawnSpec(cmd, dict(ctx.endpoint_env))
+
+    #: 修复会话里允许 Claude 自带命令行跑的只读命令（`Bash(<命令>)` 与 `Bash(<命令> *)` 各一条）。**故意不含 cat / head / tail / grep**：
+    #: 它们能绕过 `Read` 的 deny 去读凭据位置，读内容走 `Read` / `Grep` / `Glob`（有 deny 表）或 MCP 的 read_file。
+    FIX_READONLY_COMMANDS = (
+        "ls",
+        "pwd",
+        "which",
+        "file",
+        "stat",
+        "wc",
+        "uname",
+        "pip list",
+        "pip freeze",
+        "pip show",
+        "conda list",
+        "conda env list",
+    )
+    #: 精确匹配的只读命令（带参数就不是它了）
+    FIX_READONLY_EXACT = (
+        "python --version",
+        "python3 --version",
+        "python -V",
+        "pip --version",
+    )
+
+    def fix_permissions(self, deny: dict, mcp_name: str) -> dict:
+        """`--settings` 的 `permissions`：允许 MCP 工具与只读的读文件 / 只读命令，其余（写文件、联网、其它命令）一律拒；
+        `deny` 里的凭据位置不许 `Read`（Claude 把 Read 规则也用在 Grep / Glob 上）。表是 `readscope.deny_spec()` 现生成的，
+        不在这里抄第二份。`~/x` = 主目录相对，`//x` = 绝对路径，`**/x` = 相对工作目录的任意深度；文件名类再给 `//**/x` 覆盖工作目录之外。"""
+        rules: list[str] = []
+        for rel in deny.get("home_relative", ()):
+            rules += [f"Read(~/{rel})", f"Read(~/{rel}/**)"]
+        for pat in deny.get("names", ()):
+            rules += [f"Read(**/{pat})", f"Read(//**/{pat})"]
+        for ab in deny.get("absolute", ()):
+            rules.append("Read(//" + str(ab).replace("\\", "/").lstrip("/") + ")")
+        rules += [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "WebFetch",
+            "WebSearch",
+        ]  # Claude Code 2.1 已没有 MultiEdit（写了会报「matches no known tool」）
+        rules += ["Bash(*>*)", "Bash(*tee *)", "Bash(*sed -i*)", "Bash(*-exec*)"]
+        allow = [f"mcp__{mcp_name}__*", "Read", "Grep", "Glob"]
+        for c in self.FIX_READONLY_COMMANDS:
+            allow += [f"Bash({c})", f"Bash({c} *)"]
+        allow += [f"Bash({c})" for c in self.FIX_READONLY_EXACT]
+        return {"allow": allow, "deny": rules}
+
+    def build_fix_command(self, ctx: FixRunContext) -> SpawnSpec | None:
+        """修复会话：权限与 MCP 配置都只经**本次**启动参数（`--settings` / `--mcp-config` JSON 字符串，加 `--strict-mcp-config`
+        不读别处的 MCP），不写 `~/.claude`。`dontAsk` = 没明确允许的工具一律拒、不弹确认。令牌只以 `${变量名}` 出现在 MCP 的 env 里，
+        值由 Claude 从它自己的环境展开。"""
+        mcp = {
+            "mcpServers": {
+                ctx.mcp_name: {
+                    "type": "stdio",
+                    "command": ctx.mcp_command[0],
+                    "args": list(ctx.mcp_command[1:]),
+                    "env": {ctx.token_env: "${" + ctx.token_env + "}"},
+                }
+            }
+        }
+        settings = {"permissions": self.fix_permissions(ctx.deny, ctx.mcp_name)}
+        cmd = [
+            *ctx.argv,
+            "-p",
+            ctx.prompt,
+            "--output-format",
+            "stream-json",  # 一行一个事件：只用来显示进度 / 发现权限拒绝，不当结论
+            "--verbose",
+            "--permission-mode",
+            "dontAsk",
+            "--allowedTools=mcp__" + ctx.mcp_name + "__*",
+            "--settings",
+            json.dumps(settings),
+            "--mcp-config",
+            json.dumps(mcp),
+            "--strict-mcp-config",
+        ]
+        cmd += ctx.endpoint_args
+        env = {"MCP_TOOL_TIMEOUT": str(int(ctx.tool_timeout_s) * 1000), **ctx.endpoint_env}
+        if ctx.model and ctx.endpoint_env:
+            cmd += ["--model", ctx.model]
+        return SpawnSpec(cmd, env)
+
+    def fix_event_parser(self) -> Callable[[str], list[dict]] | None:
+        prefix = "mcp__tavotto_fix__"
+        names: dict[str, str] = {}  # tool_use id -> 工具名
+
+        def parse(line: str) -> list[dict]:
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                return []
+            if not isinstance(ev, dict):
+                return []
+            out: list[dict] = []
+            t = str(ev.get("type", ""))
+            content = (
+                (ev.get("message") or {}).get("content")
+                if isinstance(ev.get("message"), dict)
+                else None
+            )
+            for block in content if isinstance(content, list) else ():
+                if not isinstance(block, dict):
+                    continue
+                if t == "assistant" and block.get("type") == "tool_use":
+                    name = str(block.get("name") or "")
+                    names[str(block.get("id") or "")] = name
+                    if name.startswith(prefix):
+                        out.append({"kind": "mcp_begin", "tool": name[len(prefix) :]})
+                elif t == "user" and block.get("type") == "tool_result":
+                    name = names.get(str(block.get("tool_use_id") or ""), "")
+                    text = block.get("content")
+                    text = text if isinstance(text, str) else json.dumps(text)[:400]
+                    if block.get("is_error") and "permission" in text.lower():
+                        out.append({"kind": "denied", "tool": name.removeprefix(prefix)})
+                    elif name.startswith(prefix):
+                        out.append({"kind": "mcp_end", "tool": name[len(prefix) :]})
+            for d in ev.get("permission_denials") or ():
+                if isinstance(d, dict):
+                    out.append(
+                        {
+                            "kind": "denied",
+                            "tool": str(d.get("tool_name") or "").removeprefix(prefix),
+                        }
+                    )
+            return out or [{"kind": "output", "tool": ""}]
+
+        return parse
 
     def _effort_ok(self, ctx: RunContext) -> bool:
         details, _families, _aliases = self._catalog()

@@ -9,17 +9,24 @@
   回答按卡种类校验（`approve` → yes/no；`choice` → 选项 id / other / skip；`pick` → skip 或路径；`send` → sent/no）。
 * **预算**：步数 / 墙钟（用户思考的时间也算在墙钟里）/ token；`finish` 之后不再请求模型。
 * 结束后由前端重跑准备会话验证——本模块不替用户判「修好了」，`finish(fixed)` 只是 AI 的说法。
+
+**CLI 连接（D3，ADR 0149 修订）**：只连了 Codex / Claude Code 时，同一个会话改为起那个 CLI（`ai_bridge.fix_cli_command`），
+它经 MCP 修复模式（`fixmcp.py`）回调本会话的 `call_tool` / `tool_list`——工具仍在**本进程**里由 `run_tool` 执行
+（卡片、快照、审计、项目作用域与内置循环是同一份）。回调凭本次会话的 scoped token（`secrets` 生成、`compare_digest`、
+只认本会话、会话结束 / 取消即失效）。CLI 的 stdout 一个字不当结论，结论只认 `finish` 工具；退出时没调 `finish` = `failed`。
 """
 
 from __future__ import annotations
 
 import logging
 import secrets
+import subprocess
+import sys
 import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import fixtools
@@ -40,6 +47,16 @@ FIX_LIMITS = Limits(
 )
 KEEP_SESSIONS = 8
 CARD_KINDS = ("approve", "choice", "pick", "send")
+
+#: 卡住检测（秒；测试里改小）。ADR 0149 D3：任何一种模式都不许静默挂着
+DELIVER_WAIT = 20.0  # CLI 报「MCP 工具调用开始」后应用这边这么久没收到回调 = 工具没送达（多半在等 CLI 自己的审批）
+STALL_IDLE = 120.0  # 没有工具在跑、没有 CLI 输出 / 模型事件这么久 = 卡住
+STALL_HARD = 300.0  # 卡住持续这么久自动取消，outcome=failed，原因码 = 卡住的原因
+FORCE_SETTLE = 10.0  # 自动取消后内置循环（模型请求挂住）还没返回，这么久后强行收尾
+WATCH_TICK = 0.5
+STALL_APPROVAL = "cli_waiting_approval"
+STALL_NOT_DELIVERED = "cli_tool_not_delivered"
+STALL_IDLE_CODE = "stalled"
 
 STATE_RUNNING = "running"
 STATE_WAITING = "waiting"
@@ -70,8 +87,15 @@ inspect_environment, list_environments, read_logs, lookup_package) until you kno
 2. TRY next. try_import and try_run run things in a throw-away copy and change nothing. Use them to confirm a theory \
 before you change anything.
 3. CHANGE only what you must, and only with the tools you are given. Before any change to the user's environment \
-or files, call propose_fix with ONE plain sentence and wait: if the user declines, do not do it. Tavotto takes a \
+or files, call propose_fix with ONE plain sentence (and, if it installs anything, the package names in `packages`) and wait: if the user declines, do not do it. Tavotto takes a \
 snapshot before each change so it can be rolled back; if a change did not help, roll it back.
+3b. NO USABLE ENVIRONMENT. If list_environments shows none, or no environment can run this script, do NOT give up. \
+First call propose_fix with ONE plain sentence that states the whole plan, and put every package you will install in `packages` (the user confirms once; install_packages will not ask again for those exact names), for example "This project has no Python \
+environment that works yet. I will create one just for it and install colorcet." If the user agrees: call \
+change_python (it creates a Tavotto-managed environment and installs what the script imports; leave `version` out \
+unless you know one is needed), then install_packages for anything still missing into the environment id that \
+change_python returned, then try_run to check, then finish with outcome `fixed`. Only if that path fails call \
+prepare_diagnostics and finish with `not_fixed`.
 4. If you need something only the user knows, use ask_user (a multiple-choice question) or pick_file (the system file \
 chooser). Never ask for a password, key or token.
 5. If you cannot fix it, call prepare_diagnostics with a short note of what you found and tried (the user decides \
@@ -85,6 +109,19 @@ more than twice.
 """
 
 
+def activity_detail(args: object) -> str:
+    """进度那一句话里点名的东西（包名 / 模块名）：只取这几个键、短、脱敏；其余参数不进进度。"""
+    if not isinstance(args, dict):
+        return ""
+    for key in ("packages", "package", "module", "name"):
+        v = args.get(key)
+        if isinstance(v, list):
+            v = ", ".join(str(x) for x in v[:4])
+        if isinstance(v, str) and v.strip():
+            return fixtools.scrub(v.strip())[:60]
+    return ""
+
+
 def _first_message(ctx: fixtools.FixContext, script: str) -> str:
     report = read_run_report(ctx, {})
     body = report.content if not report.is_error else "(no report available; call read_run_report)"
@@ -94,17 +131,59 @@ def _first_message(ctx: fixtools.FixContext, script: str) -> str:
     )
 
 
+#: CLI 没有「系统提示」入口（Codex 没有、Claude 有但各家不一），所以和内置循环**同一份**提示词放在最前面，后面补这一段
+CLI_ADDENDUM = """\
+
+You are running inside a command-line AI tool. Your repair tools are the MCP tools of the server `tavotto_fix` \
+(read_run_report, read_file, try_run, propose_fix, finish, ...): use them for everything, and above all for every change. \
+Your own shell and editor are read-only here and anything done with them is neither recorded nor undoable. \
+What you write in your reply is not shown to the user: the only way to report the result is the `finish` tool.
+"""
+#: 提示词进命令行（Windows 约 32 KB 上限）：准备报告太长就截断，让模型自己调 read_run_report 读全文
+CLI_PROMPT_MAX = 12000
+
+
+def cli_prompt(ctx: fixtools.FixContext, script: str) -> str:
+    text = SYSTEM_PROMPT + CLI_ADDENDUM + "\n" + _first_message(ctx, script)
+    if len(text) > CLI_PROMPT_MAX:
+        text = text[:CLI_PROMPT_MAX] + "\n[truncated; call read_run_report for the full report]"
+    return text
+
+
 class FixToolset:
     """`loop.run` 要的任务工具集：每次会话现建，工具带本次会话的 `FixContext`。"""
 
     task_type = "fix_environment"
     default_limits = FIX_LIMITS
 
-    def __init__(self, ctx: fixtools.FixContext, script: str, audit: AuditLog | None = None):
+    def __init__(
+        self,
+        ctx: fixtools.FixContext,
+        script: str,
+        audit: AuditLog | None = None,
+        on_activity: Callable[[str, str, str], None] | None = None,
+    ):
         self.ctx, self.script, self.audit = ctx, script, audit
+        self.on_activity = on_activity
 
     def tools(self, envelope: RunEnvelope) -> list[Tool]:
-        return fixtools.build_agent_tools(self.ctx, self.audit)
+        tools = fixtools.build_agent_tools(self.ctx, self.audit)
+        if self.on_activity is None:
+            return tools
+        note = self.on_activity
+
+        def wrap(t: Tool) -> Tool:
+            def handler(args: dict, _inner=t.handler, _name=t.name):
+                detail = activity_detail(args)
+                note(_name, "start", detail)
+                try:
+                    return _inner(args)
+                finally:
+                    note(_name, "end", detail)
+
+            return replace(t, handler=handler)
+
+        return [wrap(t) for t in tools]
 
     def first_message(self, envelope: RunEnvelope) -> str:
         return _first_message(self.ctx, self.script)
@@ -139,6 +218,24 @@ class _Pending:
 
 
 @dataclass
+class CliLaunch:
+    """起 CLI 所需的一切（命令行里没有令牌；令牌只在 `env` 里）。"""
+
+    argv: list[str]
+    env: dict[str, str]
+    cwd: str
+    #: CLI 结构化输出的逐行解析器（`AgentDefinition.fix_event_parser()`）；只用来显示进度 / 发现卡住，从不当结论
+    parse: Callable[[str], list[dict]] | None = None
+
+
+#: 收尾时等在途工具结束的第一档上限（秒）；到点还没结束就如实记一条警告，**仍不发布终态**，继续等到它结束
+TOOL_DRAIN = 120.0
+
+#: `finish` 之后给 CLI 自己收尾退出的时间（秒），到点就结束它自己起的那个进程
+FINISH_GRACE = 20.0
+
+
+@dataclass
 class FixSession:
     id: str
     scope: str  # 项目 id
@@ -157,6 +254,28 @@ class FixSession:
     pending: _Pending | None = None
     thread: threading.Thread | None = None
     reported: tuple[str, str] | None = None  # `finish` 交来的 (outcome, summary)
+    #: CLI 连接才有：MCP 回调凭它认本会话（不进 `public()`、日志、事件）
+    token: str = ""
+    ctx: fixtools.FixContext | None = None
+    audit: AuditLog | None = None
+    #: MCP 回调的工具调用串行（`run_tool` 改 `ctx.step` / `call_meta`，不是线程安全的）
+    tool_lock: threading.Lock = field(default_factory=threading.Lock)
+    #: CLI 会话收尾中（取消 / 超时 / 进程退出）：不再接受新的工具调用，在途的那个等结束后才发布终态
+    closing: threading.Event = field(default_factory=threading.Event)
+    cli: bool = False
+    done: threading.Event = field(default_factory=threading.Event)
+    #: 进度与卡住（D3）：`activity` 是最近一次工具活动；`stalled` 非空 = 现在卡住了，界面要说原因
+    activity: dict | None = None
+    stalled: dict | None = None
+    stall_since: float | None = None
+    stall_code: str = ""  # 自动取消时记下的原因码；收尾时据此判 failed
+    last_progress: float = field(default_factory=time.monotonic)
+    inflight: int = 0
+    #: CLI 报告的 MCP 工具调用开始时刻 / 应用实际收到的回调次数（按工具名）；开始数多于回调数 = 有调用没送达
+    begins: dict = field(default_factory=dict)
+    cbs: dict = field(default_factory=dict)
+    approval: str | None = None  # CLI 自己在等审批（值 = 工具名，可空串）
+    denied: set = field(default_factory=set)
 
 
 def _same(a: str, b: object) -> bool:
@@ -211,6 +330,10 @@ class FixSessions:
             "reason": s.reason,
             "steps": s.steps,
             "seq": s.seq,
+            #: 最近一次工具活动 `{tool, phase: start|end|denied, detail, at_ms}`（界面按 tool 映射成一句话）；还没有 = None
+            "activity": dict(s.activity) if s.activity else None,
+            #: 现在卡住了：`{reason: cli_waiting_approval|cli_tool_not_delivered|stalled, detail}`；没卡住 = None
+            "stalled": dict(s.stalled) if s.stalled else None,
         }
 
     def _notify(self, s: FixSession) -> None:
@@ -230,7 +353,8 @@ class FixSessions:
         prep_session_id: str,
         script: str,
         project_root: Path,
-        model: object,
+        model: object | None = None,
+        cli: Callable[[str, str, str], CliLaunch] | None = None,
         report: Callable[[], dict | None] | None = None,
         redactor: Redactor = NO_REDACTION,
         audit: AuditLog | None = None,
@@ -250,6 +374,7 @@ class FixSessions:
                 scope=scope,
                 script=script,
                 prep_session_id=prep_session_id,
+                token=secrets.token_urlsafe(32) if cli is not None else "",
             )
             self._by_id[s.id] = s
             while len(self._by_id) > KEEP_SESSIONS:
@@ -276,12 +401,29 @@ class FixSessions:
             limits=limits or FIX_LIMITS,
             redactor=redactor,
         )
-        toolset = FixToolset(ctx, script, audit)
-        wrapped = _FinishAware(model, s.finished)
+        s.ctx, s.audit = ctx, audit if audit is not None else AuditLog()
+        s.cli = cli is not None
+        toolset = FixToolset(
+            ctx, script, audit, on_activity=lambda t, ph, d: self._activity(s, t, ph, d)
+        )
 
-        def work() -> None:
-            self._work(s, wrapped, toolset, envelope)
+        if cli is not None:
+            prompt = cli_prompt(ctx, script)
 
+            def work() -> None:
+                self._work_cli(
+                    s, cli, prompt, str(project_root), (limits or FIX_LIMITS).max_seconds
+                )
+
+        else:
+            wrapped = _FinishAware(model, s.finished)
+
+            def work() -> None:
+                self._work(s, wrapped, toolset, envelope)
+
+        threading.Thread(
+            target=self._watch, args=(s,), name=f"fixwatch-{s.id}", daemon=True
+        ).start()
         if background:
             s.thread = threading.Thread(target=work, name=f"fix-{s.id}", daemon=True)
             s.thread.start()
@@ -293,6 +435,7 @@ class FixSessions:
         done: dict = {}
 
         def emit(event: dict) -> None:
+            s.last_progress = time.monotonic()  # 模型有任何事件 = 活着
             kind = event.get("type")
             if kind == "tool":
                 s.steps += 1
@@ -306,19 +449,282 @@ class FixSessions:
             LOG.exception("fix session crashed")
             done.setdefault("ok", False)
             done.setdefault("reason", "internal")
+        self._settle(s, str(done.get("reason") or "internal"))
+
+    def _settle(self, s: FixSession, failed_reason: str) -> None:
+        """会话收尾：`finish` 交来了结论就采用，取消就是 cancelled，否则 failed（原因码是闭集，界面按它选一句话）。"""
         with self._lock:
+            if s.state == STATE_FINISHED:
+                return  # 已收尾（看门狗强行收尾后，卡住的循环线程迟到的那次不再改结局）
             reported = s.reported
-            if s.cancel.is_set() and reported is None:
+            if s.stall_code and reported is None:
+                s.outcome, s.summary, s.reason = OUTCOME_FAILED, "", s.stall_code
+            elif s.cancel.is_set() and reported is None:
                 s.outcome, s.summary, s.reason = OUTCOME_CANCELLED, "", "cancelled"
             elif reported is not None:
                 s.outcome, s.summary = reported
                 s.reason = ""
             else:
-                # AI 没调 finish 就停了（预算 / 网络 / 额度 / 认证…）：按没修好算，原因码给界面选一句话
+                # AI 没调 finish 就停了（预算 / 网络 / 额度 / 认证…）：按没修好算
                 s.outcome = OUTCOME_FAILED
-                s.reason = str(done.get("reason") or "internal")[:24]
-            s.state, s.card, s.pending = STATE_FINISHED, None, None
+                s.reason = failed_reason[:24]
+            s.state, s.card, s.pending, s.stalled = STATE_FINISHED, None, None, None
+            s.done.set()
+        if s.ctx is not None:
+            s.ctx.release_leases()  # change_python 持的旧代租约：会话结束才放（之后旧代才可能被清理）
         self._notify(s)
+
+    # ---- 进度与卡住（D3） -------------------------------------------------
+    def _activity(self, s: FixSession, tool: str, phase: str, detail: str = "") -> None:
+        now = time.monotonic()
+        with self._lock:
+            s.activity = {
+                "tool": tool,
+                "phase": phase,
+                "detail": detail,
+                "at_ms": int(time.time() * 1000),
+            }
+            s.last_progress = now
+            if phase == "start":
+                s.inflight += 1
+            elif phase == "end":
+                s.inflight = max(0, s.inflight - 1)
+        self._notify(s)
+
+    def _audit_event(self, s: FixSession, code: str, summary: str, tool: str = "") -> None:
+        """会话级事件（卡住 / 自动取消 / CLI 权限拒绝）进 `fix_audit.jsonl`，诊断包「修复经过」随之可见。不抛。"""
+        if s.audit is None:
+            return
+        try:
+            s.audit.record(
+                session=s.id,
+                step=s.ctx.step if s.ctx else 0,
+                tool="_session",
+                tier="observe",
+                args={"tool": tool},
+                approved_by="blocked",
+                result={"ok": False, "code": code, "summary": summary},
+            )
+        except Exception:  # noqa: BLE001 - 审计失败不影响会话
+            LOG.debug("fix audit event failed", exc_info=True)
+
+    def _cli_event(self, s: FixSession, ev: dict) -> None:
+        kind, tool = str(ev.get("kind") or ""), str(ev.get("tool") or "")[:60]
+        now = time.monotonic()
+        audit = None
+        with self._lock:
+            s.last_progress = now
+            if kind == "mcp_begin":
+                s.begins.setdefault(tool, []).append(now)
+            elif kind == "approval":
+                s.approval = tool
+                audit = ("cli_waiting_approval", "the CLI is waiting for its own approval")
+            elif kind == "denied" and tool not in s.denied:
+                s.denied.add(tool)
+                s.activity = {
+                    "tool": tool,
+                    "phase": "denied",
+                    "detail": "",
+                    "at_ms": int(time.time() * 1000),
+                }
+                audit = ("cli_permission_denied", "the CLI refused one of its own tools")
+        if audit is not None:
+            self._audit_event(s, audit[0], audit[1], tool)
+            self._notify(s)
+
+    def _watch(self, s: FixSession) -> None:
+        """看门狗（两种模式共用）：发现卡住就写进会话状态让界面说出原因，卡得太久自动取消。等用户点卡片不算卡住。"""
+        forced_at: float | None = None
+        while not s.done.wait(WATCH_TICK):
+            now = time.monotonic()
+            new_stall = auto_cancel = None
+            changed = False
+            with self._lock:
+                if s.state == STATE_FINISHED:
+                    return
+                code, detail = "", ""
+                if s.state == STATE_WAITING:
+                    s.last_progress = now
+                elif s.approval is not None:
+                    code, detail = STALL_APPROVAL, s.approval
+                else:
+                    for name, times in s.begins.items():
+                        got = s.cbs.get(name, 0)
+                        if len(times) > got and now - times[got] > DELIVER_WAIT:
+                            code, detail = STALL_NOT_DELIVERED, name
+                            break
+                    else:
+                        if s.inflight == 0 and now - s.last_progress > STALL_IDLE:
+                            code = STALL_IDLE_CODE
+                if code and (s.stalled is None or s.stalled["reason"] != code):
+                    s.stalled = {"reason": code, "detail": detail}
+                    s.stall_since = now
+                    new_stall, changed = (code, detail), True
+                elif not code and s.stalled is not None:
+                    s.stalled, s.stall_since, changed = None, None, True
+                if (
+                    s.stalled
+                    and s.stall_since is not None
+                    and now - s.stall_since > STALL_HARD
+                    and not s.cancel.is_set()
+                ):
+                    s.stall_code = s.stalled["reason"]
+                    auto_cancel = (s.stall_code, s.stalled["detail"])
+            if new_stall:
+                self._audit_event(s, new_stall[0], "the repair AI looks stuck", new_stall[1])
+            if auto_cancel:
+                self._audit_event(
+                    s, auto_cancel[0], "stopped automatically after being stuck", auto_cancel[1]
+                )
+                s.cancel.set()
+                forced_at = now
+            if changed:
+                self._notify(s)
+            if (
+                forced_at is not None
+                and not s.cli
+                and now - forced_at > FORCE_SETTLE
+                and s.inflight == 0
+            ):
+                self._settle(s, s.stall_code)  # 模型请求挂住、循环线程回不来：不能让会话永远占着位
+
+    # ---- CLI 连接（D3） -------------------------------------------------
+    def _work_cli(
+        self,
+        s: FixSession,
+        build: Callable[[str, str, str], CliLaunch],
+        prompt: str,
+        cwd: str,
+        max_seconds: float,
+    ) -> None:
+        """起 CLI、等它退出。只结束**自己起的**那个进程（`ai_bridge._terminate` 的进程组 / `taskkill /T`）。
+        stdout 读掉丢弃（不读会把管道写满），内容不当结论、不入日志。"""
+        from . import ai_bridge
+
+        reason = "cli_exit"
+        sess: dict = {"exited": threading.Event()}
+        try:
+            launch = build(s.id, s.token, prompt)
+            proc = ai_bridge._popen(launch.argv, launch.cwd, launch.env, subprocess.DEVNULL)
+        except Exception:  # noqa: BLE001 - 起不来（没装 / 参数 / 权限）：按没修好算
+            LOG.warning("fix cli failed to start", exc_info=True)
+            self._settle(s, "cli_start")
+            return
+        sess["proc"] = proc
+        drain = threading.Thread(
+            target=self._read_events, args=(s, proc, launch.parse), daemon=True
+        )
+        drain.start()
+        started = time.monotonic()
+        finish_seen: float | None = None
+        while proc.poll() is None:
+            now = time.monotonic()
+            if s.cancel.is_set():
+                break
+            if s.finished.is_set():
+                finish_seen = finish_seen or now
+                if now - finish_seen > FINISH_GRACE:
+                    break
+            if now - started > max_seconds:
+                reason = "budget"
+                break
+            time.sleep(0.1)
+        s.closing.set()  # 先拒新调用；卡片上阻塞的在途工具由 `_ask` 看到它而醒来
+        code = proc.poll()
+        if code is None:
+            ai_bridge._terminate(sess)
+        ai_bridge._await_exit(sess)
+        drain.join(timeout=2)
+        self._drain_inflight(s)
+        if reason != "budget":
+            reason = "cli_exit" if (code or 0) != 0 else "cli_no_finish"
+        self._settle(s, reason)
+
+    @staticmethod
+    def _drain_inflight(s: FixSession) -> None:
+        """等应用进程里在途的工具调用（`call_tool` 持着 `tool_lock`）结束，之后才发布终态、释放 `active()`：
+        否则界面可以重跑验证或起下一次修复，而 `install_packages` 之类还在改环境。上限到了仍未结束就记警告并继续等（会话保持占位）。"""
+        if s.tool_lock.acquire(timeout=TOOL_DRAIN):
+            s.tool_lock.release()
+            return
+        LOG.warning(
+            "fix session %s: a tool call is still running after %ss; keeping the slot",
+            s.id,
+            TOOL_DRAIN,
+        )
+        s.tool_lock.acquire()
+        s.tool_lock.release()
+
+    def _read_events(self, s: FixSession, proc, parse) -> None:
+        """读 CLI 的结构化输出：逐行解析成进度 / 卡住的线索，**不当结论、不入日志**（不读会把管道写满）。"""
+        try:
+            for line in proc.stdout:
+                s.last_progress = time.monotonic()  # CLI 有输出 = 活着
+                if parse is None:
+                    continue
+                try:
+                    events = parse(line.strip())
+                except Exception:  # noqa: BLE001 - 解析器的缺陷不拖垮会话
+                    continue
+                for ev in events:
+                    self._cli_event(s, ev)
+        except (OSError, ValueError):
+            pass
+
+    def _authorized(self, fix_id: object, token: object) -> FixSession:
+        """MCP 回调的认证：会话存在、令牌对、会话没结束没取消。别的一律同一个 403（不泄漏哪一项错了）。"""
+        with self._lock:
+            for s in self._by_id.values():
+                if _same(s.id, fix_id):
+                    if (
+                        s.token
+                        and _same(s.token, token)
+                        and s.state != STATE_FINISHED
+                        and not s.cancel.is_set()
+                        and not s.closing.is_set()
+                    ):
+                        return s
+                    break
+        raise FixError("fix_tool_forbidden", 403)
+
+    def token_valid(self, fix_id: object, token: object) -> bool:
+        """会话认证 guard 的 scoped token 检查（`security.py`）。"""
+        try:
+            self._authorized(fix_id, token)
+        except FixError:
+            return False
+        return True
+
+    def tool_list(self, fix_id: object, token: object) -> list[dict]:
+        """MCP `tools/list`：注册表里的名字 / 描述 / schema。**不含 tier / waits_for_user**（与 `build_agent_tools` 同口径）。"""
+        self._authorized(fix_id, token)
+        return [
+            {"name": t.name, "description": t.description, "inputSchema": t.schema}
+            for t in fixtools.REGISTRY.values()
+        ]
+
+    def call_tool(self, fix_id: object, token: object, name: object, args: object) -> dict:
+        """MCP `tools/call`：在本进程里 `run_tool`（档位 / 同意卡 / 快照 / 审计全在里面）。阻塞到工具结束；
+        卡片等用户的上限是 `ASK_TIMEOUT`，取消立即返回。"""
+        s = self._authorized(fix_id, token)
+        tool = fixtools.REGISTRY.get(name) if isinstance(name, str) else None
+        if tool is None:
+            return {"content": "Unknown tool.", "is_error": True}
+        detail = activity_detail(args)
+        with self._lock:  # 回调到了：CLI 报告的这次调用送达了，它自己的「在等审批」也解除了
+            s.cbs[name] = s.cbs.get(name, 0) + 1
+            s.approval = None
+        self._activity(s, name, "start", detail)
+        try:
+            with s.tool_lock:
+                if s.cancel.is_set() or s.closing.is_set() or s.finished.is_set() or s.ctx is None:
+                    return {"content": "The repair session has ended.", "is_error": True}
+                result = fixtools.run_tool(tool, s.ctx, args, s.audit)
+        finally:
+            self._activity(s, name, "end", detail)
+        s.steps += 1
+        self._notify(s)
+        return {"content": result.content, "is_error": bool(result.is_error)}
 
     # ---- 弹卡 -----------------------------------------------------------
     def _ask(self, s: FixSession, card: dict, redactor: Redactor) -> dict:
@@ -345,7 +751,7 @@ class FixSessions:
         self._notify(s)
         deadline = time.monotonic() + ASK_TIMEOUT
         while not p.event.wait(0.2):
-            if s.cancel.is_set():
+            if s.cancel.is_set() or s.closing.is_set():
                 p.result = {"answer": "cancelled"}
                 break
             if time.monotonic() >= deadline:
@@ -414,7 +820,7 @@ SESSIONS = FixSessions()
 # --------------------------------------------------------------------------- 连接（API 连接 → 内置执行器的模型）
 def connection() -> dict | None:
     """用户连着的、内置执行器能直接用的 API 连接：该 agent 当前选中的第三方接口，有地址 / 密钥 / 型号、地址合规。
-    只连了 CLI（官方登录态）时返回 None——CLI 经 MCP 的接法是 D3，此处暂不可用。返回里带密钥，**只给 `build_model` 用**。"""
+    只连了 CLI（官方登录态）时返回 None——那条路走 `cli_agent()` + MCP 接法（D3）。返回里带密钥，**只给 `build_model` 用**。"""
     from . import ai_agents, ai_providers
 
     for agent in ai_providers.agents():
@@ -432,11 +838,60 @@ def connection() -> dict | None:
     return None
 
 
-def available() -> bool:
+def cli_agent() -> str | None:
+    """没有可用的 API 连接时，能经 MCP 接法修复的 CLI（Codex / Claude Code）；没有 = None。"""
+    from . import ai_bridge
+
     try:
-        return connection() is not None
+        return ai_bridge.fix_cli_agent()
+    except Exception:  # noqa: BLE001 - 探测失败 = 不可用
+        return None
+
+
+def available() -> bool:
+    """「使用你的 AI 来修复」能不能真的跑：有内置循环能用的 API 连接，或有可用的 Codex / Claude Code。"""
+    try:
+        return connection() is not None or cli_agent() is not None
     except Exception:  # noqa: BLE001 - 探测失败 = 不可用
         return False
+
+
+def mcp_launcher() -> list[str]:
+    """本地 MCP 修复模式服务的启动命令（`tavotto fix-mcp`）。冻结产物里 `sys.executable` 就是 Tavotto 自己，
+    优先用同目录的 console 版 `tavotto-cli`（GUI 子系统的 exe 没有可靠的 stdio）；源码 / pip 形态走 `-m tavotto`。"""
+    if getattr(sys, "frozen", False):
+        from . import locate
+
+        cli = Path(sys.executable).with_name(locate.CLI_NAME)
+        return [str(cli if cli.is_file() else sys.executable), "fix-mcp"]
+    return [sys.executable, "-m", "tavotto", "fix-mcp"]
+
+
+def cli_launcher(
+    agent_id: str, *, callback_url: str, project_root: Path
+) -> Callable[[str, str, str], CliLaunch]:
+    """→ `SESSIONS.start(cli=…)` 要的构造器 `(fix_id, token, prompt) -> CliLaunch`。令牌只放进子进程环境。"""
+
+    def build(fix_id: str, token: str, prompt: str) -> CliLaunch:
+        from . import ai_agents, ai_bridge, fixmcp
+
+        run_ctx = ai_agents.FixRunContext(
+            argv=[],
+            prompt=prompt,
+            cwd=str(project_root),
+            mcp_command=[*mcp_launcher(), "--url", callback_url, "--fix-id", fix_id],
+            mcp_name=fixmcp.SERVER_NAME,
+            token_env=fixmcp.ENV_TOKEN,
+            tool_timeout_s=int(ASK_TIMEOUT) + 120,
+            deny=fixtools.readscope.deny_spec(),
+        )
+        argv, extra_env = ai_bridge.fix_cli_command(agent_id, run_ctx)
+        env = ai_bridge._spawn_env(argv[0], {**extra_env, fixmcp.ENV_TOKEN: token})
+        agent = ai_agents.get_agent(agent_id)
+        parse = agent.fix_event_parser() if agent else None
+        return CliLaunch(argv=argv, env=env, cwd=str(project_root), parse=parse)
+
+    return build
 
 
 def build_model(conn: dict):
@@ -477,8 +932,14 @@ __all__ = [
     "FixError",
     "FixSessions",
     "FixToolset",
+    "NO_REDACTION",
+    "CliLaunch",
     "audit_tail",
     "available",
     "build_model",
+    "cli_agent",
+    "cli_launcher",
+    "cli_prompt",
     "connection",
+    "mcp_launcher",
 ]

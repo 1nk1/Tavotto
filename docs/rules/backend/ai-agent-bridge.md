@@ -500,6 +500,42 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
 - **会话**（`fixsession.SESSIONS`）：同一时刻一个；id 是 `secrets.token_urlsafe`、比较 `compare_digest`、按项目 id 作用域（别的项目 404）。循环在**本进程**线程里跑（工具要碰应用状态），
   模型只有 `HttpModel` 一条出站路径；密钥只在内存，卡片文字过 `Redactor` + `readscope.scrub`，SSE `ai.fix` 只带 `{pj, fix_id}`（「重读」提示），状态以 `GET /api/ai/fix/<id>` 为准。
   卡片回答 `POST …/answer {card_id, answer, text?}` 按卡种类校验（坏回答 400、过期卡 409）；`POST …/cancel` 唤醒阻塞中的工具。预算：40 轮 / 30 分钟（含用户思考时间）/ 60 万 token；`finish` 之后不再请求模型。
-- **连接**：`connection()` 只认当前选中的第三方 API 接口（有地址 / 密钥 / 型号、地址过 `check_base_url`）；只连了 CLI 时 `ai_fix_available=false`（CLI 经 MCP 是 D3）。
+- **连接**：`connection()` 只认当前选中的第三方 API 接口（有地址 / 密钥 / 型号、地址过 `check_base_url`）；只连了 CLI 时由 D3 的 MCP 接法接手（见下一节），`ai_fix_available` 随之为真。
 - **验证**：会话结束后由前端重跑准备会话；`finish(fixed)` 只是 AI 的说法。诊断包 `detail-runs.json` 多 `fix_audit`（审计尾部，本来就不含内容）。看护 `tests/test_fixasks.py`、`tests/test_ai_fix_endpoint.py`。
+
+### D3：CLI 经 MCP 修复模式（`engine/fixmcp.py`、`fixsession.py` 的 CLI 分支、`ai_agents` 的 `build_fix_command`）
+
+只连了 Codex / Claude Code 时，同一个修复会话起那个 CLI；CLI 经 `tavotto fix-mcp`（`engine/cli.py` 的子命令，冻结产物里用同目录 console 版 `tavotto-cli`，`fixsession.mcp_launcher`）调同一张 `REGISTRY`。看护 `tests/test_fixcli.py`、`tests/test_fixmcp.py`、`tests/test_ai_fix_endpoint.py`。
+
+- **选谁**：`POST /api/ai/fix` 先看 `fixsession.connection()`（API 连接，走内置循环，不变）；没有才取 `ai_bridge.fix_cli_agent()`（第一个 `usable` 且适配器覆写了 `build_fix_command` 的 Agent；通用层没有 `if agent == …`）。`ai_fix_available = connection() or cli_agent()`。
+  命令由 `ai_bridge.fix_cli_command` 构造（与 `_cmd` 同一套：`resolve` 出的启动 argv、`spawn_overrides` 的第三方接口注入、`spawn_env` 的 PATH），再起进程用 `ai_bridge._popen`（自成进程组、stdin DEVNULL、UTF-8）。
+- **启动参数契约**（令牌**不在**任何一个 argv 里，只在子进程环境 `TAVOTTO_FIX_TOKEN`）：
+  - Codex：`codex exec -C <项目> --sandbox read-only --skip-git-repo-check -c mcp_servers.tavotto_fix.command=… -c …args=[…,"fix-mcp","--url",…,"--fix-id",…] -c …env_vars=["TAVOTTO_FIX_TOKEN"] -c …tool_timeout_sec=<卡片超时+120> -c …startup_timeout_sec=60 -c approval_policy="never" <提示词>`（`-c` 的值是 TOML；`env_vars` 只列变量名，由 Codex 从它自己的环境转给 MCP 子进程）。
+  - Claude Code：`claude -p <提示词> --permission-mode dontAsk --allowedTools=mcp__tavotto_fix__* --settings <JSON> --mcp-config <JSON> --strict-mcp-config`；环境多一个 `MCP_TOOL_TIMEOUT`（毫秒，长于卡片超时）。MCP 配置里的 `env` 是 `{"TAVOTTO_FIX_TOKEN": "${TAVOTTO_FIX_TOKEN}"}`，由 Claude 从它自己的环境展开。
+  - 提示词 = 内置循环**同一份** `SYSTEM_PROMPT` + 一段 CLI 补充（工具叫什么、结论只能经 `finish`）+ 首条消息，超 12000 字符截断（命令行长度）。
+- **只读口径与已接受的风险（维护者裁决）**：两边的自带命令行都只许只读，所有改动只能经 MCP 工具。**Claude**：`--settings` 的 `permissions.deny` 里 `Read(~/<DENY_HOME_RELATIVE 每项>)` / `Read(~/<项>/**)`、`Read(**/<DENY_NAME_PATTERNS 每项>)` / `Read(//**/<项>)`、Tavotto 自己的 `config.json`
+  （全部由 `readscope.deny_spec()` **每次现读表生成**，不手抄；Claude 把 Read 规则也用在 Grep / Glob 上）；另 deny `Edit` / `Write` / `MultiEdit` / `NotebookEdit` / `WebFetch` / `WebSearch` 与 `Bash(*>*)` / `Bash(*tee *)` / `Bash(*sed -i*)` / `Bash(*-exec*)`；
+  `allow` 只有 MCP 工具、`Read` / `Grep` / `Glob`、与白名单里的只读命令（`ls` `pwd` `which` `file` `stat` `wc` `uname` `pip list|freeze|show` `conda list|env list`，及精确的 `python --version` 等）。
+  **白名单故意不含 `cat` / `head` / `tail` / `grep`**：它们能绕过 `Read` 的 deny 读凭据位置，读内容走 `Read` / `Grep` / `Glob` 或 MCP 的 `read_file`。`id_*` 的 `.pub` 豁免在 Claude 的规则里表达不出来（`id_rsa.pub` 也被拦，偏严）。
+  **Codex**：`--sandbox read-only`——写被沙盒拦，但它的自带命令行**读不受限**，`DENY` 管不到它；这是维护者「接受 Codex 这边的风险，两边都开放」的裁决，不是遗漏。Codex 的自带命令行不经 `run_tool`，所以不进 `fix_audit.jsonl`。
+- **回调**：`GET /api/ai/fix/<id>/tools`（`[{name, description, inputSchema}]`，来自 `REGISTRY`，**不含 tier / waits_for_user**）与 `POST /api/ai/fix/<id>/tool {name, arguments}` → `{content, is_error}`。
+  令牌头 `X-Tavotto-Fix-Token`；`security._session_guard` 在 cookie / 本机凭据之后多认这一种 scoped token，**只认这两个路径 + 对应方法 + 对应会话**（`SESSIONS.token_valid`）；Host / Origin 校验照旧在前。错令牌 / 别的会话 / 已结束 / 已取消 = 401（guard）或 403 `fix_tool_forbidden`（处理器）。
+  `call_tool` 在 `s.tool_lock` 里串行执行 `run_tool(tool, s.ctx, args, s.audit)`；等用户点卡片的上限仍是 `ASK_TIMEOUT`，取消立即返回（`ctx.ask` 的取消）。
+- **会话**：`SESSIONS.start(cli=构造器)`；`_work_cli` 起进程、读掉 stdout 丢弃（不入日志、不当结论）、轮询：取消 → 结束；`finish` 之后给 `FINISH_GRACE`（20 秒）收尾，到点结束；超 `FIX_LIMITS.max_seconds` → `budget`。
+  结束只用 `ai_bridge._terminate` / `_await_exit`（POSIX `killpg` 自己的进程组、Windows `taskkill /T /PID`），**绝不按名字杀**。没调 `finish` 就退出 = `failed`，`reason ∈ {cli_no_finish, cli_exit, cli_start, budget}`（前端落到「AI 这次没能修好」那句，无需新文案）。
+- **卫生**：MCP 配置只在本次启动参数里，**不写 `~/.codex`、`~/.claude`**（用例用假主目录断言）；Tavotto 不读、不存 CLI 的登录凭据；回环请求显式绕开系统代理；`fix-mcp` 的 stdout 归协议独占，没有令牌或 URL 不是 `http://127.0.0.1:` 就退出码 2。
+- **真机核实（2026-10-24，Codex 0.163.0 / Claude Code 2.1.310，隔离数据目录 + 假执行器）**：两边整链都走通（CLI → `tavotto fix-mcp` → 回调 → `run_tool` → 弹卡 → `finish`），`env_vars` 转令牌、`${VAR}` 展开、`--strict-mcp-config`、`dontAsk` 均生效，`~/.codex` / `~/.claude` 未被写。真机发现并已修：Codex exec 模式下 MCP 工具默认要它自己的审批、没人点就一直挂着 → 本服务加 `default_tools_approval_mode="approve"`（要用户点头的改动仍由 Tavotto 弹卡）；Claude Code 2.1 已没有 `MultiEdit`（deny 里写它会报 matches no known tool）。仍知：Codex 没有 `--strict-mcp-config` 的对应项，用户自己在 `~/.codex/config.toml` 配的其它 MCP 服务也会出现在修复会话里（它们的工具仍走 Codex 默认审批，exec 模式下不会自动执行）。
+- **没有可用环境的路（D3 真机后）**：`SYSTEM_PROMPT` 的 3b 条（内置循环与 CLI 共用）；`change_python` 的 `version` 可省，`FixContext.python_changer` 由应用注入 `executors.default_python_changer`
+  （`pyversionfix.plan_python_change` 推范围 + `apply_python_change` 在受管环境另建一代并按联合计划补脚本依赖，建好后 `managedenv.python_of` 给新解释器、登记成环境 id）；`list_environments` 为空时文字里点名 `change_python`。看护 `tests/test_fixflow_noenv.py`。
+- **进度与卡住**（`fixsession.py`，看护 `tests/test_fixstall.py`）：公开状态 `activity = {tool, phase: start|end|denied, detail, at_ms}`（`detail` 只取 packages / package / module / name、脱敏、≤60 字，路径与其它参数不进）、
+  `stalled = {reason, detail}`（`reason ∈ cli_waiting_approval | cli_tool_not_delivered | stalled`）。来源：内置循环包装工具 handler 的开始 / 结束；CLI 每次 `/tool` 回调；CLI 结构化输出
+  （Codex `exec --json`、Claude `-p --output-format stream-json --verbose`）经适配器的 `fix_event_parser()` 逐行解析成 `mcp_begin / mcp_end / approval / denied / output`——**只用于进度与卡住线索，从不当结论**。
+  看门狗线程（每会话一个，`_watch`）：`DELIVER_WAIT`=20 s 内 CLI 报告的调用没收到回调 → `cli_tool_not_delivered`；出现 CLI 审批请求 → `cli_waiting_approval`（回调一到即解除）；`STALL_IDLE`=120 s 无工具在跑、无 CLI 输出 / 模型事件 → `stalled`；
+  等卡片（`state=waiting`）与在途工具都不算。卡住持续 `STALL_HARD`=300 s 自动取消：`stall_code` 记下，`_settle` 判 `failed` + 该原因码；内置循环的模型请求挂住、循环线程回不来时 `FORCE_SETTLE`=10 s 后看门狗强行收尾（`_settle` 幂等，迟到的循环线程不再改结局）。
+  卡住与自动取消、Claude 的权限拒绝（`cli_permission_denied`）都写 `fix_audit.jsonl`（`tool=_session`）。
+- **Codex 的取舍**：`--ignore-user-config` 仅在 `endpoint_args` 非空（Tavotto 显式给了 provider）时加并带 `-m <接口型号>`；官方登录态不加。**没核实的**：Codex `--json` 里 MCP 调用 / 审批事件的确切字段名（解析器按 `item.*` 的 `type` 含 `mcp` / `approval` 写，且对未知事件一律当「有输出」）。
+- **`change_python` 的旧代租约与回滚（Codex #1383 P2）**：换到新一代后 `deprepair._run_generation` 会 `managedenv.retire_unused` 删掉没人占着的旧代，所以 `change_python` 动手前给项目当前用的受管环境那一代
+  （`managedenv.python_of` 与设置里记着的受管解释器）加 **保留型**租约 `envlease.acquire_retain`（`fix:<会话>`；与 native 占用在同一模块、两种用途：保留型只让 `deprepair._generation_in_use` 不清这一代，**不**被 `envlease.mutating()` 当成 native 会话拒绝——用 native 租约会把换代事务自己挡死；真正的 native 会话仍照旧拒绝换代），换成功则持到会话收尾（`_settle` → `ctx.release_leases()`，finish / 取消 / 失败 / 自动取消都走），没换成立即放（`release_retain`）。
+  快照多存 `managed = {generation}`；`rollback` 先核旧代解释器真的在（不在 = `rollback_target_gone`，**一个字不改**），再恢复设置、`managedenv.activate` 指回旧代并让池 / 缓存放弃新一代，恢复后核设置里记着的解释器在不在（不在同样 `rollback_target_gone`，不报成功）。
+  `FixContext.cancel`（= 会话的 `s.cancel`）传给缺省换 Python 执行器 `_default_python_changer(req, cancel)`，规划完、动手前先看一眼（与 #1381 同一件事）。看护 `tests/test_fixrollback_managed.py`。
 
