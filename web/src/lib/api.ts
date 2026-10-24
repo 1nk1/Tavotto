@@ -3203,6 +3203,150 @@ export interface AiCapabilities {
    * （只连了命令行 AI 时也是 false）：按钮照常出现（每次失败都出），点击走「这个问题 AI 暂时还不会修」降级
    */
   ai_fix_available?: boolean
+  /** 「连接 AI」视图（老后端没有 → 退回 `agents` 的旧界面） */
+  vendors?: AiVendor[]
+  connections?: AiConnection[]
+  /** 后端按系统语言给的排序提示；前端以界面语言为准 */
+  locale_region?: 'cn' | 'global'
+}
+
+/* --- 「连接 AI」：厂商目录与连接视图（接口约定见 docs/implementation 的连接 AI 方案；旧后端没有这些字段 → 沿用旧界面） --- */
+
+/** 一家厂商的一种连接方式（同一厂商的 API Key 与订阅登录合并成一个厂商时有多种） */
+export interface AiVendorMethod {
+  id: string
+  kind: 'key' | 'login' | 'oauth'
+  /** 方式名的 i18n 键（`method.subscription` / `method.apiKey` / `method.kimiCode` / `method.codingPlan` / `method.account`） */
+  label_key?: string | null
+  /** key 类：对应的目录行 id（保存连接时作为厂商 id） */
+  catalog_id?: string
+  /** login 类：登录用的家族（codex / claude） */
+  agent?: string
+  /** login / oauth 类：这种方式对应的连接 id（`sub:codex` / `sub:claude` / `minimax-oauth`） */
+  connection_id?: string
+  key_url?: string
+  key_hint_key?: string
+  needs_base_url?: boolean
+  available: boolean
+}
+
+/** 可连接的厂商（设置页 / 连接弹窗的一行）。`connect`：key = 填 API Key；login = 订阅登录；oauth = 账号登录（设备码） */
+export interface AiVendor {
+  id: string
+  /** 英文品牌名兜底；界面显示名走 `label_key`（`dialogs:settings.agents.<label_key>`），订阅类 / 自定义为 null */
+  label: string
+  label_key?: string | null
+  /** Key 提示的 i18n 键（同 `label_key` 的解析方式） */
+  key_hint_key?: string
+  /** 只有自定义为 true */
+  needs_base_url?: boolean
+  /** 这家厂商的连接方式；缺省（老后端）= 只有 `connect` 那一种 */
+  methods?: AiVendorMethod[]
+  /** 彩色标志的键（`BrandLogo`）；表外 = 通用图标 */
+  logo: string
+  region: 'cn' | 'global' | 'custom'
+  connect: 'key' | 'login' | 'oauth'
+  /** 「去申请 Key」页面（https） */
+  key_url?: string
+  /** login 类：对应 CLI 已安装才 true；oauth 类：client_id 已配置才出现 */
+  available: boolean
+}
+
+/** 已连接 / 需要重新登录的连接（模型选择器的一级）。订阅类 id = `sub:codex` / `sub:claude`；Key / OAuth 类 = provider id */
+export interface AiConnection {
+  id: string
+  vendor: string
+  label: string
+  logo: string
+  state: 'ready' | 'needs_auth' | 'error'
+  models: string[]
+  model_details?: AiModelDetail[]
+  default_model: string | null
+  efforts?: string[]
+  default_effort?: string | null
+  /** key 类连接对应的连接方式 id（`AiVendorMethod.id`，如 `openai-api:key`）；老后端没有，前端按 catalog_id / vendor + 类型推断 */
+  method?: string
+  /** key 类连接对应的目录行 id（同 `AiVendorMethod.catalog_id`） */
+  catalog_id?: string
+  /** 连的是明文 http 的局域网模型服务器（只放行、界面提示一句） */
+  insecure_lan?: boolean
+  /** state=error 时的原因码（unauthorized / network / timeout / …） */
+  error?: string
+  /** 只给诊断 / 测试看，界面不显示 */
+  route?: 'cli:codex' | 'cli:claude' | 'builtin'
+}
+
+export interface AiConnectBody {
+  /** 带已有连接 id = 换 Key / 换型号 */
+  id?: string
+  vendor: string
+  api_key: string
+  base_url?: string
+  model?: string
+  label?: string
+  wire?: 'anthropic' | 'openai-responses'
+}
+
+export interface AiConnectResult {
+  ok: boolean
+  connection?: AiConnection
+  /** 稳定原因码（ok=false 或保存了但试取型号失败时） */
+  reason?: string
+}
+
+/** 连接一个 Key 类厂商（保存前后端会试取一次型号清单） */
+export const connectAi = (body: AiConnectBody) =>
+  jsonFetch<AiConnectResult>('/api/ai/connections', jsonPost(body))
+
+/** 断开一个连接（订阅类不可删，只能在命令行里退出登录） */
+export const disconnectAi = (id: string) =>
+  jsonFetch<{ ok: boolean }>(`/api/ai/connections/${encodeURIComponent(id)}`, { method: 'DELETE' })
+
+/** 订阅类 / 账号登录类连接发起登录；进度沿用 `fetchAiLoginStatus` / 设备码流程的轮询 */
+export const loginAiConnection = (id: string) =>
+  jsonFetch<{ ok?: boolean; flow_id?: string }>(`/api/ai/connections/${encodeURIComponent(id)}/login`, jsonPost())
+
+/** 后端是否已给出连接视图（旧后端没有 → 界面退回旧的执行器清单） */
+export const hasConnectionView = (caps: AiCapabilities | null | undefined): boolean =>
+  !!caps && Array.isArray(caps.vendors) && Array.isArray(caps.connections)
+
+/** 可以派活的连接（state=ready），顺序沿用后端 */
+export const readyConnections = (caps: AiCapabilities | null | undefined): AiConnection[] =>
+  caps?.connections?.filter((c) => c.state === 'ready') ?? []
+
+/** 此刻有没有任何能用的 AI：有连接视图看连接，否则看旧的可用执行器 */
+export const hasUsableAi = (caps: AiCapabilities | null | undefined): boolean =>
+  hasConnectionView(caps) ? readyConnections(caps).length > 0 : usableAgents(caps ?? null).length > 0
+
+/** 这一刻该用哪个连接：首选仍 ready 就用它，否则第一个 ready；不改用户存着的首选值 */
+export const effectiveConnection = (
+  preferred: string | null | undefined,
+  caps: AiCapabilities | null | undefined,
+): AiConnection | null => {
+  const list = readyConnections(caps)
+  return list.find((c) => c.id === preferred) ?? list[0] ?? null
+}
+
+/** 连接对应的内部执行器家族（只用于旧字段 `agent`；builtin 路由没有） */
+export const connectionAgent = (c: AiConnection | null | undefined): AiAgentId | null => {
+  if (!c) return null
+  if (c.route === 'cli:codex') return 'codex'
+  if (c.route === 'cli:claude') return 'claude'
+  if (c.id.startsWith('sub:')) return c.id.slice(4)
+  return null
+}
+
+/**
+ * 厂商目录的显示顺序：按界面语言分「国内 / 海外」——中文界面国内在前，其余海外在前；
+ * 「自定义」类永远最后；组内保持后端给的顺序。已订阅登录类（`login`）在各自分组内不特殊提前。
+ */
+export const sortVendors = (vendors: AiVendor[], cnFirst: boolean): AiVendor[] => {
+  const rank = (v: AiVendor) =>
+    v.region === 'custom' ? 2 : (v.region === 'cn') === cnFirst ? 0 : 1
+  return vendors
+    .map((v, i) => ({ v, i }))
+    .sort((a, b) => rank(a.v) - rank(b.v) || a.i - b.i)
+    .map((x) => x.v)
 }
 
 /** `POST /api/ai/fix` 的响应：成功给修复会话 id；`ok: false` + 稳定原因码（`ai_fix_unavailable` 没有可用的 API 连接 / `ai_fix_busy` 已有别的修复在跑） */
@@ -3497,6 +3641,8 @@ export const pinAiHistory = (sid: string, pinned: boolean, pj: string | null) =>
 
 export interface AiRunRequest {
   agent: AiAgentId
+  /** 「连接 AI」视图下选中的连接 id（后端以它为准解析家族与接口）；旧后端 / 旧界面不带 */
+  connection?: string
   id: string
   prompt: string
   gid?: string | null

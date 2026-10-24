@@ -1236,7 +1236,8 @@
           "bad_response": "The provider's reply was not understood; enter models by hand.",
           "network": "Can't reach the provider; check your network or enter models by hand."
         },
-        "requiredAria": "required"
+        "requiredAria": "required",
+        "insecureLan": "This address isn't encrypted. Use it only on a network you trust."
       },
       "install": {
         "action": "Install {{name}} with npm",
@@ -1343,7 +1344,9 @@
         "opencodeGo": "OpenCode Go",
         "openai": "OpenAI (official)",
         "customClaude": "Custom (Anthropic-compatible)",
-        "customCodex": "Custom (OpenAI Responses-compatible)"
+        "customCodex": "Custom (OpenAI Responses-compatible)",
+        "kimi": "Kimi",
+        "bailian": "Alibaba Bailian"
       },
       "vendorKey": {
         "kimiCode": "Kimi Code membership key; not interchangeable with Open Platform keys",
@@ -1836,7 +1839,7 @@
       "style": "How figures look: fonts, sizes and line widths.",
       "spec": "What figures must meet: the rules checked before you submit.",
       "export": "What the export dialog starts with.",
-      "ai": "Figure assistants on this computer, and Tavotto inside Codex.",
+      "ai": "Connect an AI to edit figures and fix scripts with it.",
       "packages": "What is installed in this project’s Python environment.",
       "diagnostics": "Whether the runtime is healthy, and reports to send us.",
       "about": "Version, updates and privacy."
@@ -1867,6 +1870,56 @@
         "telemetry": "privacy statistics telemetry data",
         "theme": "theme dark light mode appearance night colour color"
       }
+    },
+    "connectAi": {
+      "title": "Connect an AI",
+      "titleFix": "Connect an AI to fix this",
+      "regionCn": "China",
+      "regionGlobal": "Global",
+      "connect": "Connect",
+      "signIn": "Sign in",
+      "connected": "Connected",
+      "needsAuth": "Sign in again",
+      "error": "Connection problem",
+      "later": "Later",
+      "more": "More AI…",
+      "other": "Other compatible endpoint…",
+      "getKey": "Get a key at {{name}} ↗",
+      "keyLabel": "API key",
+      "keyPlaceholder": "Paste your API key",
+      "needsInstall": "Install required",
+      "failed": "Couldn’t connect. Check the key and try again.",
+      "changeKey": "Change key",
+      "saveKey": "Save",
+      "defaultModel": "Default model",
+      "disconnect": "Disconnect",
+      "disconnectTitle": "Disconnect {{name}}?",
+      "disconnectBody": "The key saved on this computer will be deleted.",
+      "advanced": "Advanced",
+      "loading": "Loading…",
+      "err": {
+        "unauthorized": "The key is invalid or expired.",
+        "network": "Can’t reach the provider.",
+        "timeout": "The connection timed out."
+      },
+      "subtitle": "Connect an AI to edit figures or fix your environment.",
+      "method": {
+        "subscription": "Subscription",
+        "apiKey": "API key",
+        "kimiCode": "Kimi Code plan",
+        "codingPlan": "Coding Plan",
+        "account": "Account sign-in",
+        "hintKey": "Enter your {{name}} API key",
+        "hintLogin": "Sign in with {{name}}",
+        "hintKimiCode": "Use your Kimi Code plan key",
+        "hintCodingPlan": "Use your Coding Plan key",
+        "hintAccount": "Sign in with your {{name}} account",
+        "hintChatgpt": "Sign in with your ChatGPT subscription",
+        "hintClaude": "Sign in with your Claude subscription"
+      },
+      "back": "Back",
+      "savedRefreshFailed": "Saved, but the status couldn’t be refreshed.",
+      "retryRefresh": "Retry refresh"
     }
   },
   "style": {

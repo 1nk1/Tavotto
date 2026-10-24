@@ -124,6 +124,7 @@ export function EndpointDialog({
   presets,
   onClose,
   onSave,
+  saveError,
 }: {
   agent: AiAgentId
   agentLabel: string
@@ -133,6 +134,8 @@ export function EndpointDialog({
   presets: AiEndpointPreset[]
   onClose: () => void
   onSave: (rec: Parameters<typeof saveAiEndpoint>[0]) => void
+  /** 保存失败的一句原因（调用方给；显示在表单底部的状态区） */
+  saveError?: string | null
 }) {
   const { t } = useTranslation(['dialogs', 'common'])
   const [label, setLabel] = useState(existing?.label ?? '')
@@ -233,6 +236,12 @@ export function EndpointDialog({
           className="w-full font-mono"
           spellCheck={false}
         />
+        {/* 明文 http（局域网里的模型服务器）：只放行、不拦，说一句 */}
+        {/^http:\/\//i.test(baseUrl.trim()) && (
+          <span data-endpoint-insecure className="type-caption">
+            {ag('endpoint.insecureLan')}
+          </span>
+        )}
       </Field>
       <Field label={ag('endpoint.models')}>
         {/* 一个框装下全部：条目是 chip，输入紧跟在最后一个 chip 之后，回车即添加 */}
@@ -343,6 +352,13 @@ export function EndpointDialog({
           : ag('endpoint.addTitle', { name: agentLabel })
       }
       size="md"
+      status={
+        saveError ? (
+          <p role="alert" data-endpoint-save-error className="text-sm text-danger">
+            {saveError}
+          </p>
+        ) : undefined
+      }
       footer={
         <>
           <Button variant="ghost" size="md" onClick={onClose}>
