@@ -46,7 +46,7 @@ export/fidelity 各 10。历史机器快照 `tests/compat/research-baseline.json
 
 | 项目 | 已知证据 | 下一步 |
 | --- | --- | --- |
-| Celerite | 5 次执行的 26 条曲线数据、RNG、末次协方差矩阵一致；原生对照丢失 `bbox_inches` 已由 #1321 修正。同尺寸 PDF 仍有布局偏移。 | 用新对照重跑；定位零编辑布局重算。详见下节。 |
+| Celerite | 5 次执行的 26 条曲线数据、RNG、末次协方差矩阵一致；原生对照丢失 `bbox_inches` 已由 #1321 修正；零编辑布局偏移已由 #1359 修掉（2026-10-24 本机用真脚本复核：逐词坐标差 0，回归用例 `tests/test_zero_edit_usetex_pdf.py`）。 | 用新对照在托管机上重跑确认。详见下节。 |
 | Leaf | 登记入口 `plot.py hppc`；首轮产品腿没传 argv。真实入口复测通过。 | 用新测量重跑。 |
 | Qudit | 登记 cwd 为项目根，相对 glob；首轮产品腿用了 sandbox。真实入口复测通过。 | 用新测量重跑。 |
 | Cantera | 登记 cwd 为 `data`，既不是脚本目录也不是项目根。实测（2026-10-24，本机 cantera 3.2.0 pip wheel）：`ct.Interface("sofc.yaml", "tpb")` 会在 cantera 包自带数据目录（`site-packages/cantera/data/sofc.yaml`）里找到文件，从脚本目录运行 exit 0，受保护试跑捕获 1 张图。首轮的 `launch_context_unsupported` 是测量方式，不是产品能力缺口。 | 新测量规则：登记 cwd 不可表达时，产品腿不再提前拒绝，而按产品真实行为跑（脚本目录，用户 Python 的首开默认，与把 .py 拖进 Tavotto 同源），并在报告 `detail.launch_context` 记 `{registered_cwd, product_mode, substituted: true}`；只有这样跑失败时才归 `launch_context_unsupported`（`cwd_or_data_path`），失败 stage 与原始错误一并保留。原生腿不变。待用新测量重跑。 |
@@ -76,7 +76,9 @@ export/fidelity 各 10。历史机器快照 `tests/compat/research-baseline.json
   文字坐标最大差约 1.051598 pt。沿用现有像素判据：changed ratio 0.084766、mean 2.6069、max 255，
   三项都超过原阈值。重放后回零的 PDF 像素与编辑前一致，差异已在编辑前出现。
 
-旧报告的 fidelity failed 包含“对照保存参数未对齐”（已修）和“零编辑布局漂移”（仍待定位）两项。
+旧报告的 fidelity failed 包含“对照保存参数未对齐”（已修）和“零编辑布局漂移”两项。
+
+**2026-10-24 定位结论：零编辑布局漂移已由 #1359 修掉。** 根因：产品给 rcParams 的 `font.family` 补 CJK 回退尾巴后变成多项，usetex 的 TexManager 只认单项 family、多项时退回 serif，刻度文字度量变了，`figure.autolayout` 的 tight 布局把 axes 底边抬高约 0.44 pt。在当前 main 上用真 `paper/figures/sho.py` 比对原生 `savefig` 与 worker 零编辑导出：页面同为 843.84×267.84 pt，45 个词最大坐标差 0，13 个 axes 外框逐项相同（matplotlib 3.11.1 / 3.11.2 相同）；把 #1359 的 usetex 判据短路回去，即重现底边上移 0.443 pt、词坐标最大差 1.051605 pt，与上面的历史观测吻合。PDF 级回归用例 `tests/test_zero_edit_usetex_pdf.py`（同形状合成图，无 latex / dvipng / cmbright 时跳过）。托管机（Linux）上的确认随下一次 S0 重跑。
 不改随机种子、科学计算、样本数据或像素阈值。
 
 完整证据（报告、数值日志、两份 PDF）留在
