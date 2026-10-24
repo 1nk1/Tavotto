@@ -18,7 +18,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -31,7 +30,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from . import config, tlstrust
+from . import config, netpolicy, tlstrust
 
 log = logging.getLogger(__name__)
 
@@ -101,8 +100,92 @@ def _preset(row: dict) -> dict:
     return out
 
 
+#: 「思考强度」档位的合法取值（内置执行器 `agent_runner.wires`：anthropic 的 `output_config.effort` 多一档 max，Responses 的 `reasoning.effort` 只有三档）
+_EFFORT_VALUES = {
+    "claude": ("low", "medium", "high", "xhigh", "max"),
+    "codex": ("low", "medium", "high"),
+}
+
+
+def _checked_efforts(owner: str, agent: str, efforts: object) -> list[str]:
+    if not isinstance(efforts, list) or any(
+        e not in _EFFORT_VALUES.get(agent, ()) for e in efforts
+    ):
+        raise CatalogError(f"{owner} 的 efforts 不合法: {efforts!r}")
+    return list(efforts)
+
+
+def _support(owner: str, agent: str, efforts: object, default: object) -> dict:
+    checked = _checked_efforts(owner, agent, efforts)
+    if default is not None and default not in checked:
+        raise CatalogError(f"{owner} 的默认档位不在 efforts 里: {default!r}")
+    return {"efforts": checked, "default": default if checked else None}
+
+
+def _model_key(model: str | None) -> str:
+    """型号名归一后拿来做前缀匹配：小写，`.` 与 `-` 视为同一个（`claude-opus-4.6` = `claude-opus-4-6`）。"""
+    return (model or "").strip().lower().replace(".", "-")
+
+
+def is_effort_origin(agent: str, base_url: str) -> bool:
+    """这个地址是不是目录登记过的官方 API 来源（`effort_origins`）——只有它们才可能有思考强度档位。"""
+    want = origin_of(base_url)
+    if want is None:
+        return False
+    try:
+        raw = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return any(
+        o.get("agent") == agent and origin_of(o.get("origin", "")) == want
+        for o in (raw.get("effort_origins") if isinstance(raw, dict) else None) or []
+    )
+
+
+def efforts_for(agent: str, base_url: str, model: str | None = None) -> list[str]:
+    """内置执行器在这个地址、这个型号上**确认支持**的思考强度档位；不确定 = `[]`（宁可不显示，也不发对方不认的字段）。
+    细节见 `effort_support`。"""
+    return effort_support(agent, base_url, model)["efforts"]
+
+
+def effort_support(agent: str, base_url: str, model: str | None = None) -> dict:
+    """→ `{"efforts": [...], "default": 默认档位 | None}`。
+
+    两处声明：目录行自带 `efforts`（地址和家族对上这一行，所有型号），或顶层 `effort_origins`（官方 API 的来源：scheme + host + 端口对上）。
+    `effort_origins` 条目可带 `models: [{prefix, efforts}]`——**按型号前缀、先中先得**（`efforts: []` = 这个前缀明确不支持，写在更宽的前缀前面）；
+    没有 `models` 的条目 = 该来源所有型号。带了 `models` 却没给型号（或没有前缀命中）= `[]`。
+    出处（官方文档）写在条目的 `source` 里。"""
+    none: dict = {"efforts": [], "default": None}
+    url = _norm_url(base_url)
+    if not url:
+        return none
+    for r in load_vendors(CATALOG_PATH):
+        if r["agent"] == agent and _norm_url(r["base_url"]) == url and r.get("efforts"):
+            return _support(r["id"], agent, r["efforts"], r.get("default_effort"))
+    try:
+        raw = json.loads(CATALOG_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return none
+    want = origin_of(base_url)
+    for o in (raw.get("effort_origins") if isinstance(raw, dict) else None) or []:
+        if o.get("agent") != agent or want is None or origin_of(o.get("origin", "")) != want:
+            continue
+        owner = str(o.get("origin"))
+        if "models" not in o:
+            return _support(owner, agent, o.get("efforts"), o.get("default"))
+        key = _model_key(model)
+        for rule in o["models"]:
+            if key and key.startswith(_model_key(rule.get("prefix"))):
+                return _support(
+                    f"{owner} {rule.get('prefix')}", agent, rule.get("efforts"), rule.get("default")
+                )
+        return none
+    return none
+
+
 def presets() -> list[dict]:
-    return [_preset(r) for r in load_vendors()]
+    """旧版设置页的预设列表。`preset: false` 的行（官方 API Key：只作「连接」视图里某厂商的一种接入方式）不在其中。"""
+    return [_preset(r) for r in load_vendors() if r.get("preset", True) is not False]
 
 
 #: 不在目录里的接口（自定义）用的图标键；前端 `VendorIcon` 对表外 key 落到通用图标
@@ -147,20 +230,11 @@ REASONS = (
 )
 
 
-def _host_is_loopback(host: str) -> bool:
-    """字面判回环：`localhost` 精确匹配 + 字面 IP（127.0.0.0/8、::1）。不做 DNS 解析。"""
-    if host == "localhost":
-        return True
-    try:
-        return ipaddress.ip_address(host).is_loopback
-    except ValueError:
-        return False
-
-
 def url_refusal(base_url: str) -> str | None:
     """带密钥的请求能不能发往这个地址 → None（可以）或原因码。
 
-    只许 https；明文 http 只放行回环（本机开发网关），其余一律拒绝，免得密钥在网上裸奔。"""
+    只许 https；明文 http 只放本机回环与私网（实验室自建的模型服务器；判据只在 `netpolicy`：主机名要所有解析结果都在放行段），
+    其余一律拒绝，免得密钥在网上裸奔。"""
     try:
         parts = urllib.parse.urlsplit((base_url or "").strip())
         host = (parts.hostname or "").lower()
@@ -170,7 +244,7 @@ def url_refusal(base_url: str) -> str | None:
     if scheme == "https" and host:
         return None
     if scheme == "http" and host:
-        return None if _host_is_loopback(host) else "insecure_url"
+        return None if netpolicy.plain_http_allowed(host) else "insecure_url"
     return "bad_response"
 
 
@@ -242,9 +316,19 @@ def fetch_models(base_url: str, api_key: str) -> tuple[list[str] | None, str | N
     refusal = url_refusal(base_url)
     if refusal:
         return None, refusal
-    req = urllib.request.Request(  # noqa: S310 - 上面已限定 https / 回环 http
-        models_url(base_url),
+    url = models_url(base_url)
+    extra: dict[str, str] = {}
+    if urllib.parse.urlsplit(url).scheme.lower() == "http":
+        # 明文 http（回环 / 私网）：把判定时解析出的 IP 钉进 URL 直连，`Host` 头保留原主机名（防 DNS 重绑定）
+        try:
+            url, host_header = netpolicy.pin_url(url)
+        except ValueError:
+            return None, "insecure_url"
+        extra["Host"] = host_header
+    req = urllib.request.Request(  # noqa: S310 - 上面已限定 https / 回环或私网 http
+        url,
         headers={
+            **extra,
             # Anthropic 兼容网关认 x-api-key，OpenAI 系认 Bearer：两个都给，多给无副作用
             "x-api-key": api_key,
             "Authorization": f"Bearer {api_key}",

@@ -26,6 +26,7 @@ import re
 from urllib.parse import urlparse
 
 from . import ai_agents, ai_catalog, config
+from .agent_runner.wires import ANTHROPIC_EFFORTS, RESPONSES_EFFORTS, check_base_url
 
 # codex 侧临时覆盖用的 provider id 与密钥环境变量名。用 tavotto 前缀是为了
 # 不和用户自己 config.toml 里的 provider 撞名（`-c` 只在本次进程生效，但
@@ -106,6 +107,10 @@ def _clean(rec: dict, existing_ids: set[str] = frozenset()) -> dict:
     # `store_oauth` / `update_oauth` 写入（`save()` 会剥掉请求体里的这两个键）
     if rec.get("auth") == "oauth" and isinstance(rec.get("oauth"), dict):
         out_extra = {"auth": "oauth", "oauth": dict(rec["oauth"])}
+    # 保存时试取型号清单被服务商拒绝（密钥不对）：记下稳定原因码，连接视图据此给 state="error"；
+    # 只认目录里的原因码，且只有真被拒才留（断网这类暂时性失败不落盘，免得永远显示出错）
+    if rec.get("last_error") in ai_catalog.REASONS:
+        out_extra = {**out_extra, "last_error": rec["last_error"]}
     return {
         **out_extra,
         "id": pid,
@@ -435,6 +440,9 @@ def resolve(agent: str, pid: str | None = None) -> dict | None:
     """
     if pid == "":
         return None
+    if agent == ai_agents.BUILTIN_ID:
+        # 内置执行器没有「家族」：它能用任何一条 Key 连接，只认显式指定（没有「当前选中」这回事）
+        return get(pid) if pid else None
     rec = get(pid) if pid else get(active_id(agent))
     if rec is None or rec.get("agent") != agent:
         return None
@@ -448,11 +456,13 @@ def _toml(value: str) -> str:
 
 
 def spawn_overrides(
-    agent: str, rec: dict | None, model: str | None = None
+    agent: str, rec: dict | None, model: str | None = None, effort: str | None = None
 ) -> tuple[list[str], dict[str, str]]:
-    """→ (追加到命令行的参数, 追加到环境的变量)。rec 为 None 时两者都空。"""
+    """→ (追加到命令行的参数, 追加到环境的变量)。rec 为 None 时两者都空。`effort` 只有内置执行器用。"""
     if rec is None:
         return [], {}
+    if agent == ai_agents.BUILTIN_ID:
+        return _builtin_overrides(rec, model, effort)
     base_url = str(rec.get("base_url") or "").strip()
     api_key = str(rec.get("api_key") or "").strip()
 
@@ -507,6 +517,127 @@ def spawn_overrides(
         return args, env
 
     return [], {}
+
+
+#: 家族 → 内置执行器的线上协议名（`agent_runner.wires.WIRES` 的键）
+_BUILTIN_WIRE = {FAMILY_ANTHROPIC: "anthropic", FAMILY_OPENAI: "openai-responses"}
+
+
+def builtin_conn(rec: dict | None, model: str | None = None) -> dict | None:
+    """这条记录内置循环能不能直接用 → `{wire, base_url, api_key, model, auth}`（带密钥 / 令牌，只给 spawn 注入 /
+    `fixsession.build_model` 用）或 None。`auth` = `"key"`（x-api-key + Bearer 都给）| `"bearer"`（账号登录的访问令牌，只发 Bearer）。
+
+    **判据只在这一处**（改图的 `spawn_overrides("builtin")`、AI 修复的 `fixsession.connection()`、连接视图的路由都问它）：
+    有 Key（账号登录的记录看访问令牌）、有型号、地址合规（`check_base_url`：https 或本机回环）、不是不兼容的旧记录、家族认得。
+    账号登录记录的令牌可能快过期：spawn 之前由 `ai_oauth.ensure_fresh` 刷新（这里只看有没有令牌 + 刷新令牌）。"""
+    if not rec or incompatibility(rec):
+        return None
+    wire = _BUILTIN_WIRE.get(str(_family(str(rec.get("agent") or ""))))
+    chosen = (
+        str(model or "").strip()
+        or str(rec.get("default_model") or "").strip()
+        or next(iter(rec.get("models") or []), "")
+    )
+    if rec.get("auth") == "oauth":
+        oauth = rec.get("oauth") if isinstance(rec.get("oauth"), dict) else {}
+        key = str(oauth.get("access") or "") if oauth.get("refresh") else ""
+        auth = "bearer"
+    else:
+        key, auth = str(rec.get("api_key") or ""), "key"
+    base = str(rec.get("base_url") or "")
+    if wire and chosen and key and check_base_url(base) is None:
+        return {"wire": wire, "base_url": base, "api_key": key, "model": chosen, "auth": auth}
+    return None
+
+
+class EffortResolver:
+    """内置执行器在「这个地址 + 这个型号」上的思考强度：**连接视图（展示给用户的档位）与发送前的核对共用这一个**，不分两套。
+
+    * 只有官方 API 来源（`ai_catalog` 的 `effort_origins`）才有；第三方网关一律没有（不确定就不给，宁可不显示也不发对方不认的字段）；
+    * 官方来源先查 CLI 自己的型号目录缓存（`CodexAgent._catalog()` / `ClaudeAgent._catalog()`，现有代码已在只读这两份型号元数据，
+      不涉及凭据）：型号命中就**原样**用它给的档位与默认档（含 minimal / xhigh 等，CLI 目录说支持就支持；目录明确给了空 = 没有档位）；
+      目录读不到 / 型号不在目录里，才退回 `ai_catalog` 里按官方文档核对过的保守表；
+    * 最后按线上协议能发的取值过滤（anthropic：low/medium/high/xhigh/max；Responses：minimal/low/medium/high/xhigh）。
+    构造时只读一次 CLI 目录（连接视图要对每个型号各问一次）。"""
+
+    def __init__(self, agent: str, base_url: str):
+        self.agent, self.base_url = agent, base_url
+        self.official = ai_catalog.is_effort_origin(agent, base_url)
+        self._wire = _BUILTIN_WIRE.get(str(_family(agent)))
+        self._cli: dict[str, ai_agents.ModelDetail] = {}
+        if self.official:
+            cat = ai_agents.get_agent(agent)
+            try:
+                if isinstance(cat, ai_agents.CodexAgent):
+                    details = cat._catalog()
+                elif isinstance(cat, ai_agents.ClaudeAgent):
+                    details = cat._catalog()[0]
+                else:
+                    details = []
+            except Exception:  # noqa: BLE001 - 读不到 = 退回文档表
+                details = []
+            self._cli = {d.id: d for d in details if d.efforts_known}
+
+    def support(self, model: str | None) -> dict:
+        """→ `{"efforts": [...], "default": 默认档位 | None}`。"""
+        if not self.official:
+            return {"efforts": [], "default": None}
+        hit = self._cli.get(str(model or "").strip())
+        if hit is not None:
+            efforts, default = list(hit.efforts), hit.default_effort
+        else:
+            sup = ai_catalog.effort_support(self.agent, self.base_url, model)
+            efforts, default = sup["efforts"], sup["default"]
+        allowed = ANTHROPIC_EFFORTS if self._wire == "anthropic" else RESPONSES_EFFORTS
+        efforts = [e for e in efforts if e in allowed]
+        return {"efforts": efforts, "default": default if default in efforts else None}
+
+
+def builtin_effort_args(rec: dict, effort: str | None, model: str | None = None) -> list[str]:
+    """思考强度 → 内置执行器的参数。只有 `EffortResolver` 对「这个地址 + 这个型号」确认支持的档位才发，其余一律不发
+    （不支持 adaptive thinking 的型号带上 `thinking` 会 400）：
+    anthropic wire → `--effort X --thinking adaptive`（`output_config.effort` + `thinking:{type:adaptive}`，这些型号都是自适应思考；不发 `disabled`）；
+    openai-responses → `--effort X`（`reasoning.effort`）。"""
+    if not effort:
+        return []
+    agent, base = str(rec.get("agent") or ""), str(rec.get("base_url") or "")
+    chosen = (
+        str(model or "").strip()
+        or str(rec.get("default_model") or "").strip()
+        or next(iter(rec.get("models") or []), "")
+    )
+    resolver = EffortResolver(agent, base)
+    if effort not in resolver.support(chosen)["efforts"]:
+        return []
+    if resolver._wire == "anthropic":
+        return ["--effort", effort, "--thinking", "adaptive"]
+    return ["--effort", effort]
+
+
+def _builtin_overrides(
+    rec: dict, model: str | None, effort: str | None = None
+) -> tuple[list[str], dict[str, str]]:
+    """内置执行器的注入：地址 / 型号 / 协议名进 argv，**密钥（或账号登录的令牌）只进环境变量**（不进 argv / 日志 / 事件）。不可用 → 两者皆空。"""
+    conn = builtin_conn(rec, model)
+    if conn is None:
+        return [], {}
+    args = ["--wire", conn["wire"], "--base-url", conn["base_url"], "--model", conn["model"]]
+    if conn["auth"] == "bearer":
+        args += ["--auth", "bearer"]
+    args += builtin_effort_args(rec, effort, conn["model"])
+    return args, {ai_agents.BUILTIN_KEY_ENV: conn["api_key"]}
+
+
+def create(rec: dict) -> dict:
+    """**新增**一条（不合并进同 id 的旧记录）：id 已被占用就顺延成 `<id>-2`。→ 规范化后的记录（带密钥，内部用）。"""
+    rec = {k: v for k, v in rec.items() if k not in ("auth", "oauth")}
+
+    def tx(ai: dict):
+        providers = _providers_in(ai)
+        created = _clean(rec, {p.get("id") for p in providers})
+        return {"providers": [*providers, created]}, created
+
+    return _update(tx)
 
 
 def models_for(agent: str, pid: str | None = None) -> list[str]:

@@ -296,9 +296,9 @@ _BANNED_CALLS = {"HTTPSConnection", "HTTPConnection", "urlretrieve", "inject_int
 
 
 def _is_loopback_connection(call: ast.Call) -> bool:
-    """`HTTPConnection("127.0.0.1", ...)`：主机是字面量回环（HTTPSConnection / 变量主机仍被拦）。"""
+    """`HTTPConnection("127.0.0.1", ...)` / `HTTPConnection("::1", ...)`：主机是字面量回环（HTTPSConnection / 变量主机仍被拦）。"""
     first = call.args[0] if call.args else None
-    return isinstance(first, ast.Constant) and first.value == "127.0.0.1"
+    return isinstance(first, ast.Constant) and first.value in ("127.0.0.1", "::1")
 
 
 def _modules():
@@ -412,7 +412,11 @@ def _outbound_violations(rel: str, tree: ast.AST) -> tuple[list[str], dict[str, 
                 for lit in _scheme_literals(tree):
                     if not lit.startswith("http://127.0.0.1:"):
                         bad.append(f"{where} urlopen 所在模块里有非回环地址字面量 {lit!r}")
-        elif name == "HTTPConnection" and _is_loopback_connection(call):
+        elif name == "HTTPConnection" and (
+            _is_loopback_connection(call)
+            # 明文 http 的局域网 / 回环直连只有 `netpolicy.pinned_connection` 一处：先按放行段校验、再连判定时解析出的 IP
+            or (rel == "engine/netpolicy.py" and owner == "pinned_connection")
+        ):
             continue  # 直连 socket、不读代理设置：带凭据的回环请求靠它保证绝不经过代理
         elif name in _BANNED_CALLS:
             bad.append(f"{where} {name}（绕开 urllib opener 的传输）")

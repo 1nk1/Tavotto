@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import http.client
 import json
 import re
 import urllib.error
@@ -22,7 +21,7 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-from .. import tlstrust
+from .. import netpolicy, tlstrust
 
 USER_AGENT = "tavotto-agent-runner/1"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -30,9 +29,11 @@ ANTHROPIC_VERSION = "2023-06-01"
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 
 EFFORTS = ("low", "medium", "high")
-#: anthropic adaptive 的 `output_config.effort` 还多一档 max
-ANTHROPIC_EFFORTS = (*EFFORTS, "max")
+#: anthropic adaptive 的 `output_config.effort` 还多两档：xhigh（5 系列 / opus-4-7 / opus-4-8）与 max
+ANTHROPIC_EFFORTS = (*EFFORTS, "xhigh", "max")
 #: 调用方声明「思考怎么传」（不由 runner 猜；第三方兼容网关各不相同）：adaptive=新模型，budget=旧模型，none=都不发
+#: Responses 的 `reasoning.effort` 取值（CLI 型号目录可能给 minimal / xhigh；没有 max，也不发 none）
+RESPONSES_EFFORTS = ("minimal", *EFFORTS, "xhigh")
 THINKING_MODES = ("adaptive", "budget", "none")
 #: anthropic 旧式 `thinking.budget_tokens`（仅 `--thinking budget`；新模型上已弃用，不许发）
 _THINKING_BUDGET = {"low": 1024, "medium": 4096, "high": 12000}
@@ -255,6 +256,10 @@ class AnthropicWire:
 
     name = "anthropic"
 
+    def __init__(self, bearer_only: bool = False):
+        #: 账号登录（OAuth）的访问令牌只认 `Authorization: Bearer`；同时发 `x-api-key` 会让部分网关 401（Kimi 社区报告）
+        self.bearer_only = bearer_only
+
     def build(
         self,
         *,
@@ -313,7 +318,7 @@ class AnthropicWire:
             body["max_tokens"] = max_output_tokens + budget
             body["thinking"] = {"type": "enabled", "budget_tokens": budget}
         headers = {
-            "x-api-key": api_key,
+            **({} if self.bearer_only else {"x-api-key": api_key}),
             "Authorization": f"Bearer {api_key}",
             "anthropic-version": ANTHROPIC_VERSION,
         }
@@ -534,7 +539,7 @@ class OpenAIResponsesWire:
                 }
                 for t in tools
             ]
-        if effort in EFFORTS:
+        if effort in RESPONSES_EFFORTS:
             body["reasoning"] = {"effort": effort}
             body["include"] = ["reasoning.encrypted_content"]
         return Request(
@@ -622,7 +627,8 @@ def _opener() -> urllib.request.OpenerDirector:
 
 
 def check_base_url(base_url: str) -> str | None:
-    """通过回 None；否则回短错误码。https，或主机恰为字面量 127.0.0.1 的 http；不带用户信息 / 查询 / 片段。"""
+    """通过回 None；否则回短错误码。https，或明文 http 但主机属于本机回环 / 私网（判据只在 `netpolicy`：IP 字面量直接判，
+    主机名解析出的**全部**IP 都在放行段才行）；不带用户信息 / 查询 / 片段。"""
     try:
         u = urllib.parse.urlsplit(base_url)
         host = u.hostname
@@ -633,7 +639,7 @@ def check_base_url(base_url: str) -> str | None:
         return "bad_base_url"
     if u.scheme == "https":
         return None
-    if u.scheme == "http" and host == "127.0.0.1":
+    if u.scheme == "http" and netpolicy.plain_http_allowed(host):
         return None
     return "base_url_scheme"
 
@@ -663,7 +669,9 @@ def post_json(
     try:
         if u.scheme == "http":
             # 回环 http：直连 socket，不读代理设置
-            conn = http.client.HTTPConnection("127.0.0.1", u.port or 80, timeout=timeout)
+            # 明文 http：判定与连接用同一次解析，直连已校验的 IP（`Host` 头保留原主机名），不读代理设置
+            conn, host_header = netpolicy.pinned_connection(url, timeout)
+            hdrs = {**hdrs, "Host": host_header}
             try:
                 path = u.path or "/"
                 conn.request("POST", path, body=payload, headers=hdrs)

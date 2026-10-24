@@ -490,7 +490,13 @@ class TestWires:
         ("url", "code"),
         [
             ("http://example.com/v1", "base_url_scheme"),
-            ("http://localhost:1234", "base_url_scheme"),
+            ("http://8.8.8.8:1234", "base_url_scheme"),
+            ("http://169.254.169.254", "base_url_scheme"),
+            ("http://[fe80::1]:80", "base_url_scheme"),
+            ("http://0.0.0.0:80", "base_url_scheme"),
+            ("http://127.0.0.2:80", "base_url_scheme"),
+            ("http://localhost.evil.example", "base_url_scheme"),
+            ("http://[::2]:80", "base_url_scheme"),
             ("ftp://x", "base_url_scheme"),
             ("https://user:pw@api.example.com", "bad_base_url"),
             ("https://api.example.com?x=1", "bad_base_url"),
@@ -503,6 +509,12 @@ class TestWires:
     def test_base_url_accepts_https_and_loopback_http(self):
         assert wires.check_base_url("https://api.example.com/v1") is None
         assert wires.check_base_url("http://127.0.0.1:8080") is None
+        assert wires.check_base_url("http://localhost:8080") is None
+        assert wires.check_base_url("http://localhost") is None
+        assert wires.check_base_url("http://[::1]:8080") is None
+        assert (
+            wires.check_base_url("http://10.0.0.5:1234") is None
+        )  # 私网（实验室网关）：见 tests/test_netpolicy.py
 
     def test_loopback_http_ignores_proxy_environment(self, cand, serve):
         """autouse 把代理指到死端口；回环 http 能通就证明它没走代理。"""

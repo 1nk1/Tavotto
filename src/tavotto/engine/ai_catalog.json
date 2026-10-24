@@ -1,5 +1,229 @@
 {
   "version": 1,
+  "effort_origins": [
+    {
+      "origin": "https://api.anthropic.com",
+      "agent": "claude",
+      "models": [
+        {
+          "prefix": "claude-fable-5-1",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-fable-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-mythos-5-1",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-mythos-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-mythos-preview",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-opus-5-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        },
+        {
+          "prefix": "claude-opus-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-opus-4-8",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-opus-4-7",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-opus-4-6",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-sonnet-5-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-sonnet-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-sonnet-4-6",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "max"
+          ],
+          "default": "high"
+        },
+        {
+          "prefix": "claude-haiku-5-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high",
+            "xhigh",
+            "max"
+          ],
+          "default": "medium"
+        }
+      ],
+      "source": "https://platform.claude.com/docs/en/build-with-claude/effort ; https://platform.claude.com/docs/en/about-claude/models/overview（2026-10-25 核对：xhigh 只有 5 系列 / opus-4-7 / opus-4-8；opus-4-6、sonnet-4-6、mythos-preview 到 max；Haiku 4.5 及更早不支持；claude-opus-4-5 只配合 budget_tokens 的 extended thinking，runner 不支持，故不给）"
+    },
+    {
+      "origin": "https://api.openai.com",
+      "agent": "codex",
+      "models": [
+        {
+          "prefix": "gpt-5-chat",
+          "efforts": []
+        },
+        {
+          "prefix": "o1-mini",
+          "efforts": []
+        },
+        {
+          "prefix": "o1-preview",
+          "efforts": []
+        },
+        {
+          "prefix": "gpt-5",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        {
+          "prefix": "gpt-6",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        {
+          "prefix": "o1",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        {
+          "prefix": "o3",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        },
+        {
+          "prefix": "o4",
+          "efforts": [
+            "low",
+            "medium",
+            "high"
+          ],
+          "default": "medium"
+        }
+      ],
+      "source": "https://developers.openai.com/api/docs/guides/reasoning（2026-10-25 核对：reasoning.effort 取值 none/minimal/low/medium/high/xhigh/max 且按型号不同，页面没有完整清单；保守取交集 low/medium/high，不给 none/minimal/xhigh/max，直到逐型号核实；gpt-5-chat 等非推理型号不给）"
+    }
+  ],
   "vendors": [
     {
       "id": "deepseek",
@@ -48,7 +272,9 @@
       ],
       "source": "https://platform.kimi.com/docs/guide/claude-code-kimi",
       "oauth": null,
-      "icon_key": "moonshot"
+      "icon_key": "moonshot",
+      "vendor_label": "Kimi",
+      "vendor_label_key": "vendor.kimi"
     },
     {
       "id": "kimi-code",
@@ -64,7 +290,9 @@
       ],
       "source": "openclaw docs/providers/moonshot.md#L196",
       "oauth": null,
-      "icon_key": "kimi"
+      "icon_key": "kimi",
+      "vendor": "moonshot",
+      "method_key": "method.kimiCode"
     },
     {
       "id": "kimi-code-codex",
@@ -82,7 +310,9 @@
       ],
       "oauth": null,
       "source": "https://www.kimi.com/code/docs/en/third-party-tools/codex",
-      "icon_key": "kimi"
+      "icon_key": "kimi",
+      "vendor": "moonshot",
+      "method_key": "method.kimiCode"
     },
     {
       "id": "zhipu",
@@ -130,7 +360,9 @@
       ],
       "source": "https://help.aliyun.com/zh/model-studio/claude-code",
       "oauth": null,
-      "icon_key": "bailian"
+      "icon_key": "bailian",
+      "vendor_label": "Alibaba Bailian",
+      "vendor_label_key": "vendor.bailian"
     },
     {
       "id": "dashscope-coding",
@@ -146,7 +378,50 @@
       ],
       "source": "https://help.aliyun.com/zh/model-studio/claude-code",
       "oauth": null,
-      "icon_key": "bailian"
+      "icon_key": "bailian",
+      "vendor": "dashscope",
+      "method_key": "method.codingPlan"
+    },
+    {
+      "id": "openai-api",
+      "label_key": "vendor.openai",
+      "brand": "OpenAI",
+      "region": "global",
+      "agent": "codex",
+      "base_url": "https://api.openai.com/v1",
+      "wire_api": "responses",
+      "key_url": "https://platform.openai.com/api-keys",
+      "models_hint": [
+        "gpt-5",
+        "gpt-5-mini"
+      ],
+      "source": "https://platform.openai.com/docs/api-reference/responses",
+      "oauth": null,
+      "icon_key": "openai",
+      "vendor": "openai",
+      "vendor_label": "OpenAI",
+      "preset": false
+    },
+    {
+      "id": "anthropic-api",
+      "label_key": "vendor.anthropic",
+      "brand": "Anthropic",
+      "region": "global",
+      "agent": "claude",
+      "base_url": "https://api.anthropic.com",
+      "key_url": "https://console.anthropic.com/settings/keys",
+      "models_hint": [
+        "claude-sonnet-5-5",
+        "claude-opus-5-5",
+        "claude-haiku-5-5",
+        "claude-fable-5-1"
+      ],
+      "source": "https://docs.claude.com/en/api/overview",
+      "oauth": null,
+      "icon_key": "anthropic",
+      "vendor": "anthropic",
+      "vendor_label": "Claude",
+      "preset": false
     },
     {
       "id": "anthropic",

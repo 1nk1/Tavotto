@@ -21,7 +21,6 @@ from __future__ import annotations
 import logging
 import secrets
 import subprocess
-import sys
 import threading
 import time
 from collections import OrderedDict
@@ -33,7 +32,7 @@ from . import fixtools
 from .agent_runner import loop
 from .agent_runner.redact import NO_REDACTION, Redactor
 from .agent_runner.tools import Limits, RunEnvelope, Tool
-from .agent_runner.wires import WIRES, Turn, check_base_url
+from .agent_runner.wires import WIRES, AnthropicWire, Turn
 from .fixtools.audit import AuditLog
 from .fixtools.observe import read_run_report
 
@@ -826,23 +825,13 @@ SESSIONS = FixSessions()
 
 # --------------------------------------------------------------------------- 连接（API 连接 → 内置执行器的模型）
 def connection() -> dict | None:
-    """用户连着的、内置执行器能直接用的 API 连接：该 agent 当前选中的第三方接口，有地址 / 密钥 / 型号、地址合规。
-    只连了 CLI（官方登录态）时返回 None——那条路走 `cli_agent()` + MCP 接法（D3）。返回里带密钥，**只给 `build_model` 用**。"""
-    from . import ai_agents, ai_providers
+    """用户连着的、内置循环能直接用的 Key 连接：连接视图（`ai_connections`）里**第一个可用的** Key 连接——有地址 / 密钥 / 型号、
+    地址合规、不是账号登录、不是不兼容的旧记录；不再只看各家族「当前选中」的那一条。顺序：旧版选中的接口在前（老用户的结论不变），
+    其余按保存顺序。只连了 CLI（官方登录态）时返回 None——那条路走 `cli_agent()` + MCP 接法（D3）。
+    返回里带密钥，**只给 `build_model` 用**。"""
+    from . import ai_connections
 
-    for agent in ai_providers.agents():
-        rec = ai_providers.resolve(agent)
-        if not rec:
-            continue
-        family = getattr(ai_agents.get_agent(agent), "endpoint_family", None)
-        wire = {"anthropic": "anthropic", "openai": "openai-responses"}.get(str(family))
-        model = str(rec.get("default_model") or "").strip() or next(
-            iter(rec.get("models") or []), ""
-        )
-        base, key = str(rec.get("base_url") or ""), str(rec.get("api_key") or "")
-        if wire and model and key and check_base_url(base) is None:
-            return {"wire": wire, "base_url": base, "api_key": key, "model": model}
-    return None
+    return ai_connections.first_key_connection(refresh=True)
 
 
 def cli_agent() -> str | None:
@@ -858,20 +847,20 @@ def cli_agent() -> str | None:
 def available() -> bool:
     """「使用你的 AI 来修复」能不能真的跑：有内置循环能用的 API 连接，或有可用的 Codex / Claude Code。"""
     try:
-        return connection() is not None or cli_agent() is not None
+        from . import ai_connections
+
+        # 只问「有没有」：不联网（账号登录令牌的刷新留到真要开跑的 `connection()`）
+        return ai_connections.first_key_connection() is not None or cli_agent() is not None
     except Exception:  # noqa: BLE001 - 探测失败 = 不可用
         return False
 
 
 def mcp_launcher() -> list[str]:
-    """本地 MCP 修复模式服务的启动命令（`tavotto fix-mcp`）。冻结产物里 `sys.executable` 就是 Tavotto 自己，
-    优先用同目录的 console 版 `tavotto-cli`（GUI 子系统的 exe 没有可靠的 stdio）；源码 / pip 形态走 `-m tavotto`。"""
-    if getattr(sys, "frozen", False):
-        from . import locate
+    """本地 MCP 修复模式服务的启动命令（`tavotto fix-mcp`）。前缀与内置执行器同一出处（`ai_agents.tavotto_launcher`）：
+    冻结产物优先用同目录的 console 版 `tavotto-cli`，源码 / pip 形态走 `-m tavotto`。"""
+    from . import ai_agents
 
-        cli = Path(sys.executable).with_name(locate.CLI_NAME)
-        return [str(cli if cli.is_file() else sys.executable), "fix-mcp"]
-    return [sys.executable, "-m", "tavotto", "fix-mcp"]
+    return [*ai_agents.tavotto_launcher(), "fix-mcp"]
 
 
 def cli_launcher(
@@ -903,8 +892,13 @@ def cli_launcher(
 
 def build_model(conn: dict):
     """连接 → `HttpModel`。密钥只放进模型对象（`repr` 不含），返回的 `Redactor` 用于过滤卡片里的回显。"""
+    wire = (
+        AnthropicWire(bearer_only=True)
+        if conn.get("auth") == "bearer" and conn["wire"] == "anthropic"
+        else WIRES[conn["wire"]]
+    )
     model = loop.HttpModel(
-        WIRES[conn["wire"]],
+        wire,
         base_url=conn["base_url"],
         api_key=conn["api_key"],
         model=conn["model"],

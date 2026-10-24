@@ -33,7 +33,16 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
-from . import ai_agents, ai_history, ai_oauth, ai_providers, config, projectenv, scriptlock
+from . import (
+    ai_agents,
+    ai_connections,
+    ai_history,
+    ai_oauth,
+    ai_providers,
+    config,
+    projectenv,
+    scriptlock,
+)
 from .ai_agents import spawn_env as _spawn_env  # noqa: F401 — run() 与旧调用方仍认这个名字
 from .runtime import (  # noqa: F401 — 重导出，历史调用方仍认这个名字
     CREATE_NEW_CONSOLE,
@@ -394,10 +403,15 @@ def capabilities(refresh: bool = False) -> dict:
         gen = _CAPS_GEN
     saved = config.ai_agent_settings()
     npm_available = _npm_argv() is not None
+    agent_infos = [_agent_caps(a, saved.get(a.id) or {}, npm_available) for a in ai_agents.agents()]
+    infos_by_id = {a["id"]: a for a in agent_infos}
     caps = {
-        "agents": [
-            _agent_caps(a, saved.get(a.id) or {}, npm_available) for a in ai_agents.agents()
-        ],
+        # 旧字段：只有两家 CLI。内置执行器**不在这里**（旧前端会把它当一个执行器显示），它只经 connections 的 route 体现
+        "agents": agent_infos,
+        # 「连接」视图（接口约定 2026-10-24）：厂商目录 / 已连接的连接 / 排序提示
+        "vendors": ai_connections.vendors(infos_by_id),
+        "connections": ai_connections.connections(infos_by_id),
+        "locale_region": ai_connections.locale_region(),
         "endpoints": [ai_providers.public(p) for p in ai_providers.list_providers()],
         "presets": ai_providers.PRESETS,
         # 账号登录（设备码 OAuth）：没有 Tavotto 自己的 client_id 的厂商 oauth_available=false → 界面不出现入口
@@ -410,6 +424,13 @@ def capabilities(refresh: bool = False) -> dict:
         if gen == _CAPS_GEN:
             _CAPS_CACHE = caps
     return caps
+
+
+def resolve_connection(connection_id: str) -> tuple[str, dict | None]:
+    """连接 id → `(agent_id, endpoint 记录 | None)`（路由规则见 `ai_connections`）；改图请求带 `connection` 时用。
+    找不到 / 走不通 → `ai_connections.ConnectionRefused`。"""
+    infos = {a["id"]: a for a in capabilities().get("agents", [])}
+    return ai_connections.resolve_connection(connection_id, infos)
 
 
 def capabilities_generation() -> int:
@@ -445,6 +466,11 @@ def require_usable(agent_id: str) -> dict:
     最后那道 `usable` 才是兜底——将来 usable 多一个成因，这里自动跟上。
     """
     require_agent(agent_id)
+    if agent_id == ai_agents.BUILTIN_ID:
+        # 内置执行器没有 CLI 可探测：判据 = 有可用的 Key 连接（且没被 TAVOTTO_AI_BUILTIN=0 强制关掉）
+        if not ai_connections.builtin_usable():
+            raise AgentError("ai_agent_not_usable", {"agent": agent_id})
+        return {"id": agent_id, "usable": True}
     info = agent_caps(agent_id)
     if info is None:  # 理论上到不了
         raise AgentError("ai_agent_unknown", {"agent": agent_id})
@@ -540,13 +566,44 @@ script_guard = scriptlock.script_guard
 _REQUEST_LOCK = threading.RLock()
 
 
-def _popen(cmd: list[str], cwd: str, env: dict, stderr_log) -> subprocess.Popen:
-    """起一次 Agent CLI。首次运行与 TAF 修正共用这一处，进程参数只有一份。"""
-    return subprocess.Popen(
+def _feed_stdin(proc: subprocess.Popen, text: str, keep_open: bool = False) -> None:
+    """把提示词写进子进程的 stdin 再关掉（写不进去 = 子进程已经退了，不是错）。放线程里：提示词可能超过管道缓冲，
+    而子进程读 stdin 的时刻不由我们定，主线程不能被卡在 write 上。`keep_open`：之后还要往 stdin 写 `check` 的回复（转换任务）。"""
+
+    def feed() -> None:
+        try:
+            assert proc.stdin is not None
+            proc.stdin.write(text)
+            proc.stdin.flush()
+        except (OSError, ValueError):
+            pass
+        finally:
+            if not keep_open:
+                try:
+                    proc.stdin.close()  # type: ignore[union-attr]
+                except (OSError, ValueError, AttributeError):
+                    pass
+
+    threading.Thread(target=feed, daemon=True, name="ai-builtin-stdin").start()
+
+
+def _popen(
+    cmd: list[str],
+    cwd: str,
+    env: dict,
+    stderr_log,
+    stdin_text: str | None = None,
+    keep_stdin_open: bool = False,
+) -> subprocess.Popen:
+    """起一次 Agent CLI。首次运行与 TAF 修正共用这一处，进程参数只有一份。
+
+    `stdin_text`（只有内置执行器给）：提示词经 stdin 交给子进程，不进 argv。其余一律 DEVNULL。"""
+    proc = subprocess.Popen(
         cmd,
         cwd=cwd,
         env=env,
-        stdin=subprocess.DEVNULL,  # 桌面 sidecar 的 stdin 是父进程死亡信号管道，不外传
+        # 桌面 sidecar 的 stdin 是父进程死亡信号管道，不外传；内置执行器的提示词走我们新开的管道
+        stdin=subprocess.DEVNULL if stdin_text is None else subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=stderr_log,  # CLI 的 hook/统计噪音不进对话
         text=True,
@@ -560,6 +617,9 @@ def _popen(cmd: list[str], cwd: str, env: dict, stderr_log) -> subprocess.Popen:
         # Windows 的 `taskkill /T` 按 pid 找子树，不需要单独的组
         start_new_session=os.name != "nt",
     )
+    if stdin_text is not None:
+        _feed_stdin(proc, stdin_text, keep_stdin_open)
+    return proc
 
 
 def _terminate(sess: dict) -> None:
@@ -991,10 +1051,36 @@ def _cmd(
     model: str | None = None,
     effort: str | None = None,
     endpoint: dict | None = None,
+    target: str | None = None,
+    task: str = "figure_edit",
+    output: str | None = None,
 ) -> tuple[list[str], dict[str, str]]:
     """→ (命令行, 需要追加到环境的变量)。第三方接口全部走这两样注入，
-    绝不改写用户自己的 ~/.claude 或 ~/.codex 配置。"""
+    绝不改写用户自己的 ~/.claude 或 ~/.codex 配置。
+
+    内置执行器（`agent.internal`）没有 CLI 可解析：命令是 Tavotto 自己的 `agent-run` 子命令，`target` = 目标脚本（相对 `cwd`），
+    密钥只在返回的环境变量里。"""
     agent = require_agent(agent_id)
+    if agent.internal:
+        extra_args, extra_env = ai_providers.spawn_overrides(agent_id, endpoint, model, effort)
+        if (
+            not extra_args
+        ):  # 记录不可用（没 Key / 没型号 / 地址不合规）：不起一个注定 `auth` 失败的进程
+            raise AgentError("ai_agent_not_usable", {"agent": agent_id})
+        spec = agent.build_command(
+            ai_agents.RunContext(
+                argv=[],
+                prompt=prompt,
+                cwd=cwd,
+                target=target,
+                task=task,
+                output=output,
+                model=model,
+                endpoint_args=list(extra_args),
+                endpoint_env=dict(extra_env),
+            )
+        )
+        return list(spec.argv), dict(spec.env)
     res = ai_agents.resolve(agent)
     if res.argv is None:
         raise AgentError("ai_agent_not_installed", {"agent": agent_id})
@@ -1087,6 +1173,15 @@ def _build_prompt(
     )
 
 
+def _endpoint_backed(agent_id: str, endpoint_id: str | None) -> bool:
+    """显式指定的接口会不会真的接管这次调用（`spawn_overrides` 真产出了注入）。"""
+    if not endpoint_id:
+        return False
+    rec = ai_providers.resolve(agent_id, endpoint_id)
+    args, env = ai_providers.spawn_overrides(agent_id, rec)
+    return bool(args or env)
+
+
 def run(
     agent: str,
     script: str,
@@ -1125,7 +1220,12 @@ def run(
     重发一条已经在跑的请求得到的是既有会话，不是 409。同脚本上另一个会话还在跑（不同请求）
     则 409 `ai_script_busy`——后端不能只靠前端的 `runningHere` 挡并发。
     """
-    require_usable(agent)
+    try:
+        require_usable(agent)
+    except AgentError as exc:
+        # 被选中的连接自带凭据（第三方 Key / 账号登录令牌注入）时，CLI 自己有没有官方登录与这次运行无关
+        if exc.code != "ai_agent_needs_auth" or not _endpoint_backed(agent, endpoint_id):
+            raise
     # 账号登录的接口：令牌剩余不足 10 分钟就在 spawn **之前**刷新并写回。刷新要联网（最多数次 30 s），
     # 所以放在脚本锁 / 请求锁**之外**做，不卡住别的请求；刷不动的结论先记下，等去重查找之后再抛——
     # 已受理请求的重发仍得到既有会话（ADR 0132，去重先于其他可变判断）
@@ -1138,7 +1238,9 @@ def run(
             needs_login = {"endpoint": pre_chosen.get("label") or pre_chosen.get("id") or ""}
     script_path = Path(figures_dir) / script
     project_key = str(Path(figures_dir).resolve())
-    taf = _taf_enabled()
+    # 内置执行器**一律**走候选工作区 + 提交前检查 + 事务写回（与 TAF 实验开关无关）：它不是用户装的 CLI，
+    # 没有理由拿到真实项目路径；候选建不起来就整条拒绝（见下），绝不退回原地修改
+    taf = _taf_enabled() or agent == ai_agents.BUILTIN_ID
     # 从「脚本在不在」到登记进 SESSIONS 整段持脚本锁：改写 / 复原的事务要么在这之前落地（这里快照的
     # 就是改后的脚本），要么在这之后看到 running 的会话而让路
     with script_guard(script_path), _REQUEST_LOCK:
@@ -1159,6 +1261,10 @@ def run(
             )
         if needs_login is not None:
             raise AgentError("ai_endpoint_needs_login", needs_login)
+        if agent == ai_agents.BUILTIN_ID:
+            # 内置执行器必须显式指到一条内置循环能用的连接（没有「当前选中」这回事）
+            if ai_providers.builtin_conn(chosen, model) is None:
+                raise AgentError("ai_agent_not_usable", {"agent": agent})
         if not script_path.is_file():
             raise RuntimeError(f"脚本不存在: {script}")
         if script_busy(script_path):
@@ -1286,8 +1392,27 @@ def run(
                 prompt += "\n\n" + ai_figure_edit.prompt_note(cand)
         stderr_log = open(SNAP_DIR / f"{sid}.stderr.log", "wb", buffering=0)
         endpoint = ai_providers.resolve(agent, endpoint_id)
+        builtin = agent == ai_agents.BUILTIN_ID
+        # 内置执行器要知道目标脚本（写权限收窄到它）；提示词走 stdin 不进 argv。两家 CLI 的调用形状一个字节不变
+        # 转换任务（ADR 0143）：Agent 读候选里的原脚本副本、新建 `<原名>_matplotlib.py`；`check` 经 stdin/stdout 回调本进程的校验流水
+        builtin_convert = builtin and convert is not None
+        if builtin_convert:
+            cmd_kw = {
+                "target": Path(script).name,
+                "task": "convert_to_editable",
+                "output": cand.target_name,
+            }
+        else:
+            cmd_kw = {"target": cand.target_name if cand is not None else script} if builtin else {}
+
+        def stdin_for(text: str) -> str | None:
+            if not builtin:
+                return None
+            return json.dumps({"prompt": text}) + "\n" if builtin_convert else text
+
+        stdin_text = stdin_for(prompt)
         cmd, extra_env = _cmd(
-            agent, prompt, agent_cwd, model=model, effort=effort, endpoint=endpoint
+            agent, prompt, agent_cwd, model=model, effort=effort, endpoint=endpoint, **cmd_kw
         )
         # 提示词按**值**从日志里摘掉（它在命令行里的位置各家不同：codex 在末尾、
         # claude 在 `-p` 后面）。按 agent 写死下标那种做法，加第三个 Agent 时
@@ -1363,7 +1488,11 @@ def run(
                 from . import ai_tasks
 
                 task_run = ai_tasks.begin_registered(sid, envelope)
-            proc = _popen(cmd, agent_cwd, env, stderr_log)
+                if builtin_convert:
+                    # 内置执行器的 `check` 在 spawn 之后、消费它的输出期间就会跑校验（早于编排器的 `_render` 挂取消标记）：
+                    # 会话的取消标记要在 spawn 前就挂到候选上，取消才会中止校验的 worker 与依赖安装
+                    cand.extras["cancel"] = task_run.cancel_event
+            proc = _popen(cmd, agent_cwd, env, stderr_log, stdin_text, builtin_convert)
             _SPAWN_MARK.started = True  # 进程已经起来了：此后任何异常都不能再清账本行
         except BaseException as exc:
             # 记录已落库而进程没起来：标成失败，不是删掉——「查询」要查得到它，且明确是没执行
@@ -1415,11 +1544,31 @@ def run(
 
     log_state = {"log": stderr_log}
 
+    def _answer_check() -> None:
+        """内置执行器的 `check`：跑 ADR 0143 的校验流水（`run_validation`，候选工作区里），把结论写回它的 stdin。"""
+        from . import ai_convert
+
+        try:
+            ok, report = ai_convert.agent_check(cand)
+        except Exception:  # noqa: BLE001 - 校验流水自身出错：告诉 Agent 不通过，不拖垮会话
+            LOG.exception("内置执行器的 check 回调出错（session %s）", sid)
+            ok, report = False, "check_failed"
+        reply = json.dumps({"ok": ok, "report": report}, ensure_ascii=True) + "\n"
+        try:
+            pipe = sess["proc"].stdin
+            pipe.write(reply)
+            pipe.flush()
+        except (OSError, ValueError, AttributeError):
+            pass  # 子进程已经退出
+
     def _consume():
         st: dict = {}
         for line in sess["proc"].stdout:
             line = line.rstrip("\n")
             if not line.strip():
+                continue
+            if builtin_convert and '"check_request"' in line:
+                _answer_check()
                 continue
             for kind, text in _classify(agent, line, st):
                 if not text:
@@ -1449,14 +1598,23 @@ def run(
             {"session": sid, "task_type": sess["task"]["task_type"], "phase": "correcting"},
         )
         again = prompt + "\n\n" + note
-        cmd2, extra2 = _cmd(agent, again, agent_cwd, model=model, effort=effort, endpoint=endpoint)
+        cmd2, extra2 = _cmd(
+            agent, again, agent_cwd, model=model, effort=effort, endpoint=endpoint, **cmd_kw
+        )
         LOG.info(
             "AI 任务修正命令: %s", " ".join("<prompt>" if part == again else part for part in cmd2)
         )
         log_state["log"] = open(SNAP_DIR / f"{sid}.stderr.log", "ab", buffering=0)
         sess["exited"].clear()
         try:
-            sess["proc"] = _popen(cmd2, agent_cwd, _spawn_env(cmd2[0], extra2), log_state["log"])
+            sess["proc"] = _popen(
+                cmd2,
+                agent_cwd,
+                _spawn_env(cmd2[0], extra2),
+                log_state["log"],
+                stdin_for(again),
+                builtin_convert,
+            )
         except BaseException:
             sess["exited"].set()  # 没起来：没有要等的进程
             log_state["log"].close()
