@@ -58,6 +58,8 @@ SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TEST_SELECTOR_RE = re.compile(r"^tests/[A-Za-z0-9_./-]+\.py(::[A-Za-z0-9_\[\]./-]+)*$")
 SHARD_RE = re.compile(r"^([1-9][0-9]?)/([1-9][0-9]?)$")
 MAX_SELECTORS = 40
+#: hosts-live 的 --mode：真宿主的闭集（实现见 LIVE_HOSTS）
+LIVE_HOST_IDS = ("claude-code", "codex-cli", "codebuddy", "minimax-code", "dsh")
 #: 依赖安装配方的版本：改了 prepare 的安装步骤就加一，已有 venv 随之重装（散列戳里含它）。
 DEPS_RECIPE = "2"
 
@@ -136,6 +138,8 @@ class Task:
     needs_model_conf: bool = False
     #: 安装包：`--package` / `--from` 只收 cache\packages\ 里带 .sha256 的文件名
     accepts_package: bool = False
+    #: corpus：`--mode` 只收登记值
+    modes: tuple[str, ...] = ()
 
 
 #: Windows 回归 + 编码 / 路径 / 导出 / 保存重载这一组都是仓库里已有的用例，Lab 只负责在真
@@ -232,11 +236,56 @@ TASKS: dict[str, Task] = {
             ),
         ),
         Task(
+            id="desktop-window",
+            kind="desktop-window",
+            summary="真窗口：装包后在已登录的交互会话里跑 tests/desktop_windows（WebView2 + msedgedriver 附着），与 nightly 同一套用例",
+            timeout_s=2400,
+            accepts_package=True,
+            claim=(
+                "tests/desktop_windows 的真窗口用例在 Lab 的交互桌面（非管理员、zh-CN、Defender 开）上对这个安装包的 junit 结论；"
+                "任何 skip 都让结论降为 skipped"
+            ),
+            unverified=(
+                "交互会话是自动登录的控制台会话，不是 RDP、不是多显示器 / 高 DPI",
+                "键鼠经 CDP 与窗口消息投递，不是真实硬件输入（IME 不覆盖）",
+                "Server 2025 不是 Windows 10 / 11 客户端",
+            ),
+        ),
+        Task(
+            id="env-matrix",
+            kind="env-matrix",
+            summary="环境矩阵：装包后对每个解释器环境跑 nightly 同款冒烟（内置 / 官方 CPython / uv 3.10·3.12·3.14 / conda / 中文空格路径 venv）",
+            timeout_s=5400,
+            accepts_package=True,
+            claim=(
+                "每条腿：装好的 sidecar 在中文 + 空格的项目路径下渲染导出成功，且渲染解释器来源与期望一致"
+                "（不指定 → bundled 并带全科学栈；TAVOTTO_WORKER_PYTHON 指定 → env_override 压过内置）"
+            ),
+            unverified=(
+                "uv 装的是 python-build-standalone，不是 python.org 安装器（只有 3.13 是官方安装器）",
+                "不覆盖 Microsoft Store Python、pyenv-win、企业代理 / 证书拦截环境",
+                "项目自带 .venv 的自动采用（project_venv）不在本任务",
+            ),
+        ),
+        Task(
+            id="corpus",
+            kind="corpus",
+            summary="脚本语料：CompatBench（scripts/ci/compat_matrix.py）在 Lab 上跑——smoke 与 CI compat-smoke 同口径，all 跑全部 case",
+            timeout_s=5400,
+            modes=("smoke", "all"),
+            claim="经评审的 CompatBench 语料在真 Windows（cp936、非管理员、Defender 开）上的结论；不比像素保真度",
+            unverified=(
+                "只跑仓库里经评审的语料，不跑用户提交的脚本（那要一次性隔离环境）",
+                "--no-fidelity：不比像素基线",
+            ),
+        ),
+        Task(
             id="hosts-live",
             kind="hosts-live",
             summary="AI 宿主 L4/L5：真 Claude Code（国内 Anthropic 兼容模型）调用 Tavotto MCP，改图、导出、重开核对",
             timeout_s=2400,
             needs_model_conf=True,
+            modes=tuple(LIVE_HOST_IDS),
             claim=(
                 "L4 = 真 Claude Code CLI 在 Lab 上执行了 Tavotto MCP 工具调用并拿到成功结果；"
                 "L5 = 同一张真实 matplotlib 图经宿主打开、改线宽与图例、导出 PDF、重放校验，"
@@ -277,8 +326,11 @@ def validate_test_args(
     network: str,
     package: str | None = None,
     frm: str | None = None,
+    mode: str | None = None,
 ) -> str | None:
     """返回错误文本；None = 合法。所有参数都可审计：没有透传通道。"""
+    if mode and mode not in task.modes:
+        return f"task {task.id} does not accept --mode {mode} (allowed: {', '.join(task.modes) or 'none'})"
     if (package or frm) and not task.accepts_package:
         return f"task {task.id} does not accept --package / --from"
     if task.accepts_package and not package:
@@ -1135,8 +1187,6 @@ def run_hosts_task(lab: Lab, run_dir: Path, env: dict) -> dict:
             henv = dict(env)
             henv[h["config_env"]] = str(cfg)
             server = [str(py), str(lab.repo / "codex-plugin" / "mcp" / "server.py")]
-            # Tavotto 的数据目录写进宿主的 MCP 配置（用户就是这么配的），不塞进宿主进程自己的环境
-            data = f"TAVOTTO_DATA_DIR={run_dir / 'work' / 'tavotto-data'}"
             if h["id"] == "claude-code":
                 add = [
                     str(exe),
@@ -1145,13 +1195,11 @@ def run_hosts_task(lab: Lab, run_dir: Path, env: dict) -> dict:
                     "tavotto",
                     "--scope",
                     "user",
-                    "-e",
-                    data,
                     "--",
                     *server,
                 ]
             else:
-                add = [str(exe), "mcp", "add", "tavotto", "--env", data, "--", *server]
+                add = [str(exe), "mcp", "add", "tavotto", "--", *server]
             _run_logged(add, lab.root, henv, ev / "mcp-add", 120)
             listed = _run_logged([str(exe), *h["mcp_list"]], lab.root, henv, ev / "mcp-list", 180)
             text = Path(f"{ev / 'mcp-list'}.stdout.log").read_text(
@@ -1352,116 +1400,431 @@ def judge_live(s1: dict, s2: dict, pdf: Path | None, journal_ok: bool, sid: str 
     return {"L4": l4, "L5": l5, "checks": checks}
 
 
-def run_hosts_live_task(lab: Lab, run_dir: Path, env: dict, model_conf: dict) -> dict:
-    exe = lab.cache / "npm-global" / "claude.cmd"
+def parse_recorded(path: Path, start_line: int = 0) -> dict:
+    """mcp_recorder 的 jsonl（服务端事实）→ 与 parse_stream 同形：判定只认 Tavotto 这一侧真发生了什么，
+    不认宿主怎么转述。`start_line` 之后的记录属于这一轮。"""
+    calls, listed = [], []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()[start_line:]
+    except OSError:
+        lines = []
+    for line in lines:
+        with contextlib.suppress(ValueError):
+            rec = json.loads(line)
+            if rec.get("dir") != "server":
+                continue
+            if rec.get("method") == "tools/list" and not rec.get("error"):
+                listed += rec.get("tools") or []
+            if rec.get("method") == "tools/call":
+                calls.append(
+                    {
+                        "name": f"mcp__tavotto__{rec.get('tool')}",
+                        "is_error": bool(rec.get("error")),
+                        "result": json.dumps(rec.get("facts") or {}, separators=(",", ":")),
+                    }
+                )
+    return {"calls": calls, "final": "", "listed_tools": sorted(set(listed))}
+
+
+def _line_count(path: Path) -> int:
+    try:
+        return len(path.read_text(encoding="utf-8").splitlines())
+    except OSError:
+        return 0
+
+
+@dataclass
+class LiveHost:
+    id: str
+    npm: str
+    bin: str
+    #: (lab, run_dir, proj, exe, mcp_command, mcp_env, model_conf, env) → 宿主进程的额外环境（配置写在 run 自己的目录里）
+    configure: object
+    #: prompt → argv（无头模式，提示词紧跟在前面，避免被可变长选项吞掉）
+    argv: object
+
+
+def _claude_configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, conf, env) -> dict:
+    cfg = run_dir / "work" / "claude-config"
+    cfg.mkdir(parents=True, exist_ok=True)
+    henv = dict(_host_model_env(conf), CLAUDE_CONFIG_DIR=str(cfg))
+    add = [str(exe), "mcp", "add", "tavotto", "--scope", "user"]
+    for k, v in mcp_env.items():
+        add += ["-e", f"{k}={v}"]
+    _run_logged(
+        [*add, "--", *mcp_cmd],
+        proj,
+        {**env, **henv},
+        run_dir / "evidence" / "live" / "mcp-add",
+        120,
+    )
+    return henv
+
+
+def _claude_argv(exe: Path, prompt: str, henv: dict) -> list[str]:
+    return [
+        str(exe),
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--max-turns",
+        "30",
+        "--allowedTools",
+        "mcp__tavotto",
+    ]
+
+
+def _toml_str(s: str) -> str:
+    return json.dumps(s, ensure_ascii=False)
+
+
+def _codex_configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, conf, env) -> dict:
+    """Codex：隔离的 CODEX_HOME + 自定义供应商（DeepSeek 的 OpenAI 兼容 Responses 接口，env_key 取密钥，不走登录）。"""
+    home = run_dir / "work" / "codex-home"
+    home.mkdir(parents=True, exist_ok=True)
+    env_lines = ", ".join(f"{k} = {_toml_str(v)}" for k, v in mcp_env.items())
+    toml = "\n".join(
+        [
+            f"model = {_toml_str(conf.get('openai_model') or 'deepseek-flash')}",
+            'model_provider = "lab"',
+            'forced_login_method = "api"',
+            'approval_policy = "never"',
+            'sandbox_mode = "workspace-write"',
+            "",
+            "[model_providers.lab]",
+            'name = "lab"',
+            f"base_url = {_toml_str(conf.get('openai_base_url') or 'https://api.deepseek.com/')}",
+            'wire_api = "responses"',
+            'env_key = "WINLAB_MODEL_KEY"',
+            "",
+            "[mcp_servers.tavotto]",
+            f"command = {_toml_str(mcp_cmd[0])}",
+            "args = [" + ", ".join(_toml_str(a) for a in mcp_cmd[1:]) + "]",
+            f"env = {{ {env_lines} }}",
+            "startup_timeout_sec = 60",
+            "tool_timeout_sec = 1800",
+            'default_tools_approval_mode = "approve"',
+            "",
+        ]
+    )
+    (home / "config.toml").write_text(toml, encoding="utf-8")
+    return {"CODEX_HOME": str(home), "WINLAB_MODEL_KEY": conf["api_key"]}
+
+
+def _codex_argv(exe: Path, prompt: str, henv: dict) -> list[str]:
+    return [
+        str(exe),
+        "exec",
+        prompt,
+        "--skip-git-repo-check",
+        "--json",
+        "--sandbox",
+        "workspace-write",
+    ]
+
+
+def _isolated_home(run_dir: Path) -> dict[str, str]:
+    """宿主的用户级配置落在本次 run 的目录里：不碰 tavotto-lab 的真实配置，也不在两次 run 之间串味。"""
+    home = run_dir / "work" / "home"
+    for sub in ("AppData/Roaming", "AppData/Local"):
+        (home / sub).mkdir(parents=True, exist_ok=True)
+    return {
+        "USERPROFILE": str(home),
+        "HOME": str(home),
+        "APPDATA": str(home / "AppData" / "Roaming"),
+        "LOCALAPPDATA": str(home / "AppData" / "Local"),
+    }
+
+
+def _mcp_servers_json(mcp_cmd: list[str], mcp_env: dict) -> dict:
+    return {"mcpServers": {"tavotto": {"command": mcp_cmd[0], "args": mcp_cmd[1:], "env": mcp_env}}}
+
+
+def _codebuddy_configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, conf, env) -> dict:
+    """CodeBuddy CLI：models.json 指向 OpenAI 兼容的 Chat Completions（密钥只以 ${变量} 引用），MCP 走 --mcp-config。"""
+    henv = _isolated_home(run_dir)
+    cfg = Path(henv["USERPROFILE"]) / ".codebuddy"
+    cfg.mkdir(parents=True, exist_ok=True)
+    model = conf.get("openai_model") or "deepseek-flash"
+    base = (conf.get("openai_base_url") or "https://api.deepseek.com/").rstrip("/")
+    models = {
+        "models": [
+            {
+                "id": model,
+                "name": model,
+                "vendor": conf.get("provider") or "lab",
+                "url": f"{base}/v1/chat/completions",
+                "apiKey": "${WINLAB_MODEL_KEY}",
+                "maxInputTokens": 128000,
+                "maxOutputTokens": 8192,
+                "supportsToolCall": True,
+                "supportsImages": False,
+            }
+        ],
+        "availableModels": [model],
+    }
+    (cfg / "models.json").write_text(json.dumps(models, indent=2), encoding="utf-8")  # 无 BOM
+    mcp = run_dir / "work" / "codebuddy-mcp.json"
+    mcp.write_text(json.dumps(_mcp_servers_json(mcp_cmd, mcp_env), indent=2), encoding="utf-8")
+    henv.update(
+        {
+            "CODEBUDDY_CONFIG_DIR": str(cfg),
+            "WINLAB_MODEL_KEY": conf["api_key"],
+            "WINLAB_MCP_CONFIG": str(mcp),
+            "WINLAB_MODEL": model,
+        }
+    )
+    return henv
+
+
+def _codebuddy_argv(exe: Path, prompt: str, henv: dict) -> list[str]:
+    # MCP 工具是延迟加载的：经 ToolSearch 找到、经 DeferExecuteTool 执行——无头模式下三者都要预先授权
+    return [
+        str(exe),
+        "-p",
+        prompt,
+        "--output-format",
+        "stream-json",
+        "--model",
+        henv["WINLAB_MODEL"],
+        "--mcp-config",
+        henv["WINLAB_MCP_CONFIG"],
+        "--strict-mcp-config",
+        "--allowedTools",
+        "mcp__tavotto",
+        "ToolSearch",
+        "DeferExecuteTool",
+    ]
+
+
+def _minimax_configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, conf, env) -> dict:
+    """MiniMax Code：自定义供应商（OpenAI 兼容 completions，密钥经 --api-key-env 引用），MCP 走项目根 .mcp.json。"""
+    henv = _isolated_home(run_dir)
+    model = conf.get("openai_model") or "deepseek-flash"
+    henv.update({"WINLAB_MODEL_KEY": conf["api_key"], "WINLAB_MODEL": f"lab/{model}"})
+    (proj / ".mcp.json").write_text(
+        json.dumps(_mcp_servers_json(mcp_cmd, mcp_env), indent=2), encoding="utf-8"
+    )
+    _run_logged(
+        [
+            str(exe),
+            "provider",
+            "add",
+            "--name",
+            "lab",
+            "--base-url",
+            (conf.get("openai_base_url") or "https://api.deepseek.com/").rstrip("/"),
+            "--api-format",
+            "openai-completions",
+            "--model",
+            model,
+            "--api-key-env",
+            "WINLAB_MODEL_KEY",
+            "--use",
+        ],
+        proj,
+        {**env, **henv},
+        run_dir / "evidence" / "live" / "provider-add",
+        300,
+    )
+    return henv
+
+
+def _minimax_argv(exe: Path, prompt: str, henv: dict) -> list[str]:
+    # `provider add --use` 已把它设成默认；`--model lab/<id>` 在 cn-prod 路由上不认（10-24 实测）
+    return [str(exe), "exec", prompt]
+
+
+def _dsh_configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, conf, env) -> dict:
+    """DSH：隔离 DSH_HOME / DSH_AGENTS_HOME；模型走 DEEPSEEK_BASE_URL（Anthropic Messages，ADR 0104 同法）；
+    MCP 用一层 --patch 插入官方 dsh-mcp-client（与 codex-plugin/dsh/cordis.patch.yml 同一个插件），命令写死不用 !!js。"""
+    work = run_dir / "work"
+    work.mkdir(parents=True, exist_ok=True)
+    patch = [
+        {
+            "insert": [
+                {
+                    "id": "tavotto-mcp",
+                    "name": "@deepseek-ai/dsh-mcp-client",
+                    "config": {
+                        "transport": "stdio",
+                        "serverName": "tavotto",
+                        "command": mcp_cmd[0],
+                        "args": mcp_cmd[1:],
+                        "cwd": str(proj),
+                        "toolCallTimeoutMs": 1800000,
+                    },
+                }
+            ]
+        }
+    ]
+    pf = work / "dsh-tavotto.patch.yml"
+    pf.write_text(json.dumps(patch, indent=2), encoding="utf-8")  # JSON 即合法 YAML
+    henv = {
+        "DSH_HOME": str(work / "dsh-home"),
+        "DSH_AGENTS_HOME": str(work / "dsh-agents"),
+        "DEEPSEEK_BASE_URL": conf.get("base_url") or "https://api.deepseek.com/anthropic",
+        "DEEPSEEK_API_KEY": conf["api_key"],
+        "WINLAB_DSH_PATCH": str(pf),
+    }
+    # dsh-mcp-client 不收 env：MCP server 继承宿主进程的环境
+    henv.update(mcp_env)
+    return henv
+
+
+def _dsh_argv(exe: Path, prompt: str, henv: dict) -> list[str]:
+    return [str(exe), "headless", "--patch", henv["WINLAB_DSH_PATCH"], prompt]
+
+
+#: 宿主自己说「要登录官方账户」的字样：出现且一次 Tavotto 工具都没调到 → BLOCKED（需要账户），不是 FAIL
+LOGIN_MARKERS = re.compile(r"sign in|log ?in to|please login|not logged in|请先登录|需要登录", re.I)
+
+LIVE_HOSTS = {
+    "claude-code": LiveHost(
+        "claude-code", "@anthropic-ai/claude-code", "claude.cmd", _claude_configure, _claude_argv
+    ),
+    "codex-cli": LiveHost("codex-cli", "@openai/codex", "codex.cmd", _codex_configure, _codex_argv),
+    "codebuddy": LiveHost(
+        "codebuddy",
+        "@tencent-ai/codebuddy-code",
+        "codebuddy.cmd",
+        _codebuddy_configure,
+        _codebuddy_argv,
+    ),
+    "minimax-code": LiveHost(
+        "minimax-code", "@minimax-ai/code", "mcode.cmd", _minimax_configure, _minimax_argv
+    ),
+    "dsh": LiveHost("dsh", "@deepseek-ai/dsh@next", "dsh.cmd", _dsh_configure, _dsh_argv),
+}
+
+
+def run_hosts_live_task(
+    lab: Lab, run_dir: Path, env: dict, model_conf: dict, host_id: str = "claude-code"
+) -> dict:
+    host = LIVE_HOSTS[host_id]
     py = lab.venv_python()
-    if not exe.exists() or not py.exists():
+    if not py.exists():
         return {
             "result": "environment_unavailable",
-            "summary": "run `test hosts` first (installs Claude Code CLI)",
+            "summary": "venv missing: run `winlab prepare` first",
         }
-    version = _tool_version([str(exe), "--version"])
-    ev = run_dir / "evidence" / "claude-code-live"
+    ev = run_dir / "evidence" / "live"
+    prefix = lab.cache / "npm-global"
+    exe = prefix / host.bin
+    if not exe.exists():
+        _run_logged(
+            [
+                str(Path(NODE_DIR) / "npm.cmd"),
+                "install",
+                "-g",
+                "--prefix",
+                str(prefix),
+                host.npm,
+                "--no-fund",
+                "--no-audit",
+            ],
+            lab.root,
+            dict(env, npm_config_better_sqlite3_binary_host=SQLITE_BINARY_MIRROR),
+            ev / "npm-install",
+            900,
+        )
+    version = _tool_version([str(exe), "--version"]) if exe.exists() else None
+    if not version:
+        return {
+            "result": "failed",
+            "summary": f"{host.id}: official CLI did not install or start (L2)",
+            "levels": {"L2": "failed"},
+        }
     proj = run_dir / "work" / "project"
     (proj / "out").mkdir(parents=True)
     (proj / "plot.py").write_text(LIVE_FIGURE, encoding="utf-8")
-    cfg = run_dir / "work" / "claude-config"
-    cfg.mkdir(parents=True)
-    henv = dict(env)
-    henv.update(_host_model_env(model_conf))
-    henv["CLAUDE_CONFIG_DIR"] = str(cfg)
-    henv["TAVOTTO_MCP_ROOTS"] = str(proj)
-    henv["MPLCONFIGDIR"] = str(run_dir / "work" / "mpl")
-    seed = _run_logged([str(py), "plot.py"], proj, henv, ev / "seed-figure", 300)
+    data_dir = (
+        Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "Tavotto"
+    )  # 产品默认（engine/config.data_dir）
+    seed_env = dict(env, MPLCONFIGDIR=str(run_dir / "work" / "mpl"))
+    seed = _run_logged([str(py), "plot.py"], proj, seed_env, ev / "seed-figure", 300)
     if seed.get("exit_code") != 0:
         return {
             "result": "error",
             "summary": "seeding the figure script failed",
             "host_version": version,
         }
-    server = [str(py), str(lab.repo / "codex-plugin" / "mcp" / "server.py")]
-    _run_logged(
-        [
-            str(exe),
-            "mcp",
-            "add",
-            "tavotto",
-            "--scope",
-            "user",
-            # `-e` 是可变长选项：名字必须在它之前，`--` 截断后才是命令（实测放在名字前会把名字当成变量吞掉）
-            # 只给 MCP 服务器它需要的 Tavotto 变量；模型凭据只在宿主自己的环境里
-            "-e",
-            f"TAVOTTO_MCP_ROOTS={proj}",
-            "-e",
-            f"TAVOTTO_DATA_DIR={run_dir / 'work' / 'tavotto-data'}",
-            "-e",
-            "TAVOTTO_NO_TELEMETRY=1",
-            "--",
-            *server,
-        ],
-        proj,
-        henv,
-        ev / "mcp-add",
-        120,
-    )
-
-    def claude_print(prompt: str) -> list[str]:
-        # 提示词紧跟 `-p`：`--allowedTools` 是可变长选项，放在它后面的提示词会被当成工具名吞掉
-        return [
-            str(exe),
-            "-p",
-            prompt,
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--max-turns",
-            # Tavotto 的 open 结果超过 Claude Code 单次 MCP 结果上限时会被转存成文件，模型要多花几轮去读
-            "30",
-            "--allowedTools",
-            "mcp__tavotto",
-        ]
-
-    r1 = _run_logged(claude_print(LIVE_SESSION_1), proj, henv, ev / "session-1", 1200)
-    _scrub(ev, model_conf["api_key"])
-    s1 = parse_stream(
-        Path(f"{ev / 'session-1'}.stdout.log").read_text(encoding="utf-8", errors="replace")
-    )
+    rec_log = ev / "mcp-recorder.jsonl"
+    recorder = Path(__file__).resolve().parent / "mcp_recorder.py"
+    mcp_cmd = [
+        str(py),
+        str(recorder),
+        str(rec_log),
+        "--",
+        str(py),
+        str(lab.repo / "codex-plugin" / "mcp" / "server.py"),
+    ]
+    # 只给 MCP 服务器项目根与遥测开关（写进宿主的 MCP 配置）；模型凭据只进宿主进程。数据目录不指定：
+    # MCP server 用 tavotto-lab 自己的默认数据目录，与真实用户一致，会话日志按唯一的 session_id 去那里找
+    mcp_env = {"TAVOTTO_MCP_ROOTS": str(proj), "TAVOTTO_NO_TELEMETRY": "1"}
+    henv = dict(env)
+    henv.update(host.configure(lab, run_dir, proj, exe, mcp_cmd, mcp_env, model_conf, env))
+    r1 = _run_logged(host.argv(exe, LIVE_SESSION_1, henv), proj, henv, ev / "session-1", 1200)
+    s1 = parse_recorded(rec_log)
+    split = _line_count(rec_log)
     sid = opened_session_id(s1)
-    journal_ok = journal_has_edits(run_dir / "work" / "tavotto-data", sid)
+    # MCP server 继承宿主进程的环境：宿主的用户目录被隔离时（CodeBuddy / MiniMax），它的默认数据目录也跟着走
+    data_dir = (
+        Path(henv.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA") or Path.home()) / "Tavotto"
+    )
+    journal_ok = journal_has_edits(data_dir, sid)
     if sid:
         r2 = _run_logged(
-            claude_print(LIVE_SESSION_2.format(sid=sid)), proj, henv, ev / "session-2", 900
+            host.argv(exe, LIVE_SESSION_2.format(sid=sid), henv), proj, henv, ev / "session-2", 900
         )
-        _scrub(ev, model_conf["api_key"])
     else:
         r2 = {"exit_code": None, "skipped": "no session id from session 1"}
-        Path(f"{ev / 'session-2'}.stdout.log").write_text("", encoding="utf-8")
-    s2 = parse_stream(
-        Path(f"{ev / 'session-2'}.stdout.log").read_text(encoding="utf-8", errors="replace")
-    )
+    _scrub(ev, model_conf["api_key"])
+    _scrub(run_dir / "work", model_conf["api_key"])
+    s2 = parse_recorded(rec_log, split)
+    host_text = ""
+    for f in ev.glob("session-1.*.log"):
+        host_text += f.read_text(encoding="utf-8", errors="replace")[-20000:]
+    if not s1["calls"] and LOGIN_MARKERS.search(host_text):
+        return {
+            "result": "environment_unavailable",
+            "summary": f"{host.id} {version}: the host requires signing in to its own account before any tool call (L4/L5 blocked)",
+            "host": {"id": host.id, "version": version},
+            "levels": {
+                "L2": "passed",
+                "L3": "passed" if "tavotto_open_figure" in s1["listed_tools"] else "not_run",
+                "L4": "environment_unavailable",
+                "L5": "environment_unavailable",
+            },
+            "blocked_reason": "host login required",
+        }
     pdfs = sorted((proj / "out").glob("*.pdf"))
     levels = judge_live(s1, s2, pdfs[0] if pdfs else None, journal_ok, sid)
+    levels["L2"] = "passed"
+    # L3：宿主自己发了 tools/list 并拿到了 Tavotto 的工具（服务端看到的，不是宿主的自述）
+    levels["L3"] = "passed" if "tavotto_open_figure" in s1["listed_tools"] else "failed"
     levels["session_id_from_session_1"] = bool(sid)
     if r1.get("timed_out") or r2.get("timed_out"):
         levels["L5"] = "error"
     return {
-        "result": av.aggregate([levels["L4"], levels["L5"]]),
-        "summary": f"claude-code {version} via {model_conf.get('provider', '?')}/{model_conf.get('model') or 'deepseek-flash'}: "
-        f"L4={levels['L4']} L5={levels['L5']}",
+        "result": av.aggregate([levels["L2"], levels["L3"], levels["L4"], levels["L5"]]),
+        "summary": f"{host.id} {version} via {model_conf.get('provider', '?')}: "
+        f"L3={levels['L3']} L4={levels['L4']} L5={levels['L5']}",
         "host": {
-            "id": "claude-code",
+            "id": host.id,
             "version": version,
             "provider": model_conf.get("provider"),
-            "model": model_conf.get("model") or "deepseek-flash",
             "network": "direct",
         },
         "levels": levels,
-        "tool_calls": {
+        "server_side_calls": {
             "session_1": [
-                {"name": c["name"], "ok": c.get("is_error") is False} for c in s1["calls"]
+                {"tool": c["name"].split("__")[-1], "ok": not c["is_error"]} for c in s1["calls"]
             ],
             "session_2": [
-                {"name": c["name"], "ok": c.get("is_error") is False} for c in s2["calls"]
+                {"tool": c["name"].split("__")[-1], "ok": not c["is_error"]} for c in s2["calls"]
             ],
         },
         "exit_codes": {"session_1": r1.get("exit_code"), "session_2": r2.get("exit_code")},
@@ -1654,6 +2017,672 @@ def run_installer_task(lab: Lab, run_dir: Path, env: dict, package: str, frm: st
     }
 
 
+# ----------------------------------------------------------------------------- 交互会话
+GUI_TASK = "TavottoLab-GUI"
+GUI_START_WAIT_S = 60
+WEBVIEW2_RT_KEY = (
+    r"SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+)
+WEBVIEW2_POLICY_KEY = r"SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments"
+DEBUG_PORT = 9222
+
+
+def ensure_gui_task(lab: Lab) -> dict:
+    """tavotto-lab 名下的计划任务：只在它已登录的交互会话里运行（/IT），动作是 gui_host.py。幂等。"""
+    host = Path(__file__).resolve().parent / "gui_host.py"
+    tr = f'"{BASE_PYTHON}" -I "{host}"'
+    out = subprocess.run(
+        [
+            "schtasks",
+            "/Create",
+            "/TN",
+            GUI_TASK,
+            "/TR",
+            tr,
+            "/SC",
+            "ONCE",
+            "/ST",
+            "00:00",
+            "/IT",
+            "/RL",
+            "LIMITED",
+            "/F",
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    return {"exit_code": out.returncode}
+
+
+def run_in_gui(
+    lab: Lab, run_id: str, argv: list[str], cwd: Path, env: dict, out_prefix: Path, timeout: float
+) -> dict:
+    """把一条登记过的命令交给交互会话执行（gui_host.py），等结果。会话不在就 environment_unavailable——
+    绝不退回 session 0 里假装跑过。"""
+    gui = lab.state / "gui"
+    gui.mkdir(parents=True, exist_ok=True)
+    reg = ensure_gui_task(lab)
+    if reg["exit_code"] != 0:
+        return {"exit_code": None, "gui": "task_register_failed"}
+    req = {
+        "run_id": run_id,
+        "argv": argv,
+        "cwd": str(cwd),
+        "env": env,
+        "timeout": timeout,
+        "out_prefix": str(out_prefix),
+        "written": time.time(),
+    }
+    tmp = gui / "request.json.tmp"
+    tmp.write_text(json.dumps(req), encoding="utf-8")
+    os.replace(tmp, gui / "request.json")
+    subprocess.run(["schtasks", "/Run", "/TN", GUI_TASK], capture_output=True)
+    started = gui / f"{run_id}.started"
+    deadline = time.monotonic() + GUI_START_WAIT_S
+    while not started.exists():
+        if time.monotonic() > deadline:
+            (gui / "request.json").unlink(missing_ok=True)
+            return {"exit_code": None, "gui": "no_interactive_session"}
+        time.sleep(1)
+    info = json.loads(started.read_text(encoding="utf-8"))
+    result_path = gui / f"{run_id}.result.json"
+    deadline = time.monotonic() + timeout + 120
+    while not result_path.exists():
+        if time.monotonic() > deadline:
+            (gui / f"{run_id}.stop").write_text("timeout", encoding="utf-8")
+            return {
+                "exit_code": None,
+                "timed_out": True,
+                "gui": "no_result",
+                "session_id": info.get("session_id"),
+            }
+        time.sleep(2)
+    res = json.loads(result_path.read_text(encoding="utf-8"))
+    for f in (started, result_path):
+        f.unlink(missing_ok=True)
+    res["gui"] = "ran"
+    return res
+
+
+def _hkcu_installs() -> list[dict]:
+    import winreg
+
+    out = []
+    base = r"Software\Microsoft\Windows\CurrentVersion\Uninstall"
+    try:
+        root = winreg.OpenKey(winreg.HKEY_CURRENT_USER, base)
+    except OSError:
+        return out
+    with root:
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(root, i)
+            except OSError:
+                break
+            i += 1
+            with winreg.OpenKey(root, name) as k:
+                vals = {}
+                for v in ("DisplayName", "DisplayVersion", "InstallLocation"):
+                    with contextlib.suppress(OSError):
+                        vals[v] = winreg.QueryValueEx(k, v)[0]
+            if str(vals.get("DisplayName", "")).startswith("Tavotto") and vals.get(
+                "InstallLocation"
+            ):
+                vals["InstallLocation"] = str(vals["InstallLocation"]).strip('"')
+                out.append(vals)
+    return out
+
+
+def install_package(setup: Path) -> dict:
+    subprocess.run([str(setup), "/S"], capture_output=True, timeout=900)
+    found = _hkcu_installs()
+    if not found:
+        return {"ok": False}
+    inst = Path(found[-1]["InstallLocation"])
+    shells = [p for p in inst.glob("*.exe") if p.name.lower().startswith("tavotto")]
+    return {
+        "ok": bool(shells),
+        "shell": str(shells[0]) if shells else None,
+        "version": found[-1].get("DisplayVersion"),
+        "name": found[-1].get("DisplayName"),
+    }
+
+
+def uninstall_all() -> bool:
+    for ent in _hkcu_installs():
+        u = Path(ent["InstallLocation"]) / "uninstall.exe"
+        if u.exists():
+            subprocess.run([str(u), "/S"], capture_output=True, timeout=600)
+            for _ in range(120):  # NSIS 卸载器会从 %TEMP% 重新拉起自己：等目录真的没了
+                if not u.exists():
+                    break
+                time.sleep(0.5)
+    return not _hkcu_installs()
+
+
+def webview2_policy_ok(shell: Path) -> bool:
+    import winreg
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WEBVIEW2_POLICY_KEY) as k:
+            value = winreg.QueryValueEx(k, shell.name)[0]
+    except OSError:
+        return False
+    return f"--remote-debugging-port={DEBUG_PORT}" in str(value)
+
+
+def ensure_msedgedriver(lab: Lab, env: dict) -> tuple[Path | None, str]:
+    """与本机 WebView2 Runtime 同版本的 msedgedriver（微软下载点直连），核 Authenticode 与版本号后缓存。"""
+    import winreg
+    import zipfile
+
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, WEBVIEW2_RT_KEY) as k:
+            rt = str(winreg.QueryValueEx(k, "pv")[0])
+    except OSError:
+        return None, "cannot read the WebView2 Runtime version"
+    if not re.fullmatch(r"\d+(\.\d+){3}", rt):
+        return None, f"odd WebView2 version {rt!r}"
+    d = lab.cache / "msedgedriver" / rt
+    drv = d / "msedgedriver.exe"
+    if not drv.exists():
+        d.mkdir(parents=True, exist_ok=True)
+        z = d / "edgedriver_win64.zip"
+        with _opener("direct").open(
+            f"https://msedgedriver.microsoft.com/{rt}/edgedriver_win64.zip", timeout=300
+        ) as r:
+            z.write_bytes(r.read())
+        with zipfile.ZipFile(z) as zf:
+            zf.extract("msedgedriver.exe", d)
+        z.unlink()
+    pwsh = r"C:\Program Files\PowerShell\7\pwsh.exe"
+    sig = subprocess.run(
+        [
+            pwsh,
+            "-NoProfile",
+            "-c",
+            f"$s=Get-AuthenticodeSignature '{drv}'; \"$($s.Status)|$($s.SignerCertificate.Subject)\"",
+        ],
+        capture_output=True,
+        text=True,
+        errors="replace",
+    ).stdout.strip()
+    if not (sig.startswith("Valid|") and "O=Microsoft Corporation" in sig):
+        drv.unlink(missing_ok=True)
+        return None, f"msedgedriver signature check failed: {sig[:120]}"
+    ver = _tool_version([str(drv), "--version"]) or ""
+    if rt not in ver:
+        return None, f"msedgedriver {ver!r} does not match WebView2 {rt}"
+    return drv, rt
+
+
+def run_desktop_window_task(lab: Lab, run_id: str, run_dir: Path, env: dict, package: str) -> dict:
+    setup, err = package_path(lab, package)
+    if err:
+        return {"result": "environment_unavailable", "summary": err}
+    py = lab.venv_python()
+    if not py.exists():
+        return {
+            "result": "environment_unavailable",
+            "summary": "venv missing: run `winlab prepare` first",
+        }
+    drv, rt = ensure_msedgedriver(lab, env)
+    if drv is None:
+        return {"result": "environment_unavailable", "summary": rt}
+    uninstall_all()
+    inst = install_package(setup)
+    if not inst.get("ok"):
+        return {
+            "result": "error",
+            "summary": "silent install did not produce a shell",
+            "install": inst,
+        }
+    shell = Path(inst["shell"])
+    try:
+        if not webview2_policy_ok(shell):
+            return {
+                "result": "environment_unavailable",
+                "summary": f"HKLM WebView2 debug-port policy missing for {shell.name}: run `winlab.py admin gui-setup`",
+            }
+        junit = run_dir / "evidence" / "junit.xml"
+        genv = dict(env)
+        genv.update(
+            {
+                "TAVOTTO_DESKTOP_EXE": str(shell),
+                "TAVOTTO_MSEDGEDRIVER": str(drv),
+                "TAVOTTO_DESKTOP_WINDOW_REQUIRED": "1",
+                "TAVOTTO_WEBVIEW2_DEBUG_PORT": str(DEBUG_PORT),
+                "TAVOTTO_DW_ARTIFACTS": str(run_dir / "evidence" / "desktop-window"),
+                # 与 nightly 那一步同：失败信息与 xfail 理由是中文，别让代码页把它们转成 \uXXXX
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONPATH": str(lab.repo / "src"),
+                "TEMP": str(run_dir / "work" / "tmp"),
+                "TMP": str(run_dir / "work" / "tmp"),
+            }
+        )
+        (run_dir / "work" / "tmp").mkdir(parents=True, exist_ok=True)
+        argv = [
+            str(py),
+            "-m",
+            "pytest",
+            "tests/desktop_windows",
+            "-p",
+            "no:cacheprovider",
+            "-v",
+            "-rA",
+            f"--junitxml={junit}",
+        ]
+        step = run_in_gui(lab, run_id, argv, lab.repo, genv, run_dir / "evidence" / "pytest", 1800)
+    finally:
+        uninstall_all()
+    if step.get("gui") == "no_interactive_session":
+        return {
+            "result": "environment_unavailable",
+            "summary": "no interactive session for tavotto-lab (autologon off, or someone RDP'd in as it): run `winlab.py admin gui-setup` and reboot",
+        }
+    if step.get("gui") != "ran":
+        return {"result": "error", "summary": f"gui bridge: {step.get('gui')}", "step": step}
+    if not step.get("session_id"):
+        # 会话 0 = 服务会话，没有用户桌面：那就不是真窗口验收
+        return {
+            "result": "error",
+            "summary": f"gui host ran in session {step.get('session_id')}, not an interactive one",
+            "step": step,
+        }
+    if step.get("timed_out"):
+        return {"result": "error", "summary": "desktop window tests timed out", "step": step}
+    result, summary, counts = av.judge_pytest(step, junit)
+    return {
+        "result": result,
+        "summary": summary,
+        "counts": counts,
+        "step": step,
+        "webview2": rt,
+        "package": {"name": package, "version": inst.get("version"), "display": inst.get("name")},
+        "session_id": step.get("session_id"),
+        "failures": junit_failures(junit, lab.root),
+    }
+
+
+# ----------------------------------------------------------------------------- 环境矩阵
+#: better-sqlite3 等原生模块的预编译件默认从 GitHub release 取（这台机器取不到）→ npmmirror 的二进制镜像
+SQLITE_BINARY_MIRROR = "https://registry.npmmirror.com/-/binary/better-sqlite3"
+UV_PYTHON_MIRROR = "https://registry.npmmirror.com/-/binary/python-build-standalone"
+CONDA_FORGE_MIRROR = "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge"
+MINIFORGE_URL = (
+    "https://mirrors.tuna.tsinghua.edu.cn/github-release/conda-forge/miniforge/LatestRelease"
+)
+UV_PYTHONS = ("3.10", "3.12", "3.14")
+MATRIX_FIGURES_DIR = "张三 的论文"
+
+
+def _py_in(venv: Path) -> Path:
+    return venv / "Scripts" / "python.exe"
+
+
+def prepare_envs(lab: Lab, env: dict, log: Path) -> tuple[dict[str, Path], dict[str, str]]:
+    """各解释器环境（幂等、缓存在 cache\\envs\\）：每个都是一个装了 matplotlib 的环境。返回 (可用, 失败原因)。"""
+    envs = lab.cache / "envs"
+    envs.mkdir(parents=True, exist_ok=True)
+    ok: dict[str, Path] = {}
+    bad: dict[str, str] = {}
+    py = str(lab.venv_python())
+
+    def pip_mpl(target: Path, name: str) -> bool:
+        if (target.parent.parent / ".winlab-mpl").exists():
+            return True
+        r = _run_logged(
+            [
+                str(target),
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "--disable-pip-version-check",
+                "--only-binary=matplotlib",
+                "matplotlib",
+            ],
+            lab.root,
+            env,
+            log / f"pip-{name}",
+            1200,
+        )
+        if r.get("exit_code") == 0:
+            (target.parent.parent / ".winlab-mpl").write_text("ok")
+            return True
+        return False
+
+    def venv_from(base: str, venv: Path, name: str) -> None:
+        if not _py_in(venv).exists():
+            r = _run_logged(
+                [base, "-m", "venv", str(venv)], lab.root, env, log / f"venv-{name}", 300
+            )
+            if r.get("exit_code") != 0:
+                bad[name] = "venv creation failed"
+                return
+        if pip_mpl(_py_in(venv), name):
+            ok[name] = _py_in(venv)
+        else:
+            bad[name] = "pip install matplotlib failed"
+
+    venv_from(BASE_PYTHON, envs / "cpython-3.13", "cpython-3.13")
+    venv_from(BASE_PYTHON, envs / "张三 的环境" / "venv", "cpython-3.13-cjk-path")
+
+    # uv（PyPI 镜像装进 Lab venv）→ python-build-standalone（npmmirror），不写注册表、不进 PATH
+    uv = lab.venv_python().parent / "uv.exe"
+    if not uv.exists():
+        _run_logged(
+            [py, "-m", "pip", "install", "-q", "--disable-pip-version-check", "uv"],
+            lab.root,
+            env,
+            log / "pip-uv",
+            600,
+        )
+    uenv = dict(
+        env,
+        UV_PYTHON_INSTALL_MIRROR=UV_PYTHON_MIRROR,
+        UV_PYTHON_INSTALL_DIR=str(lab.cache / "uv-python"),
+        UV_INDEX_URL=PIP_INDEX,
+        UV_NO_CONFIG="1",
+    )
+    for ver in UV_PYTHONS:
+        name = f"uv-{ver}"
+        venv = envs / name
+        if not _py_in(venv).exists():
+            r = _run_logged(
+                [str(uv), "venv", "--python", ver, "--seed", str(venv)],
+                lab.root,
+                uenv,
+                log / f"uv-{ver}",
+                900,
+            )
+            if r.get("exit_code") != 0:
+                bad[name] = "uv venv failed"
+                continue
+        if pip_mpl(_py_in(venv), name):
+            ok[name] = _py_in(venv)
+        else:
+            bad[name] = "pip install matplotlib failed"
+
+    # Miniforge：TUNA 镜像，核同目录的 .sha256；JustMe 装进 cache，不注册、不进 PATH
+    mf = envs / "miniforge"
+    conda = mf / "Scripts" / "conda.exe"
+    if not conda.exists():
+        try:
+            with _opener("direct").open(MINIFORGE_URL + "/", timeout=60) as r:
+                listing = r.read().decode("utf-8", "replace")
+            exe = re.search(r"Miniforge3-[0-9.]+-\d+-Windows-x86_64\.exe(?=[\"'])", listing).group(
+                0
+            )
+            inst = lab.cache / "installers" / exe
+            inst.parent.mkdir(parents=True, exist_ok=True)
+            if not inst.exists():
+                with _opener("direct").open(f"{MINIFORGE_URL}/{exe}", timeout=900) as r:
+                    inst.write_bytes(r.read())
+            with _opener("direct").open(f"{MINIFORGE_URL}/{exe}.sha256", timeout=60) as r:
+                want = r.read().decode("ascii", "replace").split()[0].lower()
+            if hashlib.sha256(inst.read_bytes()).hexdigest() != want:
+                inst.unlink()
+                bad["conda"] = "miniforge sha256 mismatch"
+            else:
+                _run_logged(
+                    [
+                        str(inst),
+                        "/InstallationType=JustMe",
+                        "/RegisterPython=0",
+                        "/AddToPath=0",
+                        "/S",
+                        f"/D={mf}",
+                    ],
+                    lab.root,
+                    env,
+                    log / "miniforge",
+                    1800,
+                )
+        except (urllib.error.URLError, OSError, AttributeError) as exc:
+            bad["conda"] = f"miniforge download failed: {type(exc).__name__}"
+    if conda.exists() and "conda" not in bad:
+        cenv = envs / "conda-mpl"
+        if not (cenv / "python.exe").exists():
+            r = _run_logged(
+                [
+                    str(conda),
+                    "create",
+                    "-y",
+                    "-q",
+                    "-p",
+                    str(cenv),
+                    "--override-channels",
+                    "-c",
+                    CONDA_FORGE_MIRROR,
+                    "python=3.12",
+                    "matplotlib",
+                    # conda 26.9：新环境里给 noarch 包（pip / wheel）生成入口要目标环境自带 conda-launchers，
+                    # 否则整个事务失败（10-24 实测：FileNotFoundError cli-64.exe）
+                    "conda-launchers",
+                ],
+                lab.root,
+                env,
+                log / "conda-create",
+                1800,
+            )
+            if r.get("exit_code") != 0:
+                bad["conda-prefix"] = "conda create -p failed"
+        if (cenv / "python.exe").exists():
+            ok["conda-prefix"] = cenv / "python.exe"
+        # 第二种布局：`-n` 建在 Miniforge 自己的 envs\\ 下（用户最常见的用法）——两种布局走的是不同的识别 / 激活路径
+        named = mf / "envs" / "mpl"
+        if not (named / "python.exe").exists():
+            r = _run_logged(
+                [
+                    str(conda),
+                    "create",
+                    "-y",
+                    "-q",
+                    "-n",
+                    "mpl",
+                    "--override-channels",
+                    "-c",
+                    CONDA_FORGE_MIRROR,
+                    "python=3.12",
+                    "matplotlib",
+                    "conda-launchers",
+                ],
+                lab.root,
+                env,
+                log / "conda-create-named",
+                1800,
+            )
+            if r.get("exit_code") != 0:
+                bad["conda-named"] = "conda create -n failed"
+        if (named / "python.exe").exists():
+            ok["conda-named"] = named / "python.exe"
+    elif "conda" not in bad:
+        bad["conda"] = "miniforge install failed"
+    return ok, bad
+
+
+def _find_sidecar(shell: Path) -> Path | None:
+    for p in shell.parent.rglob("Tavotto.exe"):
+        if p != shell and p.parent.name.lower() == "tavotto" and (p.parent / "_internal").is_dir():
+            return p
+    return None
+
+
+def run_env_matrix_task(lab: Lab, run_dir: Path, env: dict, package: str) -> dict:
+    setup, err = package_path(lab, package)
+    if err:
+        return {"result": "environment_unavailable", "summary": err}
+    if not lab.venv_python().exists():
+        return {
+            "result": "environment_unavailable",
+            "summary": "venv missing: run `winlab prepare` first",
+        }
+    log = run_dir / "evidence" / "envs"
+    ready, broken = prepare_envs(lab, env, log)
+    uninstall_all()
+    inst = install_package(setup)
+    legs = []
+    try:
+        side = _find_sidecar(Path(inst["shell"])) if inst.get("ok") else None
+        if side is None:
+            return {
+                "result": "error",
+                "summary": "install produced no sidecar",
+                "install": inst,
+                "env_problems": broken,
+            }
+        figures = run_dir / "work" / MATRIX_FIGURES_DIR / "figures"
+        shutil.copytree(lab.repo / "examples" / "figures", figures)
+        plan = [
+            (
+                "bundled",
+                None,
+                "bundled",
+                "examples\\runtime_check",
+                ["--expect-packages", "numpy,pandas,scipy,seaborn,PIL,matplotlib"],
+            )
+        ]
+        plan += [
+            (name, str(pyexe), "env_override", str(figures), [])
+            for name, pyexe in sorted(ready.items())
+        ]
+        for name, worker, expect, figs, extra in plan:
+            lenv = dict(env)
+            lenv["PYTHONUTF8"] = "0"  # 与 nightly 冒烟同：中文区域的默认值
+            lenv.pop("TAVOTTO_WORKER_PYTHON", None)
+            if worker:
+                lenv["TAVOTTO_WORKER_PYTHON"] = worker
+            argv = [
+                str(lab.venv_python()),
+                "scripts/smoke_app.py",
+                "--exe",
+                str(side),
+                "--figures",
+                figs,
+                "--expect-source",
+                expect,
+                "--expect-control-plane",
+                "workerd",
+                *extra,
+            ]
+            step = _run_logged(argv, lab.repo, lenv, run_dir / "evidence" / f"leg-{name}", 900)
+            legs.append(
+                {
+                    "leg": name,
+                    "expect_source": expect,
+                    "result": "passed"
+                    if step.get("exit_code") == 0
+                    else ("error" if step.get("timed_out") else "failed"),
+                    "exit_code": step.get("exit_code"),
+                    "duration_s": step.get("duration_s"),
+                }
+            )
+    finally:
+        uninstall_all()
+    for name, why in sorted(broken.items()):
+        legs.append({"leg": name, "result": "environment_unavailable", "reason": why})
+    overall = av.aggregate([leg["result"] for leg in legs])
+    return {
+        "result": overall,
+        "summary": ", ".join(f"{leg['leg']}={leg['result']}" for leg in legs),
+        "legs": legs,
+        "package": {"name": package, "version": inst.get("version")},
+    }
+
+
+# ----------------------------------------------------------------------------- 脚本语料
+def corpus_venv(lab: Lab) -> Path:
+    return lab.cache / "venvs" / "py313-corpus" / "Scripts" / "python.exe"
+
+
+def run_corpus_task(lab: Lab, run_dir: Path, env: dict, mode: str) -> dict:
+    py = corpus_venv(lab)
+    log = run_dir / "evidence" / "setup"
+    stamp = py.parents[1] / "winlab-corpus.sha256"
+    pins = subprocess.run(
+        [BASE_PYTHON, "scripts/ci/runtime_pins.py", "--include-corpus"],
+        cwd=lab.repo,
+        capture_output=True,
+        text=True,
+        errors="replace",
+    )
+    if pins.returncode != 0:
+        return {"result": "error", "summary": "runtime_pins.py failed"}
+    digest = hashlib.sha256(
+        (pins.stdout + (lab.repo / "pyproject.toml").read_text(encoding="utf-8")).encode()
+    ).hexdigest()
+    if not py.exists():
+        _run_logged(
+            [BASE_PYTHON, "-m", "venv", str(py.parents[1])], lab.root, env, log / "venv", 300
+        )
+    if not stamp.exists() or stamp.read_text().strip() != digest:
+        # 与 CI compat-smoke 同：项目 [dev,ci] + 锁定的语料依赖
+        for i, args in enumerate((["-e", ".[dev,ci]"], pins.stdout.split())):
+            r = _run_logged(
+                [str(py), "-m", "pip", "install", "-q", "--disable-pip-version-check", *args],
+                lab.repo,
+                env,
+                log / f"pip-{i}",
+                2400,
+            )
+            if r.get("exit_code") != 0:
+                return {"result": "error", "summary": "installing the corpus environment failed"}
+        stamp.write_text(digest)
+    else:
+        _run_logged(
+            [
+                str(py),
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "--disable-pip-version-check",
+                "--no-deps",
+                "-e",
+                ".",
+            ],
+            lab.repo,
+            env,
+            log / "pip-nodeps",
+            900,
+        )
+    out = run_dir / "evidence" / "compat"
+    scope = ["--smoke", "--gate", "pr"] if mode == "smoke" else ["--all"]
+    argv = [str(py), "scripts/ci/compat_matrix.py", *scope, "--no-fidelity", "--out", str(out)]
+    step = _run_logged(
+        argv,
+        lab.repo,
+        dict(env, PYTHONPATH=str(lab.repo / "src")),
+        run_dir / "evidence" / "compat_matrix",
+        5000,
+    )
+    reports = sorted(out.rglob("compat-report.json")) if out.exists() else []
+    summary = {}
+    if reports:
+        with contextlib.suppress(OSError, ValueError):
+            rep = json.loads(reports[-1].read_text(encoding="utf-8"))
+            summary = {k: rep.get(k) for k in ("summary", "counts", "totals", "gate") if k in rep}
+    if step.get("timed_out"):
+        result = "error"
+    elif step.get("exit_code") == 0:
+        result = "passed"
+    elif reports:
+        result = "failed"
+    else:
+        result = "error"
+    return {
+        "result": result,
+        "summary": f"compat_matrix --{mode} exit={step.get('exit_code')}",
+        "mode": mode,
+        "report": summary,
+        "step": step,
+    }
+
+
 def _run_body(
     lab: Lab,
     task: Task,
@@ -1670,7 +2699,17 @@ def _run_body(
     if task.kind == "pytest":
         return run_pytest_task(lab, task, run_dir, tests, shard, env)
     if task.kind == "hosts-live":
-        return run_hosts_live_task(lab, run_dir, env, model_conf or {})
+        return run_hosts_live_task(
+            lab, run_dir, env, model_conf or {}, (pkg or {}).get("mode") or "claude-code"
+        )
+    if task.kind == "env-matrix":
+        return run_env_matrix_task(lab, run_dir, env, (pkg or {}).get("package", ""))
+    if task.kind == "corpus":
+        return run_corpus_task(lab, run_dir, env, (pkg or {}).get("mode") or "smoke")
+    if task.kind == "desktop-window":
+        return run_desktop_window_task(
+            lab, run_dir.name, run_dir, env, (pkg or {}).get("package", "")
+        )
     if task.kind == "installer":
         return run_installer_task(
             lab, run_dir, env, (pkg or {}).get("package", ""), (pkg or {}).get("from")
@@ -1993,6 +3032,11 @@ def cmd_stop(lab: Lab) -> dict:
             }
         return {"result": "passed", "summary": "no active job"}
     pid = int(holder.get("pid", 0))
+    if RUN_ID_RE.fullmatch(str(holder.get("run_id", ""))):
+        # 交互会话里那一半不是本进程的子孙：留停止标记，gui_host 看到就结束它的 Job
+        gui = lab.state / "gui"
+        gui.mkdir(parents=True, exist_ok=True)
+        (gui / f"{holder['run_id']}.stop").write_text("stop", encoding="utf-8")
     _terminate(pid)
     deadline = time.monotonic() + 15
     while _pid_alive(pid) and time.monotonic() < deadline:
@@ -2019,6 +3063,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--network")
     t.add_argument("--package")
     t.add_argument("--from", dest="frm")
+    t.add_argument("--mode")
     r = sub.add_parser("reports")
     r.add_argument("--id")
     c = sub.add_parser("clean")
@@ -2084,7 +3129,7 @@ def main(argv: list[str] | None = None, lab: Lab | None = None) -> int:
             )
     task = TASKS[ns.task]
     network = ns.network or task.networks[0]
-    err = validate_test_args(task, ns.tests, ns.shard, network, ns.package, ns.frm)
+    err = validate_test_args(task, ns.tests, ns.shard, network, ns.package, ns.frm, ns.mode)
     if err:
         sys.stdout.write(json.dumps({"result": "error", "summary": err}) + "\n")
         return av.EXIT_USAGE
@@ -2096,6 +3141,8 @@ def main(argv: list[str] | None = None, lab: Lab | None = None) -> int:
                 return _emit({"result": "environment_unavailable", "summary": parsed})
             model_conf = parsed
         pkg = {"package": ns.package, "from": ns.frm} if task.accepts_package else None
+        if task.modes:
+            pkg = {"mode": ns.mode or task.modes[0]}
         return _emit(run_task(lab, task, ns.tests, ns.shard, network, model_conf, pkg))
     except LabBusy as busy:
         return _emit(

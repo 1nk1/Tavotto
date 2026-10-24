@@ -989,3 +989,355 @@ def test_pytest_env_leaves_data_isolation_to_conftest_like_ci(tmp_path, monkeypa
     )
     A.run_pytest_task(lab, A.TASKS["pytest"], tmp_path, ["tests/test_a.py"], None, {})
     assert "TAVOTTO_DATA_DIR" not in seen["env"] and "MPLCONFIGDIR" not in seen["env"]
+
+
+# --------------------------------------------------------------------------- 交互会话执行器
+import gui_host as G  # noqa: E402
+
+
+def test_gui_bridge_without_an_interactive_session_is_environment_unavailable(
+    tmp_path, monkeypatch
+):
+    lab = A.Lab(tmp_path)
+    lab.state.mkdir()
+    monkeypatch.setattr(A, "ensure_gui_task", lambda lab: {"exit_code": 0})
+    monkeypatch.setattr(A.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(A, "GUI_START_WAIT_S", 0)
+    out = A.run_in_gui(lab, RUN, ["x"], tmp_path, {}, tmp_path / "p", 10)
+    assert out["gui"] == "no_interactive_session"
+    assert not (lab.state / "gui" / "request.json").exists()  # 没人接的请求不留着等下一次误跑
+
+
+def _write_request(lab, run_id, argv, written=None, timeout=30):
+    gui = lab.state / "gui"
+    gui.mkdir(parents=True, exist_ok=True)
+    (gui / "request.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "argv": argv,
+                "cwd": str(lab.root),
+                "env": dict(os.environ),
+                "timeout": timeout,
+                "out_prefix": str(lab.root / "out" / "p"),
+                "written": A.time.time() if written is None else written,
+            }
+        )
+    )
+
+
+@pytest.mark.parametrize("run_id,age", [("../evil", 0), (RUN, 10_000)])
+def test_gui_host_ignores_stale_or_malformed_requests(tmp_path, run_id, age):
+    lab = A.Lab(tmp_path)
+    _write_request(
+        lab, run_id, [sys.executable, "-c", "open('ran','w')"], written=A.time.time() - age
+    )
+    assert G.serve(lab) == 0
+    assert not (tmp_path / "ran").exists() and not list((lab.state / "gui").glob("*.result.json"))
+
+
+def test_gui_host_runs_the_request_and_writes_the_result(tmp_path):
+    lab = A.Lab(tmp_path)
+    _write_request(lab, RUN, [sys.executable, "-c", "print('hello from the desktop')"])
+    assert G.serve(lab) == 0
+    res = json.loads((lab.state / "gui" / f"{RUN}.result.json").read_text())
+    assert res["exit_code"] == 0 and res["timed_out"] is False
+    assert "hello from the desktop" in (lab.root / "out" / "p.stdout.log").read_text()
+    assert not (lab.state / "gui" / "request.json").exists()
+
+
+def test_gui_host_honours_the_stop_flag(tmp_path):
+    lab = A.Lab(tmp_path)
+    _write_request(lab, RUN, [sys.executable, "-c", "import time; time.sleep(60)"])
+    (lab.state / "gui" / f"{RUN}.stop").write_text("stop")
+    G.serve(lab)
+    res = json.loads((lab.state / "gui" / f"{RUN}.result.json").read_text())
+    assert res["timed_out"] is True and res["exit_code"] is None
+
+
+def test_desktop_result_from_session_zero_is_not_a_window_test(tmp_path, monkeypatch):
+    lab = A.Lab(tmp_path)
+    py = lab.venv_python()
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    monkeypatch.setattr(A, "package_path", lambda lab, name: (tmp_path / "s.exe", None))
+    monkeypatch.setattr(
+        A, "ensure_msedgedriver", lambda lab, env: (tmp_path / "d.exe", "155.0.0.1")
+    )
+    monkeypatch.setattr(A, "uninstall_all", lambda: True)
+    monkeypatch.setattr(
+        A, "install_package", lambda s: {"ok": True, "shell": str(tmp_path / "Tavotto.exe")}
+    )
+    monkeypatch.setattr(A, "webview2_policy_ok", lambda shell: True)
+    monkeypatch.setattr(
+        A, "run_in_gui", lambda *a, **k: {"gui": "ran", "exit_code": 0, "session_id": 0}
+    )
+    out = A.run_desktop_window_task(lab, RUN, tmp_path, {}, "x.exe")
+    assert out["result"] == "error" and "session 0" in out["summary"]
+
+
+def test_stop_also_signals_the_desktop_half(tmp_path, monkeypatch):
+    lab = A.Lab(tmp_path)
+    lab.state.mkdir()
+    lab.lock_path.write_text(json.dumps({"pid": 4242, "run_id": RUN}))
+    monkeypatch.setattr(A, "_terminate", lambda pid: None)
+    monkeypatch.setattr(A, "_pid_alive", lambda pid: False)
+    A.cmd_stop(lab)
+    assert (lab.state / "gui" / f"{RUN}.stop").exists()
+
+
+def test_gui_setup_keeps_the_password_out_of_the_registry():
+    ps = W.GUI_SETUP_PS
+    assert "LsaStorePrivateData" in ps and "Remove-ItemProperty $wl DefaultPassword" in ps
+    assert "Set-ItemProperty $wl DefaultPassword" not in ps
+    assert "'__PW__'" in ps  # 只在发送时替换，仓库里没有真值
+
+
+# --------------------------------------------------------------------------- 环境矩阵 / 脚本语料
+def test_corpus_modes_are_a_closed_set():
+    assert A.validate_test_args(A.TASKS["corpus"], [], None, "direct", mode="smoke") is None
+    assert A.validate_test_args(A.TASKS["corpus"], [], None, "direct", mode="all") is None
+    assert "does not accept --mode" in A.validate_test_args(
+        A.TASKS["corpus"], [], None, "direct", mode="--pdb"
+    )
+    assert "does not accept --mode" in A.validate_test_args(
+        A.TASKS["pytest"], ["tests/test_a.py"], None, "direct", mode="smoke"
+    )
+
+
+def test_matrix_and_corpus_never_route_through_the_proxy():
+    for tid in ("env-matrix", "corpus", "desktop-window", "installer"):
+        assert A.TASKS[tid].networks == ("direct",), tid
+
+
+def test_env_matrix_aggregates_unavailable_envs_honestly(tmp_path, monkeypatch):
+    lab = A.Lab(tmp_path)
+    py = lab.venv_python()
+    py.parent.mkdir(parents=True)
+    py.write_text("")
+    (lab.repo / "examples" / "figures").mkdir(parents=True)
+    shell = tmp_path / "inst" / "Tavotto beta.exe"
+    side = tmp_path / "inst" / "sidecar" / "Tavotto" / "Tavotto.exe"
+    (side.parent / "_internal").mkdir(parents=True)
+    shell.write_text("")
+    side.write_text("")
+    monkeypatch.setattr(A, "package_path", lambda lab, name: (tmp_path / "s.exe", None))
+    monkeypatch.setattr(
+        A,
+        "prepare_envs",
+        lambda lab, env, log: (
+            {"cpython-3.13": tmp_path / "py.exe"},
+            {"conda": "miniforge download failed"},
+        ),
+    )
+    monkeypatch.setattr(A, "uninstall_all", lambda: True)
+    monkeypatch.setattr(
+        A, "install_package", lambda s: {"ok": True, "shell": str(shell), "version": "x"}
+    )
+    monkeypatch.setattr(
+        A, "_run_logged", lambda argv, cwd, env, prefix, timeout, **k: {"exit_code": 0, "env": env}
+    )
+    out = A.run_env_matrix_task(lab, tmp_path / "run", {}, "x.exe")
+    legs = {leg["leg"]: leg["result"] for leg in out["legs"]}
+    assert legs == {
+        "bundled": "passed",
+        "cpython-3.13": "passed",
+        "conda": "environment_unavailable",
+    }
+    assert out["result"] == "environment_unavailable"  # 一条腿没环境，整体就不能读成通过
+
+
+def test_sidecar_is_found_by_layout_not_by_the_shell_name(tmp_path):
+    shell = tmp_path / "Tavotto.exe"
+    shell.write_text("")
+    assert A._find_sidecar(shell) is None
+    side = tmp_path / "sidecar" / "Tavotto" / "Tavotto.exe"
+    (side.parent / "_internal").mkdir(parents=True)
+    side.write_text("")
+    assert A._find_sidecar(shell) == side
+
+
+# --------------------------------------------------------------------------- MCP 记录器 + 多宿主
+
+
+def test_recorder_passes_bytes_through_and_records_only_bounded_facts(tmp_path):
+    import subprocess as sp
+
+    server = tmp_path / "server.py"
+    server.write_text(
+        "import sys, json\n"
+        "for line in sys.stdin:\n"
+        "    m = json.loads(line)\n"
+        "    if m.get('method') == 'tools/list':\n"
+        "        r = {'tools': [{'name': 'tavotto_open_figure'}, {'name': 'tavotto_health'}]}\n"
+        "    else:\n"
+        "        r = {'content': [{'type': 'text', 'text': json.dumps({'ok': True, 'session_id': 's-0123456789ab', 'patch_hash': 'sha256:ab', 'svg': '<svg>SECRET-PATH</svg>'})}], 'isError': False}\n"
+        "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': m['id'], 'result': r}) + '\\n'); sys.stdout.flush()\n",
+        encoding="utf-8",
+    )
+    log = tmp_path / "rec.jsonl"
+    reqs = [
+        {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "tavotto_verify_replay", "arguments": {"path": "C:/x"}},
+        },
+    ]
+    stdin = "".join(json.dumps(r) + "\n" for r in reqs)
+    out = sp.run(
+        [
+            sys.executable,
+            str(WINLAB / "mcp_recorder.py"),
+            str(log),
+            "--",
+            sys.executable,
+            str(server),
+        ],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=60,
+    )
+    replies = [json.loads(x) for x in out.stdout.splitlines()]
+    assert [r["id"] for r in replies] == [1, 2]  # 宿主拿到的就是 server 原样的回复
+    facts = A.parse_recorded(log)
+    assert facts["listed_tools"] == ["tavotto_health", "tavotto_open_figure"]
+    assert (
+        facts["calls"][0]["name"] == "mcp__tavotto__tavotto_verify_replay"
+        and not facts["calls"][0]["is_error"]
+    )
+    text = log.read_text(encoding="utf-8")
+    assert "SECRET-PATH" not in text and "C:/x" not in text  # 参数与结果正文不进记录
+
+
+def test_recorder_registers_request_before_forwarding_it(tmp_path):
+    import io
+
+    import mcp_recorder as R
+
+    rec = R.Recorder(str(tmp_path / "rec.jsonl"))
+    seen = []
+
+    class Dst(io.BytesIO):
+        def write(self, b):
+            seen.append(1 in rec._pending)  # 转发那一刻 id 必须已登记，否则快回复会被丢
+            return super().write(b)
+
+        def close(self):
+            pass
+
+    line = (json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}) + "\n").encode()
+    R._pump(io.BytesIO(line), Dst(), rec.from_host)
+    assert seen == [True]
+
+
+def test_recorded_split_separates_the_fresh_process(tmp_path):
+    log = tmp_path / "r.jsonl"
+    rows = [
+        {
+            "dir": "server",
+            "method": "tools/call",
+            "tool": "tavotto_open_figure",
+            "error": False,
+            "facts": {"session_id": "s-aaaaaaaaaaaa"},
+        },
+        {
+            "dir": "server",
+            "method": "tools/call",
+            "tool": "tavotto_verify_replay",
+            "error": False,
+            "facts": {"ok": True},
+        },
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    assert len(A.parse_recorded(log)["calls"]) == 2
+    assert [c["name"] for c in A.parse_recorded(log, 1)["calls"]] == [
+        "mcp__tavotto__tavotto_verify_replay"
+    ]
+
+
+def test_live_hosts_are_a_closed_set_matching_the_modes():
+    assert set(A.LIVE_HOSTS) == set(A.LIVE_HOST_IDS) == set(A.TASKS["hosts-live"].modes)
+    assert A.validate_test_args(A.TASKS["hosts-live"], [], None, "direct", mode="codex-cli") is None
+    assert A.validate_test_args(A.TASKS["hosts-live"], [], None, "direct", mode="anything")
+
+
+def test_codex_config_uses_env_key_not_the_key_itself(tmp_path):
+    conf = {"api_key": "sk-" + "x" * 30, "base_url": "https://api.deepseek.com/anthropic"}
+    extra = A._codex_configure(
+        A.Lab(tmp_path),
+        tmp_path,
+        tmp_path,
+        tmp_path / "codex.cmd",
+        ["py", "rec.py"],
+        {"TAVOTTO_MCP_ROOTS": "C:/p"},
+        conf,
+        {},
+    )
+    toml = (tmp_path / "work" / "codex-home" / "config.toml").read_text(encoding="utf-8")
+    assert conf["api_key"] not in toml and 'env_key = "WINLAB_MODEL_KEY"' in toml
+    assert extra["WINLAB_MODEL_KEY"] == conf["api_key"] and 'wire_api = "responses"' in toml
+
+
+@pytest.mark.parametrize("host", ["codebuddy", "minimax-code", "dsh"])
+def test_new_host_configs_never_write_the_key_to_disk(tmp_path, monkeypatch, host):
+    key = "sk-" + "k" * 30
+    conf = {
+        "api_key": key,
+        "base_url": "https://api.deepseek.com/anthropic",
+        "provider": "deepseek",
+    }
+    monkeypatch.setattr(A, "_run_logged", lambda *a, **k: {"exit_code": 0})
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    extra = A.LIVE_HOSTS[host].configure(
+        A.Lab(tmp_path),
+        tmp_path,
+        proj,
+        tmp_path / "x.cmd",
+        ["py", "rec.py", "log", "--", "py", "server.py"],
+        {"TAVOTTO_MCP_ROOTS": str(proj)},
+        conf,
+        {},
+    )
+    for p in tmp_path.rglob("*"):
+        if p.is_file():
+            assert key not in p.read_text(encoding="utf-8", errors="replace"), p
+    assert key in extra.values()  # 只进宿主进程的环境
+    argv = A.LIVE_HOSTS[host].argv(tmp_path / "x.cmd", "PROMPT", extra)
+    assert argv[0].endswith("x.cmd") and "PROMPT" in argv
+
+
+def test_codebuddy_pre_authorizes_the_deferred_tool_path(tmp_path):
+    argv = A._codebuddy_argv(
+        tmp_path / "cb.cmd", "P", {"WINLAB_MODEL": "m", "WINLAB_MCP_CONFIG": "c.json"}
+    )
+    i = argv.index("--allowedTools")
+    assert {"mcp__tavotto", "ToolSearch", "DeferExecuteTool"} <= set(argv[i + 1 :])
+    assert argv.index("P") < i  # 提示词不在可变长选项之后
+
+
+def test_dsh_patch_uses_the_same_mcp_client_plugin_as_the_bundle(tmp_path):
+    A._dsh_configure(
+        A.Lab(tmp_path),
+        tmp_path,
+        tmp_path,
+        tmp_path / "dsh.cmd",
+        ["py", "rec.py"],
+        {},
+        {"api_key": "k" * 20},
+        {},
+    )
+    patch = json.loads((tmp_path / "work" / "dsh-tavotto.patch.yml").read_text(encoding="utf-8"))
+    bundle = (ROOT / "codex-plugin" / "dsh" / "cordis.patch.yml").read_text(encoding="utf-8")
+    name = patch[0]["insert"][0]["name"]
+    assert name == "@deepseek-ai/dsh-mcp-client" and name in bundle
+
+
+def test_login_wall_is_blocked_not_failed():
+    assert A.LOGIN_MARKERS.search("Error: Sign in to MiniMax to continue")
+    assert A.LOGIN_MARKERS.search("请先登录后再使用")
+    assert not A.LOGIN_MARKERS.search("opened the figure; logged 3 patches")

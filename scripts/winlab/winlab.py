@@ -431,6 +431,8 @@ def admin_deploy_agent() -> int:
         for src in (
             HERE / "agent.py",
             HERE / "installer-check.ps1",
+            HERE / "gui_host.py",
+            HERE / "mcp_recorder.py",
             *(ROOT / "scripts" / "ci" / n for n in DEPLOYED_CI_MODULES),
             cmdf,
         ):
@@ -649,6 +651,64 @@ def admin_snapshot(name: str) -> int:
     return show(1, {"result": "error", "summary": f"snapshot {sid} not NORMAL within an hour"})
 
 
+GUI_SETUP_PS = r"""
+$wl = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+# autologon for tavotto-lab; the password goes into the LSA secret DefaultPassword, never the registry
+Add-Type -TypeDefinition @'
+using System; using System.Runtime.InteropServices;
+public static class Lsa {
+  [StructLayout(LayoutKind.Sequential)] public struct U { public ushort L; public ushort M; public IntPtr B; }
+  [StructLayout(LayoutKind.Sequential)] public struct A { public int Len; public IntPtr R; public IntPtr N; public uint At; public IntPtr S; public IntPtr Q; }
+  [DllImport("advapi32.dll")] public static extern uint LsaOpenPolicy(IntPtr s, ref A a, int acc, out IntPtr h);
+  [DllImport("advapi32.dll")] public static extern uint LsaStorePrivateData(IntPtr h, ref U k, ref U d);
+  [DllImport("advapi32.dll")] public static extern uint LsaClose(IntPtr h);
+  [DllImport("advapi32.dll")] public static extern int LsaNtStatusToWinError(uint s);
+  static U Mk(string s) { var u = new U(); u.B = Marshal.StringToHGlobalUni(s); u.L = (ushort)(s.Length * 2); u.M = (ushort)(u.L + 2); return u; }
+  public static int Store(string key, string val) {
+    var a = new A(); IntPtr h; uint st = LsaOpenPolicy(IntPtr.Zero, ref a, 0x000F0FFF, out h);
+    if (st != 0) return LsaNtStatusToWinError(st);
+    var k = Mk(key); var d = Mk(val); st = LsaStorePrivateData(h, ref k, ref d); LsaClose(h);
+    Marshal.FreeHGlobal(k.B); Marshal.FreeHGlobal(d.B); return LsaNtStatusToWinError(st);
+  }
+}
+'@
+$rc = [Lsa]::Store('DefaultPassword', '__PW__')
+if ($rc -ne 0) { throw "LsaStorePrivateData failed: $rc" }
+Set-ItemProperty $wl AutoAdminLogon '1'
+Set-ItemProperty $wl DefaultUserName 'tavotto-lab'
+Set-ItemProperty $wl DefaultDomainName $env:COMPUTERNAME
+Remove-ItemProperty $wl DefaultPassword -EA SilentlyContinue
+Remove-ItemProperty $wl AutoLogonCount -EA SilentlyContinue
+# keep the console desktop drawable: no display timeout, no idle lock
+powercfg /change monitor-timeout-ac 0 | Out-Null
+$pol = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'
+Set-ItemProperty $pol InactivityTimeoutSecs 0 -Type DWord
+# WebView2 debug port for the Tavotto shells (loopback; same policy the nightly sets per run)
+$wv = 'HKLM:\SOFTWARE\Policies\Microsoft\Edge\WebView2\AdditionalBrowserArguments'
+New-Item $wv -Force | Out-Null
+foreach ($n in 'Tavotto.exe', 'Tavotto beta.exe') {
+  New-ItemProperty $wv -Name $n -PropertyType String -Force -Value '--remote-debugging-port=9222 --remote-allow-origins=*' | Out-Null
+}
+'gui-setup done: reboot to start the autologon session'
+"""
+
+
+def admin_gui_setup() -> int:
+    """一次性：tavotto-lab 开机自动登录控制台（密码进 LSA 机密，取自本机钥匙串）、桌面不锁、WebView2 调试端口策略。"""
+    pw = subprocess.run(
+        ["security", "find-generic-password", "-a", "tavotto-lab", "-s", "tavotto-win-lab", "-w"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    if not pw or "'" in pw:
+        print(
+            "tavotto-lab password missing from the keychain (service tavotto-win-lab)",
+            file=sys.stderr,
+        )
+        return 3
+    return admin_ssh(GUI_SETUP_PS.replace("__PW__", pw))
+
+
 # ----------------------------------------------------------------------------- CLI
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="winlab", description=__doc__.splitlines()[0])
@@ -664,6 +724,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--network")
     t.add_argument("--package", help="installer：cache\\packages\\ 里的安装包名")
     t.add_argument("--from", dest="frm", help="installer：先装这个旧包再升级")
+    t.add_argument("--mode", help="corpus：smoke | all；hosts-live：claude-code | codex-cli")
     t.add_argument("--ref", help="先 prepare 到这个提交（经可信度检查）")
     n = sub.add_parser("network")
     n.add_argument("--mode", default="all", choices=["all", *lab_agent.NETWORK_MODES])
@@ -680,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--with-build-tools", action="store_true")
     asub.add_parser("deploy-agent")
     asub.add_parser("proxy-install")
+    asub.add_parser(
+        "gui-setup",
+        help="交互会话：tavotto-lab 自动登录 + 不锁屏 + WebView2 调试端口策略（之后需重启）",
+    )
     sn = asub.add_parser("snapshot", help="黄金快照（腾讯云轻量；不做回滚 / 删除）")
     sn.add_argument("--name", required=True)
     return ap
@@ -704,7 +769,9 @@ def main(argv: list[str] | None = None) -> int:
     if ns.verb == "test":
         task = lab_agent.TASKS[ns.task]
         network = ns.network or task.networks[0]
-        err = lab_agent.validate_test_args(task, ns.tests, ns.shard, network, ns.package, ns.frm)
+        err = lab_agent.validate_test_args(
+            task, ns.tests, ns.shard, network, ns.package, ns.frm, ns.mode
+        )
         if err:
             print(err, file=sys.stderr)
             return 2
@@ -726,6 +793,8 @@ def main(argv: list[str] | None = None) -> int:
             argv += ["--package", ns.package]
         if ns.frm:
             argv += ["--from", ns.frm]
+        if ns.mode:
+            argv += ["--mode", ns.mode]
         return show(*remote_json(argv, stdin=stdin))
     if ns.verb == "secret-init":
         return secret_init(ns.provider)
@@ -734,6 +803,8 @@ def main(argv: list[str] | None = None) -> int:
             return admin_bootstrap(ns.with_build_tools)
         if ns.admin_verb == "deploy-agent":
             return admin_deploy_agent()
+        if ns.admin_verb == "gui-setup":
+            return admin_gui_setup()
         if ns.admin_verb == "snapshot":
             return admin_snapshot(ns.name)
         return admin_proxy_install()
