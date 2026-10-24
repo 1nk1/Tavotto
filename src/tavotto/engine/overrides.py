@@ -1126,18 +1126,63 @@ def ensure_figure_fallback(fig) -> int:
     return n
 
 
-def ensure_rcparams_fallback() -> None:
+def ensure_rcparams_fallback(figures=()) -> None:
     """给 rcParams 的 `font.family` 补尾巴：之后**才**用默认 FontProperties 新建的
     Text 读的是它。幂等。
 
     这是兜底，不是兑现点：懒建的刻度标签从模板 tick 拷字体属性、图例重建
     （`rebuild_legend`）从旧文字拷，都不经 rcParams。今天没有哪条产品路径
     依赖它——`test_cjk_figure_text.py` 的变异反证里拿掉它不会红，那是已知的。
+
+    **有 TeX 文字时不动**（`rcParams["text.usetex"]` 开着，或 `figures` 里任何一段 Text 的
+    `get_usetex()` 为真）：TeX 管理器只认长度为 1 的 `font.family`，多一条尾巴就退成
+    `serif`，所有 TeX 文字的度量随之变了——零编辑的导出就和脚本自己的第一次保存对不上
+    （Celerite `sho.py`：x 轴下方整体上移 0.44 pt）。TeX 文字的字形由 TeX 出，逐字形
+    回退本来就够不着，补了没有收益。同图里 `usetex=False` 的 CJK 文字走的是逐个 Text
+    那一条（`ensure_figure_fallback`），不靠 rcParams。
     """
+    tex = bool(mpl.rcParams["text.usetex"])
+    if not tex:
+        for fig in figures:
+            try:
+                tex = any(t.get_usetex() for t in fig.findobj(Text))
+            except Exception:  # noqa: BLE001 — 用户的 artist 遍历时什么都可能抛
+                # 这张图判不出有没有 TeX 文字：宁可不补 rcParams（逐 Text 兜底照常），异常也不能
+                # 逃出去拖垮整批——这张图自己的坏会在逐图隔离块里（`ensure_figure_fallback`）照常记账
+                tex = True
+            if tex:
+                break
     cur = [str(f) for f in mpl.rcParams["font.family"]]
+    added = _RC_FAMILY_ADDED
+    if tex:
+        # 之前（脚本还没有 TeX 文字时）补进去的尾巴要**撤回**：native 脚本在两个屏障之间才开
+        # usetex，留着多项族 TexManager 照样退成 serif。只撤我们追加的那一份——现值必须恰好
+        # 等于我们写进去的链；脚本后来自己改过 `font.family` 的，那是脚本的值，不碰
+        restore_rcparams_fallback()
+        return
+    if added and cur == added[1]:
+        return  # 已经是我们补过的那份
     chain = _family_chain(cur)
     if chain != cur:
         mpl.rcParams["font.family"] = chain
+        added[:] = [list(cur), list(chain)]
+    else:
+        added.clear()
+
+
+def restore_rcparams_fallback() -> None:
+    """撤回 `ensure_rcparams_fallback` 追加的尾巴：现值恰好等于我们写入的链才恢复补之前的值
+    （脚本自己改过的不碰）。没补过就什么都不做。幂等。native 离开屏障时也走这里——
+    尾巴只存在于屏障内，脚本接着跑时看到的是它自己的 `font.family`。"""
+    added = _RC_FAMILY_ADDED
+    if added and [str(f) for f in mpl.rcParams["font.family"]] == added[1]:
+        mpl.rcParams["font.family"] = list(added[0])
+    added.clear()
+
+
+#: 我们往 `rcParams["font.family"]` 里追加过尾巴的记录 `[补之前的值, 补之后的值]`；空表示没补过。
+#: 进程级，与 rcParams 同寿命（worker / native 一个进程一份脚本）。
+_RC_FAMILY_ADDED: list = []
 
 
 def _set_text_fontfamily(t: Text, v) -> None:
