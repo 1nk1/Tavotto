@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -62,13 +63,15 @@ class FixContext:
     #: 入参 card: {"kind": "approve"|"choice"|"pick"|"send", "tool": str, "summary": str, ...}
     #: 返回 {"answer": "yes"|"no"|<选项 id>|<路径>|"sent"|"cancelled"|"timeout", ...}
     ask: Callable[[dict], dict] | None = None
+    #: 修复会话的取消信号（`fixsession` 传 `s.cancel`）；耗时的执行器（换 Python 的下载 / 建环境）据此中途停下。None = 不可取消
+    cancel: threading.Event | None = None
     #: 「改」组的执行器，全部可注入（测试一律用假的，绝不往真实环境装包）。None = 用应用里现有的那条路径（见 `change.py`）：
     #: 装 / 卸包 `(python, [需求串]) -> {"ok": bool, "code": str, "done": [需求串]}`
     installer: Callable[[str, list[str]], dict] | None = None
     uninstaller: Callable[[str, list[str]], dict] | None = None
     #: `pip freeze` 文本 `(python) -> str | None`：成功回文本（全新空环境成功是 `""`），问不出来（退出码非 0 / 起不来）回 `None`
     freezer: Callable[[str], str | None] | None = None
-    #: 另建合适版本的 Tavotto 私有环境 `({"version", "project"}) -> {"ok", "code", "message", "python"?}`；None = 暂不可用（#1342 未合入）
+    #: 另建合适版本的 Tavotto 私有环境 `({"version", "project"}) -> {"ok", "code", "message", "python"?}`；None = 缺省走 `pyversionfix`（`executors._default_python_changer`）；请求另带 `script`（项目相对，可缺）
     python_changer: Callable[[dict], dict] | None = None
     #: 转成 matplotlib `({"script", "output", "project"}) -> {"ok", "code", "message"}`，只许写 `output`；None = 暂不可用（D2b 接转换任务）
     script_converter: Callable[[dict], dict] | None = None

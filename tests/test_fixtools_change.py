@@ -503,11 +503,130 @@ def test_switch_execution_rejects_other_modes(box):
 
 
 # =========================================================================== change_python
-def test_change_python_is_unavailable_without_an_injected_executor(box):
+def test_change_python_without_injection_uses_the_pyversionfix_executor(box, monkeypatch):
+    """没注入就走缺省执行器（`pyversionfix` 的公开入口）；这里把入口换成假的：不下载、不建真实环境。"""
+    from tavotto.engine import projectenv, pyversionfix
+
+    newpy = fake_python(box, "py312")
+    seen = {}
+
+    def fake_plan(failure, project):
+        seen["failure"], seen["project"] = failure, project
+        return pyversionfix.PythonChangePlan(
+            from_version="3.14",
+            to_version="3.12",
+            base=pyversionfix.BASE_SYSTEM,
+            download_bytes=0,
+            code=failure["code"],
+            project=str(project),
+            script=failure["script"],
+            base_python="/sys/python3.12",
+        )
+
+    def fake_apply(plan, progress, cancel):
+        seen["plan"] = plan
+        return {"ok": True, "code": "", "to": plan.to_version}
+
+    monkeypatch.setattr(pyversionfix, "plan_python_change", fake_plan)
+    monkeypatch.setattr(pyversionfix, "apply_python_change", fake_apply)
+    monkeypatch.setattr(projectenv, "remembered", lambda root: newpy)
     ctx = change_ctx(box)
     r = call(ctx, "change_python", {"version": "3.12"})
-    assert r.is_error and r.code == "unavailable"
-    assert not (box.data / "cache" / "fix_snapshots").exists()
+    assert not r.is_error, r.content
+    assert seen["failure"]["requires_python"] == "==3.12.*" and seen["project"] == str(box.proj)
+    assert seen["plan"].to_version == "3.12"
+    new_id = r.content.split("new environment id: ")[1].split()[0]
+    assert ctx.environments[new_id] == newpy and "snap_" in r.content
+
+
+def test_default_python_changer_reports_a_version_it_cannot_provide(box, monkeypatch):
+    from tavotto.engine import pyversionfix
+
+    monkeypatch.setattr(pyversionfix, "plan_python_change", lambda failure, project: None)
+    monkeypatch.setattr(
+        pyversionfix,
+        "apply_python_change",
+        lambda *a, **k: pytest.fail("no plan = nothing may be applied"),
+    )
+    r = call(change_ctx(box), "change_python", {"version": "3.9"})
+    assert r.is_error and r.code == "python_change_not_possible"
+
+
+def test_default_python_changer_reports_a_failed_build(box, monkeypatch):
+    from tavotto.engine import pyversionfix
+
+    plan = pyversionfix.PythonChangePlan("", "3.12", "system", 0, "x", str(box.proj), "")
+    monkeypatch.setattr(pyversionfix, "plan_python_change", lambda failure, project: plan)
+    monkeypatch.setattr(
+        pyversionfix,
+        "apply_python_change",
+        lambda p, progress, cancel: {"ok": False, "code": "python_change_failed", "to": "3.12"},
+    )
+    ctx = change_ctx(box)
+    r = call(ctx, "change_python", {"version": "3.12"})
+    assert r.is_error and r.code == "python_change_failed"
+    assert "new environment id" not in r.content and list(ctx.environments) == ["e"]
+
+
+def _fake_plan_factory(pyversionfix):
+    def fake_plan(failure, project):
+        return pyversionfix.PythonChangePlan(
+            from_version="3.14",
+            to_version="3.12",
+            base=pyversionfix.BASE_SYSTEM,
+            download_bytes=0,
+            code=failure["code"],
+            project=str(project),
+            script=failure["script"],
+            base_python="/sys/python3.12",
+        )
+
+    return fake_plan
+
+
+def test_change_python_hands_the_session_cancel_event_to_pyversionfix(box, monkeypatch):
+    """取消要真的传下去：缺省执行器把 `ctx.cancel`（修复会话的 `s.cancel`）交给 `apply_python_change`。"""
+    import threading
+
+    from tavotto.engine import projectenv, pyversionfix
+
+    got = {}
+
+    def fake_apply(plan, progress, cancel):
+        got["cancel"] = cancel
+        return {"ok": False, "code": "x"}
+
+    monkeypatch.setattr(pyversionfix, "plan_python_change", _fake_plan_factory(pyversionfix))
+    monkeypatch.setattr(pyversionfix, "apply_python_change", fake_apply)
+    monkeypatch.setattr(projectenv, "remembered", lambda root: None)
+    ctx = change_ctx(box)
+    ctx.cancel = threading.Event()
+    call(ctx, "change_python", {"version": "3.12"})
+    assert got["cancel"] is ctx.cancel
+
+
+def test_change_python_cancelled_after_planning_does_not_start_the_change(box, monkeypatch):
+    """规划期间用户点了取消：不动手（不调 apply），如实报 cancelled。"""
+    import threading
+
+    from tavotto.engine import projectenv, pyversionfix
+
+    ctx = change_ctx(box)
+    ctx.cancel = threading.Event()
+    plan = _fake_plan_factory(pyversionfix)
+
+    def plan_then_cancel(failure, project):
+        ctx.cancel.set()
+        return plan(failure, project)
+
+    applied = []
+    monkeypatch.setattr(pyversionfix, "plan_python_change", plan_then_cancel)
+    monkeypatch.setattr(
+        pyversionfix, "apply_python_change", lambda *a: applied.append(a) or {"ok": True}
+    )
+    monkeypatch.setattr(projectenv, "remembered", lambda root: None)
+    r = call(ctx, "change_python", {"version": "3.12"})
+    assert r.is_error and r.code == "cancelled" and applied == []
 
 
 def test_change_python_calls_the_executor_registers_the_new_env_and_snapshots(box):
@@ -521,8 +640,21 @@ def test_change_python_calls_the_executor_registers_the_new_env_and_snapshots(bo
     ctx = change_ctx(box, python_changer=changer)
     r = call(ctx, "change_python", {"version": "3.12"})
     assert not r.is_error and seen == [{"version": "3.12", "project": str(box.proj)}]
+    assert ctx.script_path is None  # 没有被修的脚本就不带 script
     new_id = r.content.split("new environment id: ")[1].split()[0]
     assert ctx.environments[new_id] == newpy and "snap_" in r.content
+
+
+def test_change_python_passes_the_project_relative_script_to_the_executor(box):
+    seen = []
+    target = put(box.proj / "sub" / "plot.py", "print(1)")
+    ctx = change_ctx(
+        box,
+        script_path=target,
+        python_changer=lambda req: seen.append(req) or {"ok": False, "code": "x"},
+    )
+    call(ctx, "change_python", {"version": "3.12"})
+    assert seen[0]["script"] == "sub/plot.py"
 
 
 @pytest.mark.parametrize("bad", ["3", "3.x", "2.7", "3.12; rm", "", None, "3.123.4.5", "latest"])
