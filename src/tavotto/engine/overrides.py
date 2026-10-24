@@ -5300,6 +5300,81 @@ for _axis in ("x", "y"):
 _BROADCAST_PROPS = frozenset(prop for _cls, prop in ALIAS_GROUPS)
 
 
+def state_reverse_index(state: "FigState") -> dict[int, str]:
+    """`id(artist)` → gid，别名组解析器（`ALIAS_GROUPS`）的反查表；`apply` 与 manifest 的
+    `alias_covers` 共用这一份口径。"""
+    rev = {id(el["artist"]): el["gid"] for el in state.elements}
+    # **别名 gid 也算组员**。容器消费掉的成员（stem 的 markerline）只在
+    # `state.index` 里留了一条旧 gid 别名，元素表里没有它——而别名与
+    # 系列指着**同一个 artist**。不算进来的话：历史文档里那条
+    # `axes_i.lines_k` 被撤掉时，成员被还原成脚本原样，系列那条值没变
+    # 于是走了「跳过」的捷径，结果是**茎还是新颜色、marker 却退回原色**，
+    # 而全量重放两者都是新颜色——热态 ≠ 重放，写回自检又只比几何、
+    # 看不见颜色，坏状态会直接写进用户的原件。
+    # 元素表里已有的 gid 优先（setdefault）：别名是补充，不是改名。
+    for _gid, _artist in state.index.items():
+        rev.setdefault(id(_artist), _gid)
+    return rev
+
+
+#: 广播端里**纯别名**的那些 `(cls_key, prop)`：广播端的全部状态就是窄端成员的同名 prop，setter 与窄端 setter
+#: 是同一个调用、没有任何额外状态（不改容器自身属性、不重建布局、不给「以后新建的子对象」留默认值）。
+#: 只有纯别名的两个地址才可互换——前端据此才敢在写窄端时删掉广播端那条 override（`alias_pure`）。
+#: **拿不准的一律不进表**；往里加之前逐个读过 setter，并在这里写依据。
+#:
+#:   * `(legend, title_fontsize)`：setter = `leg.get_title().set_fontsize(v)`，窄端 `(text, fontsize)` =
+#:     同一个 Text 上的 `set_fontsize(v)`；不碰 `Legend._fontsize`、不重建图例。
+#:   * `(colorbar, vmin / vmax)`：setter = `cb.mappable.set_clim(vmin=…/vmax=…)`，窄端 `(image|collection,
+#:     vmin / vmax)` = 同一个 mappable 上的同一句 `set_clim`（norm 本就共用，兄弟联动两边一样）。
+#:
+#: **明确不纯**：
+#:   * `(legend, fontsize)`：`_set_legend_fontsize` 还改 `Legend._fontsize` 并 `rebuild_legend`（示意线长、内边距、
+#:     文字间距都以它为单位），窄端存不下这些；
+#:   * `(colorbar, tick_fontsize / tick_color)`：`cb.ax.tick_params(...)` 会给之后新生成的刻度留默认值（
+#:     `_major_tick_kw`），且盖着 x / y 两组刻度；窄端只改现有刻度；
+#:   * `bar_series` / `stem_series` 的各 prop：系列 setter 按成员分发、读第一根（`_member_aligned`）、stem 还有
+#:     旧 gid 别名与 restore 次序，没有逐个确认过「与窄端同一个调用」，按不纯。
+ALIAS_PURE: frozenset[tuple[str, str]] = frozenset(
+    {("legend", "title_fontsize"), ("colorbar", "vmin"), ("colorbar", "vmax")}
+)
+
+
+def alias_pure(artist, covers: dict) -> list[str]:
+    """`covers`（`alias_covers` 的结果）里属于纯别名的广播 prop，排序；manifest 的 `alias_pure`。"""
+    key = _cls_key(artist)
+    return sorted(prop for prop in covers if (key, prop) in ALIAS_PURE)
+
+
+def alias_covers(
+    state: "FigState", rev: dict, artist, gid: str, registered: frozenset[str]
+) -> dict[str, dict[str, list[str]]]:
+    """这个元素的广播型 prop 各自**会盖掉谁**：`{prop: {窄 prop: [窄 gid, ...]}}`。
+
+    manifest 元素上的 `alias_covers`（前端「一个量只留一个 override 地址」的唯一事实来源）。
+    与 `apply` 同一张 `ALIAS_GROUPS` 和同一份反查口径；排除与自身同 gid 的项（`fill→facecolor`
+    等同元素别名不是「同一个量」）和 `cmap`（色阶组另有 `cmap_group_gids`）。没有就返回空 dict。
+
+    **只发元素表里登记的 gid**（`registered`）：反查表里还混着 `state.index` 的旧 gid 别名与独立
+    `ScalarMappable` 的合成 gid（`mappable#<对象 id>`，每个进程都不同）——它们不是用户能选中、
+    能写 override 的元素，发出去会让热态 manifest ≠ 冷启动重放。prop 按名字排序，输出与迭代序无关。
+    """
+    out: dict[str, dict[str, list[str]]] = {}
+    key = _cls_key(artist)
+    for prop in sorted(_BROADCAST_PROPS):
+        if prop == "cmap":
+            continue
+        resolver = ALIAS_GROUPS.get((key, prop))
+        if resolver is None:
+            continue
+        for ngid, nprop in resolver(state, rev, artist):
+            if ngid == gid or ngid not in registered:
+                continue
+            gids = out.setdefault(prop, {}).setdefault(nprop, [])
+            if ngid not in gids:
+                gids.append(ngid)
+    return out
+
+
 #: 应用顺序的**规范档位**。同档内保持列表序（sorted 稳定），跨档必须按这里
 #: 的先后，否则同一组 patch 在热会话与全量重放里会落成两张不同的图。
 #:
@@ -5463,17 +5538,7 @@ def _apply(state: FigState, patches: list[dict]) -> list[str]:
     def _reverse_index() -> dict:
         nonlocal _rev, _rev_gen
         if _rev_gen != state.index_generation:
-            _rev = {id(el["artist"]): el["gid"] for el in state.elements}
-            # **别名 gid 也算组员**。容器消费掉的成员（stem 的 markerline）只在
-            # `state.index` 里留了一条旧 gid 别名，元素表里没有它——而别名与
-            # 系列指着**同一个 artist**。不算进来的话：历史文档里那条
-            # `axes_i.lines_k` 被撤掉时，成员被还原成脚本原样，系列那条值没变
-            # 于是走了「跳过」的捷径，结果是**茎还是新颜色、marker 却退回原色**，
-            # 而全量重放两者都是新颜色——热态 ≠ 重放，写回自检又只比几何、
-            # 看不见颜色，坏状态会直接写进用户的原件。
-            # 元素表里已有的 gid 优先（setdefault）：别名是补充，不是改名。
-            for _gid, _artist in state.index.items():
-                _rev.setdefault(id(_artist), _gid)
+            _rev = state_reverse_index(state)
             _rev_gen = state.index_generation
         return _rev
 
