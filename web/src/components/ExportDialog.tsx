@@ -1618,7 +1618,6 @@ export function ExportDialog() {
                   available={availability.ok || (batchMode && availability.reason === "no_figure")}
                   reason={availability.reason}
                   originalSelectable={originalSelectable}
-                  ignored={availability.spec?.ignored ?? []}
                   fallback={availability.spec?.fallback ?? false}
                 />
               )}
@@ -1971,7 +1970,7 @@ function FigureThumbArt({
  * * 多图：顶部缩略图条「整版 / 每张图」，有检查提示的缩略图带橙点，下面是选中那一项的大预览。
  *
  * 点缩略图只是换预览（`onShow`）；是否同时改要导的那张由对话框按导出内容决定。
- * 预览不是最终文件（位图格式的像素、图内修改的合成不在这里），沿用 `thumbNote` 的克制说明。
+ * 预览不是最终文件（位图格式的像素、图内修改的合成不在这里），但不另加文字说明。
  */
 function ExportPreviewPane({
   single,
@@ -2078,14 +2077,10 @@ function ExportPreviewPane({
               <ImageOff size={ICON_SIZE.md} className="text-ink-3" aria-hidden />
             </div>
           )}
-          {/* 左下角一枚小标：这块预览的尺寸 + 「示意」。预览不是最终文件（位图格式的像素、页面合成不在这里），
-              说一句，克制：中性灰，不是警告 */}
+          {/* 左下角一枚小标：这块预览的尺寸。不加「示意」之类的说明（用户 10-24：别加字） */}
           <div className="pointer-events-none absolute bottom-2 left-2 flex max-w-[calc(100%-4rem)] items-center gap-1.5 rounded-full bg-surface/80 px-2.5 py-1 backdrop-blur">
             <span data-export-preview-size className="type-meta truncate tabular-nums">
               {sizeMm ? ex("mmSize", { w: round1(sizeMm[0]), h: round1(sizeMm[1]) }) : ex("sizeUnknownShort")}
-            </span>
-            <span data-export-thumb-note className="type-caption truncate text-ink-3">
-              {ex("thumbNote")}
             </span>
           </div>
         </div>
@@ -2193,7 +2188,6 @@ function ScopeNote({
   available,
   reason,
   originalSelectable,
-  ignored,
   fallback,
 }: {
   scope: ExportScope;
@@ -2201,19 +2195,18 @@ function ScopeNote({
   reason: string;
   /** 「原图尺寸」按钮此刻能不能选（项目里有没有图可挑） */
   originalSelectable: boolean;
-  ignored: readonly string[];
   fallback: boolean;
 }) {
   useTranslation("dialogs");
   // 「按画布尺寸出图」「按这张图自己的尺寸出图」这两句只是把选中的范围再说一遍
   // （2026-09-14 审计 B4：三句解释同一件事）——删掉；留下的是范围本身说不出的事实：
-  // 画布上的哪些变换不带进导出、磁盘原件与图幅不一致、尺寸读不到用了占位值、为什么灰
+  // 磁盘原件与图幅不一致、尺寸读不到用了占位值、为什么灰
   // 没话说就不渲染这一行（连它占的 gap 一起消失）。此前靠 `:empty` 选择器把空行藏掉，
   // 而 `<input>` 也是「空元素」——把「文件名」整行一起藏了（2026-09-15 审计 D01）
   const hasNote =
     scope === "canvas"
       ? !originalSelectable
-      : !available || fallback || ignored.length > 0;
+      : !available || fallback;
   if (!hasNote) return null;
   if (scope === "canvas") {
     return (
@@ -2252,13 +2245,6 @@ function ScopeNote({
           <>
             {fallback && (
               <span className="text-warn-content">{ex("scopeOriginalFallback")}</span>
-            )}
-            {ignored.length > 0 && (
-              <span>
-                {ex("scopeIgnored", {
-                  list: ignored.map((k) => ex(`ignored.${k}`)).join("、"),
-                })}
-              </span>
             )}
           </>
         )}
