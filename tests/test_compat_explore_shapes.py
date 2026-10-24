@@ -675,7 +675,7 @@ class RealExecution(unittest.TestCase):
                 self.assertEqual(diff["evidence"]["tavotto_pages"], 0)
 
     def test_bytesio_close_is_the_known_gap_749(self):
-        """savefig 到 BytesIO 再 close：原生有一张图，Tavotto 一张都没捕获（script_no_figure）。登记已知、已看到。"""
+        """savefig 到 BytesIO 再 close：原生有一张图，Tavotto 一张都没捕获（script_no_figure）。登记已知、已看到（家族 G6-bytesio-close-zero-figures）。"""
         for case in self.PARENTS:
             with self.subTest(parent=case):
                 record = self.check_axis_changing("bytesio_close", case)
@@ -684,35 +684,37 @@ class RealExecution(unittest.TestCase):
                 zero = record["judgment"]["differences"][0]
                 self.assertEqual(zero["evidence"]["tavotto_error"], "script_no_figure")
 
-    def test_same_stem_two_figs_loses_no_figure_but_the_stem_file_still_differs(self):
-        """同一 stem 两张图、后写的被 close。#1250 之后后写的那张不再从捕获里消失（另起 `<stem>-2`），
-        所以 `fewer_figures` / `title_missing` 没了；剩下的是同一路径上的内容：原生磁盘上的 `<stem>.png`
-        最后是第二张，Tavotto 的 `<stem>` 仍是第一张。登记已知、已看到——只钉这一种差异。"""
+    def test_same_stem_two_figs_matches_native_file_by_file(self):
+        """同一 stem 两张图、后写的被 close。#1250 起第二张另起 `<stem>-2`，#1309 起每个落盘文件按「谁写的」
+        归属：原生 `<stem>.pdf` 是第一张、`<stem>.png` 是第二张，Tavotto 的 `<stem>` 对 pdf、`<stem>-2` 对 png，
+        逐个对得上。曾被判成 same_path_content_mismatch，那是 compare 把路径硬按 stem 键去比的误报。"""
         for case in self.PARENTS:
             with self.subTest(parent=case):
                 record = self.check_axis_changing("same_stem_two_figs", case)
                 self.assertEqual(record["native"]["figure_count"], 2, record)
-                self.assertEqual(record["judgment"]["outcome"], "difference_found", record)
-                self.assertEqual(self.kinds(record), SAME_STEM_KINDS, record["judgment"])
-                (diff,) = record["judgment"]["differences"]
-                self.assertEqual(diff["evidence"]["native_titles"], ["cg_second"])
-                self.assertNotEqual(diff["evidence"]["tavotto_titles"], ["cg_second"])
-                # 第二张图被 Tavotto 另存了一个 stem（不是丢了）
+                self.assertEqual(record["judgment"]["outcome"], "no_difference", record)
+                # 第二张图被 Tavotto 另存了一个 stem（不是丢了），并只绑它自己存过的格式
                 titles = [t for v in record["tavotto"]["stems"].values() for t in v["titles"]]
                 self.assertIn("cg_second", titles)
+                formats = sorted(
+                    f for fs in record["tavotto"]["savefig_calls"].values() for f in fs
+                )
+                self.assertEqual(len(formats), 2, record["tavotto"])
+                self.assertEqual(len(set(formats)), 2, record["tavotto"])
 
-    def test_bbox_tight_dpi_capture_is_right_and_pixels_are_reported_as_observed(self):
-        """图的捕获没问题（一张、无 zero / fewer）。像素层本机观察到 pixel_mismatch（原生按 tight 裁切、
-        Tavotto 零 patch 渲染的尺寸不同）：这是**新差异，不登记为已知**——这里只钉「若有差异只能是它」。"""
-        record = self.check_axis_changing("bbox_tight_dpi")
-        self.assertLessEqual(self.kinds(record), {"pixel_mismatch"}, record["judgment"])
-        self.assertIn(record["judgment"]["outcome"], ("no_difference", "difference_found"))
-        self.assertIn(record["stages"]["fidelity"]["status"], ("passed", "failed"))
+    def test_bbox_tight_dpi_native_and_tavotto_pixels_agree(self):
+        """tight 裁切下原生与 Tavotto 的像素必须一致（ADR 0098：frame 就是图幅）。曾观察到的
+        `pixel_mismatch`（原生 [640, 416] / [640, 426]、Tavotto [640, 494] / [640, 502]）成因是 #1321 之前
+        原生参考图没有回放脚本原 savefig 的 tight 裁切，是比对口径问题，不是产品缺口；回退 #1321 这条会红。"""
+        for case in self.PARENTS:
+            with self.subTest(parent=case):
+                record = self.check_axis_changing("bbox_tight_dpi", case)
+                self.assertEqual(record["judgment"]["outcome"], "no_difference", record["judgment"])
+                self.assertEqual(record["stages"]["fidelity"]["status"], "passed", record["stages"])
 
 
 #: 已知缺口的差异种类（Tavotto 产品侧，不是模板 bug；这里只登记「已知、已看到」，不替产品掩盖）
 BYTESIO_KINDS = {"zero_figures"}
-SAME_STEM_KINDS = {"same_path_content_mismatch"}
 
 for _name in ENTRY_FORMS:
     setattr(
