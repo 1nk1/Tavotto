@@ -256,6 +256,9 @@ describe('scriptRunStore 状态机', () => {
     expect(useUiStore.getState().statusAction ?? null).toBeNull()
     const first = useUiStore.getState().status
     expect(first && formatMessage(first)).toContain('all_samples.pdf')
+    // 导出对话框「合成一个多页 PDF」读这份摘要（#1370）；再跑一次没有 PdfPages 就清空，不留旧的
+    expect(state().pdfPages).toEqual(pdf_pages)
+    expect(state().pdfPagesRunConfig).toBe('') // 无参数运行；带参数的那次记它的配置引用
     // 重跑出同样的结果：不再重发
     useUiStore.getState().setStatus(null)
     mockProbe.mockResolvedValue({ ...ok([desc('a'), desc('a-2'), desc('a-3')]), pdf_pages })
@@ -268,6 +271,7 @@ describe('scriptRunStore 状态机', () => {
     mockProbe.mockResolvedValue(ok([desc('a')]))
     await useScriptRunStore.getState().run('fig.py')
     expect(useUiStore.getState().status).toBeNull()
+    expect(state().pdfPages).toEqual([])
   })
 
   it('错误码 → 相位映射（missing_dependency / timeout / no_figure / cancelled / failed）', async () => {

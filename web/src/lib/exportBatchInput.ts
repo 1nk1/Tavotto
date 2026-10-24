@@ -170,3 +170,51 @@ export function buildBatchInput(
   }
   return { ok: true, input }
 }
+
+/**
+ * 「合成一个多页 PDF」那一项的请求输入（#1370）：每一页各自按它的原图口径建一次输入（同 `buildBatchInput`，格式固定
+ * `pdf`），再合成一个——第一页的输入当底（检查 / 规范 / 文档快照都读它），`mergePages` 按页序带每一页的来源（同一张图
+ * 写多页时重复），文件名是 PdfPages 的名字。任何一页建不出来整项失败（缺一页的多页 PDF 页序不对）。样式检查报告随这一项走（见下）。
+ */
+export function buildMergedPdfInput(
+  figures: readonly ExportableFigure[],
+  plan: { name: string; figureIds: readonly string[] },
+  shared: BatchShared,
+): BatchInputResult {
+  const pdfShared: BatchShared = { ...shared, formats: ['pdf'] }
+  const byId = new Map<string, Extract<BatchInputResult, { ok: true }>['input']>()
+  for (const id of new Set(plan.figureIds)) {
+    const fig = figures.find((f) => f.figureId === id)
+    if (!fig) return { ok: false, reason: { kind: 'unavailable', code: 'unknown_figure' } }
+    const res = buildBatchInput(fig, pdfShared, null)
+    if (!res.ok) return res
+    byId.set(id, res.input)
+  }
+  const first = byId.get(plan.figureIds[0])
+  const pageInputs = [...byId.values()]
+  if (!first) return { ok: false, reason: { kind: 'unavailable', code: 'unknown_figure' } }
+  const input: ExportRequestInput = {
+    ...first,
+    formats: ['pdf'],
+    filename: plan.name,
+    // 报告随合成的这一项走（它是 PDF 的唯一作业）：要不要出由各页决定——用户勾了、或某页有没处理的校验问题；
+    // 内容是首页的报告 + `pages`（按页序、每张图一份，各自的校验证据），不丢任何一页
+    includeReport: pageInputs.some((i) => i.includeReport),
+    report: pageInputs.some((i) => i.includeReport)
+      ? { ...(first.report ?? {}), pages: pageInputs.map((i) => i.report ?? null) }
+      : undefined,
+    acknowledged: [...new Set([...byId.values()].flatMap((i) => [...(i.acknowledged ?? [])]))],
+    mergePages: plan.figureIds.map((id) => {
+      const i = byId.get(id)!
+      return { figureId: id, panel: i.panel ?? null, spec: i.spec ?? null }
+    }),
+  }
+  const problem = filenameProblem(input.filename, input.formats)
+  if (problem) return { ok: false, reason: { kind: 'filename', code: problem } }
+  try {
+    buildExportRequest(input)
+  } catch (error) {
+    return { ok: false, reason: { kind: 'request', error } }
+  }
+  return { ok: true, input }
+}
