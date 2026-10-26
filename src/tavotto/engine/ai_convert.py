@@ -413,9 +413,19 @@ def run_validation(cand: ConvertCandidate, runner) -> dict:
         code = str(err.get("code") or "run_failed")
         if code in NO_FIGURE_CODES:
             return {"status": "no_figure", "code": code}
-        if code == WRITE_OUTSIDE_ROOTS_CODE:
-            return {"status": "error", "code": code, "message": WRITE_OUTSIDE_HINT}
-        return {"status": "error", "code": code, "message": str(err.get("message") or "")[:400]}
+        if ai_figure_edit.tripped_write_roots(code, err.get("cause")):
+            # 生产 runner 里码被探测折成 script_probe_failed，绊线的码在 `cause`：两种来源同一个结论、同一句提示
+            return {
+                "status": "error",
+                "code": WRITE_OUTSIDE_ROOTS_CODE,
+                "message": WRITE_OUTSIDE_HINT,
+            }
+        return {
+            "status": "error",
+            "code": code,
+            "message": str(err.get("message") or "")[:400],
+            **({"cause": str(err["cause"])} if err.get("cause") else {}),
+        }
     if not out.get("stems"):
         return {"status": "no_figure", "code": "no_figures_captured"}
     return {
@@ -423,6 +433,8 @@ def run_validation(cand: ConvertCandidate, runner) -> dict:
         "stems": list(out["stems"]),
         "size_mm": out.get("size_mm"),
         "svg": out.get("svg"),
+        # 改图任务的 `check` 要数据指纹：runner 愿意给 manifest 就原样带上（转换任务不读）
+        "manifests": out.get("manifests"),
     }
 
 
