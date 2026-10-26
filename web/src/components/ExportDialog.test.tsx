@@ -20,6 +20,8 @@ vi.mock('@/lib/api', async (importOriginal) => ({
   postTelemetryEvent: vi.fn(() => Promise.resolve({ accepted: true })),
   // 后端导出默认值（#715 PR-B）：默认「后端没有这组端点」，个别用例改答
   fetchExportDefaultsRemote: vi.fn(() => Promise.resolve(undefined)),
+  // 预览里「带图内修改的那一版」按 overrides 出图（`useVariantPng`）
+  enginePreviewPng: vi.fn(() => Promise.resolve(new Blob(['png']))),
 }))
 
 // 「在文件夹中显示」走桌面壳的 IPC；只有个别用例把 `__TAURI_INTERNALS__` 装上
@@ -29,7 +31,8 @@ vi.mock('@tauri-apps/api/core', () => ({ invoke: tauriInvoke }))
 import { ExportDialog } from '@/components/ExportDialog'
 import { pixelPreview } from '@/lib/exportRequest'
 import { hydrateExportDefaults, readExportDefaults, writeExportDefaults } from '@/lib/exportDefaults'
-import { fetchExportDefaultsRemote, postTelemetryEvent } from '@/lib/api'
+import { enginePreviewPng, fetchExportDefaultsRemote, postTelemetryEvent } from '@/lib/api'
+import { clearVariantPngCache } from '@/hooks/useVariantPng'
 import { setTelemetryEnabled } from '@/lib/telemetry'
 import { TooltipProvider } from '@/components/ui/Tooltip'
 import { useAssetStore } from '@/store/assetStore'
@@ -1764,6 +1767,77 @@ describe('T33 · 导出对象头部：名字 · 范围 · 尺寸只出现一次'
     expect(thumb).toBeTruthy()
     expect(thumb!.querySelector('[data-thumb-panel="Fig1.pdf"]')).toBeTruthy()
     expect(document.body.querySelector('[data-export-target] [data-canvas-thumb]')).toBeNull()
+  })
+
+  it('整版预览画的是改过的那张：有图内修改的面板按 overrides 出图，不挂磁盘原图', async () => {
+    clearVariantPngCache()
+    vi.mocked(enginePreviewPng).mockClear()
+    URL.createObjectURL = vi.fn(() => 'blob:edited')
+    URL.revokeObjectURL = vi.fn()
+    const edited: PanelObject = {
+      ...panel,
+      overrides: [{ gid: 'legend_0', prop: 'fontsize', value: 8.8 }],
+    }
+    const plain: PanelObject = { ...panel, id: 'p2', fileId: 'Fig2.pdf', x: 80 }
+    await stage({
+      panels: [edited, plain],
+      renders: { 'Fig1.pdf': manifestWithTicks(1, 9), 'Fig2.pdf': manifestWithTicks(1, 9) },
+      page: { w: 160, h: 60 },
+    })
+    await mountDialogs()
+    await openDialog()
+    await act(async () => {
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+    const hrefs = (fileId: string) =>
+      [...document.body.querySelectorAll(`[data-canvas-thumb] [data-thumb-panel="${fileId}"]`)].map((n) =>
+        n.getAttribute('href'),
+      )
+    // 页签缩略图 + 大预览两处都是引擎按 overrides 出的那张
+    expect(hrefs('Fig1.pdf').length).toBeGreaterThanOrEqual(2)
+    expect(hrefs('Fig1.pdf').every((h) => h === 'blob:edited')).toBe(true)
+    expect(vi.mocked(enginePreviewPng).mock.calls.every(([id, patches]) => id === 'Fig1.pdf' && JSON.stringify(patches) === JSON.stringify(edited.overrides))).toBe(true)
+    // 没改过的那张照旧是素材预览图（不为它白跑引擎）
+    expect(hrefs('Fig2.pdf').every((h) => h?.includes('/api/render?id=Fig2.pdf'))).toBe(true)
+  })
+
+  it('runtime 面板带图内修改：重跑脚本（previewNonce 变）后整版预览按新版本重新出图，不停在上一次运行的图', async () => {
+    clearVariantPngCache()
+    vi.mocked(enginePreviewPng).mockClear()
+    URL.createObjectURL = vi.fn(() => 'blob:edited-rt')
+    URL.revokeObjectURL = vi.fn()
+    const RT = 'runtime:fig.py#F'
+    const edited: PanelObject = {
+      ...panel,
+      fileId: RT,
+      fileKind: 'runtime',
+      overrides: [{ gid: 'legend_0', prop: 'fontsize', value: 8.8 }],
+    } as PanelObject
+    const plain: PanelObject = { ...panel, id: 'p2', fileId: 'Fig2.pdf', x: 80 }
+    await stage({
+      panels: [edited, plain],
+      renders: { [RT]: manifestWithTicks(1, 9), 'Fig2.pdf': manifestWithTicks(1, 9) },
+      page: { w: 160, h: 60 },
+    })
+    useRuntimeAssetStore.setState({ previewNonce: { [RT]: 1 } } as never)
+    await mountDialogs()
+    await openDialog()
+    await act(async () => {
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+    await act(async () => {
+      await new Promise<void>((r) => setTimeout(r, 30))
+    })
+    const before = vi.mocked(enginePreviewPng).mock.calls.length
+    expect(before).toBeGreaterThan(0)
+    await act(async () => {
+      useRuntimeAssetStore.setState({ previewNonce: { [RT]: 2 } } as never)
+    })
+    await act(async () => {
+      await new Promise<void>((r) => setTimeout(r, 0))
+    })
+    // 页签缩略图 + 大预览各自按新版本重出一次（至少两处）；版本号不进缓存键时只剩单图预览那一处
+    expect(vi.mocked(enginePreviewPng).mock.calls.length - before).toBeGreaterThanOrEqual(2)
   })
 })
 
