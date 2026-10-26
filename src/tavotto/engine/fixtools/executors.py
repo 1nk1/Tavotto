@@ -27,15 +27,19 @@ def failure_detail(out: str, limit: int = 2) -> str:
     return scrub("\n".join(lines[-limit:]))
 
 
-def _default_installer(python: str, requirements: list[str]) -> dict:
+def _default_installer(
+    python: str, requirements: list[str], cancel: threading.Event | None = None
+) -> dict:
     from .. import deprepair, pool
 
-    cancel = threading.Event()
+    cancel = cancel or threading.Event()
     done: list[str] = []
     key = deprepair._env_key(deprepair.TARGET_PROJECT_VENV, python, "")
     try:
         with pool.mutating_environment(key, python):
             for req in requirements:
+                if cancel.is_set():
+                    return {"ok": False, "code": "cancelled", "done": done}
                 code, out = deprepair._pip_install(python, req, cancel, None)
                 if code:
                     # 只按安装器自己的输出分类（`deprepair.classify_pip_failure`）：不再起第二个 pip 去「查索引」——
@@ -51,15 +55,19 @@ def _default_installer(python: str, requirements: list[str]) -> dict:
     return {"ok": True, "code": "", "done": done}
 
 
-def _default_uninstaller(python: str, distributions: list[str]) -> dict:
+def _default_uninstaller(
+    python: str, distributions: list[str], cancel: threading.Event | None = None
+) -> dict:
     from .. import deprepair, pool
 
-    cancel = threading.Event()
+    cancel = cancel or threading.Event()
     done: list[str] = []
     key = deprepair._env_key(deprepair.TARGET_PROJECT_VENV, python, "")
     try:
         with pool.mutating_environment(key, python):
             for dist in distributions:
+                if cancel.is_set():
+                    return {"ok": False, "code": "cancelled", "done": done}
                 code, _out = deprepair._pip_uninstall(python, dist, cancel, None)
                 if code:
                     return {"ok": False, "code": str(code), "done": done}
@@ -131,8 +139,32 @@ def run_python_changer(ctx: FixContext, req: dict) -> dict:
 
 
 def run_installer(ctx: FixContext, python: str, requirements: list[str]) -> dict:
-    return call_executor(ctx.installer or _default_installer, python, requirements)
+    from .. import depplan, projectenv
+
+    ctx.verification = None
+    try:
+        if ctx.cancel is not None and ctx.cancel.is_set():
+            return {"ok": False, "code": "cancelled", "done": []}
+        if ctx.installer is not None:
+            return call_executor(ctx.installer, python, requirements)
+        return call_executor(_default_installer, python, requirements, ctx.cancel)
+    finally:
+        # Pip may have changed some packages before failing. Both facts and the
+        # distribution index must describe the post-operation environment.
+        depplan.reset_cache(python)
+        projectenv.reset_cache(ctx.project_root)
 
 
 def run_uninstaller(ctx: FixContext, python: str, distributions: list[str]) -> dict:
-    return call_executor(ctx.uninstaller or _default_uninstaller, python, distributions)
+    from .. import depplan, projectenv
+
+    ctx.verification = None
+    try:
+        if ctx.cancel is not None and ctx.cancel.is_set():
+            return {"ok": False, "code": "cancelled", "done": []}
+        if ctx.uninstaller is not None:
+            return call_executor(ctx.uninstaller, python, distributions)
+        return call_executor(_default_uninstaller, python, distributions, ctx.cancel)
+    finally:
+        depplan.reset_cache(python)
+        projectenv.reset_cache(ctx.project_root)

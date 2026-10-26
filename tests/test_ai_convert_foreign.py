@@ -233,12 +233,35 @@ def test_no_marker_and_no_file_is_still_an_ordinary_failure(env):
     }
 
 
-def test_marker_next_to_a_written_file_does_not_stop_the_task(env):
-    """标记只在“没写新文件”时算数：写了文件就按文件走检查。"""
+def test_reported_semantic_gap_blocks_even_a_runnable_draft(env):
+    """A missing statistical equivalent still blocks, even after writing runnable code."""
+    before = _files(env["figs"])
+    ran = []
+    env["runner"] = lambda *a, **k: ran.append(1) or ok_runner(*a)
     env["code"] = SAY_NEEDS_INPUT + "; " + WRITE_GOOD
     sid = _run(env)
     sess = _wait(sid)
-    assert sess["task"]["outcome"] == "completed"
+    assert sess["task"]["outcome"] == "needs_input"
+    assert not ran
+    assert _files(env["figs"]) == before
+    assert len(env["prompts"]) == 1
+    with pytest.raises(ai_convert.ConvertError):
+        ai_convert.adopt(sid, _project(env))
+
+
+def test_visual_review_note_does_not_claim_fidelity_or_block_runtime_validation(env):
+    note = "已生成候选。使用目标库的默认网格；字体像素和相机布局尚未对照验证。"
+    event = {"type": "item.completed", "item": {"type": "agent_message", "text": note}}
+    env["code"] = WRITE_GOOD + f"; import json; print(json.dumps({event!r}))"
+    before = _files(env["figs"])
+    sid = _run(env, original=None)
+    sess = _wait(sid)
+    assert sess["task"]["outcome"] == "completed", sess["task"]
+    st = ai_convert.status(sid, _project(env))
+    assert st["state"] == "ready"
+    assert st["comparison"]["verification"] == "unknown"
+    assert st["comparison"]["pixel_diff"] is None
+    assert _files(env["figs"]) == before
 
 
 def test_marker_after_the_correction_round_also_ends_in_needs_input(env):
@@ -254,13 +277,27 @@ def test_marker_after_the_correction_round_also_ends_in_needs_input(env):
     [
         ("  换\n行\t和  空格  ", "换 行 和 空格"),
         ("**加粗的原因**", "加粗的原因"),
-        ("x" * 500, "x" * ai_convert.NEEDS_INPUT_REASON_MAX),
+        ("x" * 500, "x" * 500),
         ("控制\x00字\x1b符", "控制 字 符"),
         ("", ""),
     ],
 )
 def test_needs_input_reason_is_cleaned_and_bounded(raw, expected):
     assert ai_convert.clean_needs_input_reason(raw) == expected
+
+
+def test_needs_input_keeps_complete_diagnostic_commands_and_inline_code():
+    reason = (
+        "`surf(z)` requires the original axes colormap. "
+        + "The version and actual axes matter for reproducing the plot. " * 4
+        + "Run `cmap=colormap(ax); writematrix(cmap,'colormap.csv')` in the original MATLAB figure."
+    )
+    assert len(reason) > 200
+    assert ai_convert.clean_needs_input_reason(reason) == reason
+    overlong = "Command `" + "x" * ai_convert.NEEDS_INPUT_REASON_MAX + "`"
+    result = ai_convert.clean_needs_input_reason(overlong)
+    assert len(result) <= ai_convert.NEEDS_INPUT_REASON_MAX
+    assert "exceeds the display limit" in result
 
 
 def test_marker_is_read_from_assistant_messages_only_at_line_start():
@@ -280,6 +317,54 @@ def test_marker_is_read_from_assistant_messages_only_at_line_start():
         == "后"
     )
     assert ai_convert.needs_input_reason([msg("TAVOTTO_NEEDS_INPUT:")]) == ""
+
+
+def test_needs_input_card_preserves_following_multiline_commands(env):
+    reason = (
+        "Missing source data and factor levels.\n\n```r\n"
+        "library(lattice)\nwrite.csv(singer, 'singer.csv', row.names=FALSE)\n"
+        "dput(levels(singer$voice.part))\n```\nAttach both files."
+    )
+    event = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "TAVOTTO_NEEDS_INPUT: " + reason},
+    }
+    env["code"] = f"import json; print(json.dumps({event!r}))"
+    sid = _run(env)
+    sess = _wait(sid)
+    assert sess["task"]["outcome"] == "needs_input"
+    assert sess["task"]["unmet"][0]["detail"] == reason
+    assert not (env["figs"] / "fig_matplotlib.py").exists()
+    assert "write.csv" not in ai_convert.clean_needs_input_reason(
+        reason + "x" * ai_convert.NEEDS_INPUT_REASON_MAX
+    )
+
+
+def test_needs_input_long_export_guide_reaches_the_task_card(env):
+    # A real model supplied a complete export guide just over 2,000 characters.
+    # Replacing the entire guide with "request a shorter explanation" stranded
+    # the user: the missing files and commands disappeared from the input card.
+    context = (
+        "The original calculation needs observed values and factor metadata. "
+        "CSV alone cannot preserve unused factor levels or their ordered property.\n"
+    ) * 17
+    commands = (
+        "Run in the original R project, then attach both output files:\n```r\n"
+        "utils::write.csv(observations, 'observations.csv', row.names = FALSE)\n"
+        "base::dput(list(levels = levels(observations$group), "
+        "ordered = is.ordered(observations$group)), file = 'groups.txt')\n```"
+    )
+    reason = context + commands
+    assert len(reason) > 2000
+    event = {
+        "type": "item.completed",
+        "item": {"type": "agent_message", "text": "TAVOTTO_NEEDS_INPUT: " + reason},
+    }
+    env["code"] = f"import json; print(json.dumps({event!r}))"
+    sess = _wait(_run(env))
+    assert sess["task"]["outcome"] == "needs_input"
+    assert sess["task"]["unmet"][0]["detail"] == reason
+    assert not (env["figs"] / "fig_matplotlib.py").exists()
 
 
 # --------------------------------------------------------------------------- 校验前的依赖步骤

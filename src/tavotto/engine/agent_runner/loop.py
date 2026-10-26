@@ -2,9 +2,9 @@
 
 结束条件（`done.reason`，闭集 + 一个兜底）：
 
-* `completed`   模型给出最终文字、没有工具调用（`ok=true`）；
+* `completed`   模型给出最终文字、没有工具调用，或显式最终校验被工具确认通过（`ok=true`）；
 * `max_turns`   轮数用尽；`budget` token / 秒数用尽，或一轮输出被截断（`detail=output_truncated`）；
-* `tool_error_loop` 同一工具的同一错误码连续 3 次；
+* `tool_error_loop` 同一工具、同一参数的同一错误码连续 3 次；
 * `auth` 401 / 403 / 没密钥；`quota` 402、额度耗尽、429 重试用尽；
 * `refused` 服务端过滤 / 拒答（chat `finish_reason=content_filter`、anthropic `stop_reason=refusal`、responses `incomplete` 且原因不是
   `max_output_tokens`；`detail` 是短代码）；
@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import email.utils
+import hashlib
 import json
 import threading
 import time
@@ -41,6 +42,7 @@ from .wires import (
     Usage,
     Wire,
     post_json,
+    truncated_continuation,
 )
 
 REASONS = (
@@ -54,6 +56,24 @@ REASONS = (
     "network",
     "cancelled",
     "internal",
+)
+
+RECOVERY_GUIDANCE = """Execution and recovery loop:
+- Treat tool results as observations. If a call fails, use its reported schema and current state to
+  correct the next call; do not repeat an identical failing call or guess that it succeeded.
+- After a validation error, correct the candidate and validate again within the available check budget.
+  An installation or file write alone does not prove that the user's requested run succeeds.
+- Prefer one concrete tool action at a time over planning the entire implementation in one response.
+  If a response is interrupted, none of its tool calls ran. Retained reasoning is context only;
+  earlier successful operations remain valid. Continue from their actual results.
+- Recovery never grants permission, bypasses a confirmation, or extends the task's budget.
+"""
+
+TRUNCATION_FEEDBACK = (
+    "Tavotto runtime: the previous response reached its output limit. NONE of its tool calls ran. "
+    "Earlier completed tool operations remain current; do not repeat their side effects. "
+    "Use retained progress when available, then take one focused tool action. "
+    "Do not restart the entire plan or treat interrupted output as a successful write. "
 )
 
 
@@ -113,6 +133,47 @@ class HttpModel:
 
     def __repr__(self) -> str:  # 密钥不进 repr / 日志
         return f"HttpModel({self.wire.name}, model={self.model!r})"
+
+    def truncated_continuation(self, turn: Turn) -> Turn | None:
+        return truncated_continuation(self.wire.name, turn)
+
+    def release_recovery_state(self, history: list[Msg]) -> int:
+        # A successful tool action now records concrete progress. Do not charge
+        # every later request for the long interrupted reasoning that led to it.
+        # Manual Anthropic thinking requires its original signed prefix.
+        if self.wire.name == "anthropic" and self.thinking == "budget":
+            return 0
+        count = sum(m.recovery_state for m in history)
+        if count:
+            history[:] = [m for m in history if not m.recovery_state]
+            self._invalidate_thinking_signatures(history)
+        return count
+
+    def _invalidate_thinking_signatures(self, history: list[Msg]) -> None:
+        if self.wire.name == "anthropic":
+            for msg in history:
+                if msg.turn is not None and isinstance(msg.turn.native, list):
+                    msg.turn.native = [
+                        block
+                        for block in msg.turn.native
+                        if block.get("type") not in ("thinking", "redacted_thinking")
+                    ]
+
+    def compress_history(self, history: list[Msg]) -> int:
+        # Manual thinking requires its last signed block during tool use. Keep
+        # that conversation append-only; the existing total budget still holds.
+        if self.wire.name == "anthropic" and self.thinking == "budget":
+            return 0
+        count = compress(history)
+        if count:
+            # A thinking signature is bound to the preceding conversation.
+            # Editing old tool results invalidates every later signed block.
+            # Some endpoints return signed/redacted blocks even when no thinking
+            # option was requested. Omit stale blocks in both modes; manual
+            # budget mode remains append-only above. Tool calls/results stay
+            # paired and the requested thinking mode and effort stay unchanged.
+            self._invalidate_thinking_signatures(history)
+        return count
 
     def complete(
         self,
@@ -308,6 +369,9 @@ class RunResult:
     #: 至少一轮服务端没报用量、按字符数估算记账
     usage_estimated: bool = False
     compressions: int = 0
+    output_recoveries: int = 0
+    protocol_recoveries: int = 0
+    recovery_state_releases: int = 0
     elapsed_ms: int = 0
 
 
@@ -331,6 +395,9 @@ def estimate_tokens(system: str, tools: list[ToolSpec], history: list[Msg]) -> i
                 # 回放时原样带回的原生内容（签名 thinking、加密 reasoning）也占上下文
                 n += _tok(json.dumps(m.turn.native, ensure_ascii=False, default=str))
         n += sum(_tok(r.content) for r in m.results)
+        # Conservative fallback when the endpoint omits usage. Images must not
+        # disappear from the context/total budget just because they aren't text.
+        n += sum(img.estimated_tokens for r in m.results for img in r.images)
     return n
 
 
@@ -360,8 +427,9 @@ def compress(history: list[Msg]) -> int:
     n = 0
     for m in tool_msgs[:-1]:
         for r in m.results:
-            if r.compact is not None and r.content != r.compact:
+            if r.compact is not None and (r.content != r.compact or r.images):
                 r.content = r.compact
+                r.images = []
                 n += 1
     return n
 
@@ -404,6 +472,9 @@ def run(
             "ledger_mismatch": res.ledger_mismatch,
             "usage_estimated": res.usage_estimated,
             "compressions": res.compressions,
+            "output_recoveries": res.output_recoveries,
+            "protocol_recoveries": res.protocol_recoveries,
+            "recovery_state_releases": res.recovery_state_releases,
         }
     )
     return res
@@ -421,11 +492,14 @@ def _run(model, toolset, envelope, emit, cancel, t0, res: RunResult) -> None:
         return _finish(res, False, "internal", getattr(exc, "code", "bad_target"))
     by_name = {t.name: t for t in tools}
     specs = [t.spec() for t in tools]
-    system = toolset.system_prompt(envelope)
+    system = toolset.system_prompt(envelope) + "\n\n" + RECOVERY_GUIDANCE
     history: list[Msg] = [Msg("user", text=toolset.first_message(envelope))]
     deadline = t0 + limits.max_seconds
     led = res.ledger
     streak_key, streak = None, 0
+    budget_notice_level = 0
+    truncated_streak = 0
+    invalid_identity_streak = 0
 
     while True:
         if cancel.is_set():
@@ -436,8 +510,30 @@ def _run(model, toolset, envelope, emit, cancel, t0, res: RunResult) -> None:
             return _finish(
                 res, False, "budget", "time" if time.monotonic() >= deadline else "tokens"
             )
+        hint = getattr(toolset, "budget_hint", "")
+        if hint:
+            used = led.total_in + led.total_out
+            spent = max(
+                used / limits.max_total_tokens,
+                res.turns / limits.max_turns,
+                (time.monotonic() - t0) / limits.max_seconds,
+            )
+            level = 2 if spent >= 0.75 else 1 if spent >= 0.5 else 0
+            if level > budget_notice_level:
+                budget_notice_level = level
+                history.append(
+                    Msg(
+                        "user",
+                        text=(
+                            "Tavotto runtime budget: "
+                            f"{limits.max_turns - res.turns} model requests, "
+                            f"{limits.max_total_tokens - used} cumulative tokens and "
+                            f"{max(0, int(deadline - time.monotonic()))} seconds remain. " + hint
+                        ),
+                    )
+                )
         if estimate_tokens(system, specs, history) > limits.compress_at_tokens:
-            res.compressions += compress(history)
+            res.compressions += getattr(model, "compress_history", compress)(history)
 
         request_tokens = estimate_tokens(system, specs, history)
         started = time.monotonic()
@@ -494,26 +590,59 @@ def _run(model, toolset, envelope, emit, cancel, t0, res: RunResult) -> None:
         if turn.thinking_chars:
             emit({"type": "thinking", "chars": turn.thinking_chars})
         # 被截断的半截回答、以及停止原因不合法（未知 / 声称调工具却没有可用调用）的那一轮，都不把文字给用户看
-        rejected_stop = turn.stop == "max_tokens" or (not turn.tool_calls and turn.stop != "end")
+        identity_error = _call_identity_error(turn.tool_calls)
+        rejected_stop = (
+            turn.stop == "max_tokens"
+            or identity_error
+            or (not turn.tool_calls and turn.stop != "end")
+        )
         if turn.text and not rejected_stop:
             emit({"type": "text", "text": turn.text})
         if cancel.is_set():
             return _finish(res, False, "cancelled")
-        history.append(Msg("assistant", turn=turn))
-
         if turn.stop == "max_tokens":  # 被截断的一轮：带不带工具调用都一个不执行
+            truncated_streak += 1
+            hint = getattr(toolset, "truncation_hint", "")
+            if (
+                truncated_streak < limits.same_error_limit
+                and used < limits.max_total_tokens
+                and res.turns < limits.max_turns
+                and time.monotonic() < deadline
+            ):
+                # Interrupted calls/text never run or reach the user. The wire
+                # may retain replayable reasoning so the next request need not
+                # spend the same output budget starting over from nothing.
+                res.output_recoveries += 1
+                continue_turn = getattr(model, "truncated_continuation", lambda turn: None)(turn)
+                if continue_turn is not None:
+                    history.append(Msg("assistant", turn=continue_turn, recovery_state=True))
+                history.append(Msg("user", text=TRUNCATION_FEEDBACK + hint))
+                continue
             return _finish(res, False, "budget", "output_truncated")
+        truncated_streak = 0
+        if identity_error:
+            invalid_identity_streak += 1
+            if invalid_identity_streak >= limits.same_error_limit:
+                return _finish(res, False, "network", identity_error)
+            res.protocol_recoveries += 1
+            history.append(
+                Msg(
+                    "user",
+                    text=(
+                        "Tavotto runtime rejected the entire response because tool call identities were missing "
+                        "or duplicated. No tool calls ran and no file changed. Reissue the next intended call "
+                        "using the advertised tool schema; each call must have a nonempty, unique identity."
+                    ),
+                )
+            )
+            continue
+        invalid_identity_streak = 0
+        history.append(Msg("assistant", turn=turn))
         if not turn.tool_calls:
             if turn.stop != "end":  # 未知停止原因 / 声称要调工具却没有可用调用：不是完成
                 return _finish(res, False, "network", f"bad_stop_{turn.stop_value or turn.stop}")
             return _finish(res, True, "completed")
 
-        if any(not (isinstance(c.id, str) and c.id.strip()) for c in turn.tool_calls):
-            # 缺对应 ID 的工具调用：结果无法回填、下一轮必然失败——一个都不执行
-            return _finish(res, False, "network", "tool_call_without_id")
-        if len({c.id for c in turn.tool_calls}) != len(turn.tool_calls):
-            # 同一轮里重复的对应 ID：结果无法一一回填——一个都不执行
-            return _finish(res, False, "network", "duplicate_tool_call_id")
         results: list[ToolResult] = []
         for call in turn.tool_calls:
             if cancel.is_set():  # 每个工具调用前都查：已取消就不再写文件
@@ -529,13 +658,43 @@ def _run(model, toolset, envelope, emit, cancel, t0, res: RunResult) -> None:
                     "summary": r.summary,
                 }
             )
-            key = (call.name, r.code) if r.is_error else None
+            if cancel.is_set():
+                return _finish(res, False, "cancelled")
+            if r.completed and not r.is_error:
+                # The user-facing result still passes through the normal
+                # redacting emitter. Do not make another model request, or
+                # execute any later calls that could change the checked bytes.
+                if time.monotonic() >= deadline:
+                    return _finish(res, False, "budget", "time")
+                if r.completion_text:
+                    emit({"type": "text", "text": r.completion_text})
+                if cancel.is_set():
+                    return _finish(res, False, "cancelled")
+                return _finish(res, True, "completed")
+            # Distinct argument corrections may share an error code. Stop a
+            # repeated failed action, not three genuine attempts to repair it.
+            args_digest = hashlib.sha256(
+                json.dumps(call.args, sort_keys=True, ensure_ascii=True).encode()
+            ).digest()
+            key = (call.name, r.code, args_digest) if r.is_error else None
             streak = streak + 1 if key is not None and key == streak_key else (1 if key else 0)
             streak_key = key
             if streak >= limits.same_error_limit:
                 history.append(Msg("tool", results=results))
                 return _finish(res, False, "tool_error_loop", r.code)
         history.append(Msg("tool", results=results))
+        if any(not r.is_error for r in results):
+            res.recovery_state_releases += getattr(
+                model, "release_recovery_state", lambda history: 0
+            )(history)
+
+
+def _call_identity_error(calls: list[ToolCall]) -> str:
+    if any(not (isinstance(call.id, str) and call.id.strip()) for call in calls):
+        return "tool_call_without_id"
+    if len({call.id for call in calls}) != len(calls):
+        return "duplicate_tool_call_id"
+    return ""
 
 
 def _execute(by_name: dict[str, toolmod.Tool], call: ToolCall) -> ToolResult:
@@ -553,7 +712,7 @@ def _execute(by_name: dict[str, toolmod.Tool], call: ToolCall) -> ToolResult:
         return ToolResult(
             call.id,
             call.name,
-            "Tool arguments were not a valid JSON object.",
+            "Tool arguments were not a valid JSON object. " + _argument_hint(tool, None),
             is_error=True,
             code="bad_arguments",
             summary="error: bad_arguments",
@@ -570,4 +729,24 @@ def _execute(by_name: dict[str, toolmod.Tool], call: ToolCall) -> ToolResult:
             summary="error: tool_crashed",
         )
     r.call_id, r.name = call.id, call.name
+    if r.code == "bad_arguments" and not r.mutated:
+        # Handlers remain the only validation authority. Explain their
+        # rejection using the advertised schema, without guessing unknown keys or
+        # echoing model-supplied keys/values (which may contain private text).
+        r.content += " " + _argument_hint(tool, call.args)
     return r
+
+
+def _argument_hint(tool: toolmod.Tool, args: dict | None) -> str:
+    props = tool.schema.get("properties", {})
+    required = tool.schema.get("required", [])
+    missing = [key for key in required if args is None or key not in args]
+    types = {key: spec.get("type", "value") for key, spec in props.items()}
+    prefix = f"Missing required keys: {', '.join(missing)}. " if missing else ""
+    return (
+        prefix
+        + "Accepted keys and types: "
+        + json.dumps(types, ensure_ascii=True)
+        + ". Use these exact parameter names and actual values; do not rename keys. "
+        "Resend one corrected call. This rejected call made no changes."
+    )

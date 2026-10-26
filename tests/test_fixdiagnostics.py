@@ -304,6 +304,43 @@ def test_system_prompt_has_the_shadow_rule_for_both_wires():
         assert "never edit the script" in rule and "not_fixed" in rule
 
 
+@pytest.mark.parametrize("current_shadow", [True, False])
+def test_application_and_observation_share_the_current_package_diagnosis(box, current_shadow):
+    script = celerite_project(box)
+    shadow_error = {
+        "code": "script_error",
+        "message": "No module named 'celerite.celerite_version'",
+        "traceback": CELERITE_TB.format(root=box.proj),
+    }
+    error = (
+        shadow_error
+        if current_shadow
+        else {"code": "script_error", "message": "ValueError: current data"}
+    )
+    report = {
+        "phase": "completed",
+        "outcome": {"kind": "failed"},
+        "result": {"error": error},
+        "plan": {"launch_context": {"cwd": "paper/figures"}},
+        "attempt_history": [shadow_error] * 12,
+    }
+    ctx = make_ctx(
+        box,
+        environments={"e": "py"},
+        script_path=script,
+        report=lambda: report,
+        application_runner=lambda *_args: {"report": report},
+    )
+    observation = run_tool(REGISTRY["read_run_report"], ctx, {})
+    verification = run_tool(REGISTRY["try_run"], ctx, {"env": "e"})
+    assert not observation.is_error and not verification.is_error
+    assert observation.content in verification.content
+    for result in (observation, verification):
+        assert ('"project_package_shadow"' in result.content) is current_shadow
+        assert error["message"] in result.content
+        assert '"launch_context"' in result.content and "paper/figures" in result.content
+
+
 # =========================================================================== 2. 安装失败分类
 PIP_NONE = (
     "ERROR: Could not find a version that satisfies the requirement celerite (from versions: none)\n"

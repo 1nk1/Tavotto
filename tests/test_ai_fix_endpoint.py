@@ -7,13 +7,15 @@
 # ruff: noqa: F811 — 夹具（client / fake_pool / sessions）从别的测试文件导入复用，参数名与导入名相同
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
 
 from tavotto.engine import ai_bridge, ai_providers, fixsession, prepsession
+from tavotto.engine.agent_runner.loop import HttpModel
 from tavotto.engine.agent_runner.redact import Redactor
-from tavotto.engine.agent_runner.wires import ToolCall, Turn
+from tavotto.engine.agent_runner.wires import OpenAIResponsesWire, ToolCall, Turn
 from test_preparation_api import client, fake_pool  # noqa: F401 — 夹具复用
 from test_preparation_session import _create_ready, sessions  # noqa: F401
 
@@ -109,7 +111,7 @@ def test_full_flow_start_card_answer_finish(client, tmp_path, fake_pool, session
     model = Scripted(
         [("read_run_report", {})],
         [("ask_user", {"question": "数据在哪？", "options": [{"id": "a", "label": "A"}]})],
-        [("finish", {"outcome": "fixed", "summary": "好了"})],
+        [("finish", {"outcome": "not_fixed", "summary": "还没修好"})],
     )
     connect(monkeypatch, model)
     pokes: list[dict] = []
@@ -151,7 +153,7 @@ def test_full_flow_start_card_answer_finish(client, tmp_path, fake_pool, session
             == 200
         )
         done = poll(client, fid, lambda b: b["state"] == "finished")
-        assert done["outcome"] == "fixed" and done["summary"] == "好了"
+        assert done["outcome"] == "not_fixed" and done["summary"] == "还没修好"
         # SSE 只有「重读」提示：事件名 + 项目 + 会话 id，没有卡片内容
         while not q.empty():
             pokes.append(q.get_nowait())
@@ -160,6 +162,81 @@ def test_full_flow_start_card_answer_finish(client, tmp_path, fake_pool, session
     fix_events = [d for e, d in pokes if e == "ai.fix"]
     assert fix_events and all(set(d) == {"pj", "fix_id"} for d in fix_events)
     assert "数据在哪" not in repr(fix_events)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_fix_recovery_preserves_model_state_and_waits_for_the_card(
+    client, tmp_path, fake_pool, sessions, monkeypatch, cancel
+):
+    _root, _pj, report = _create_ready(client, tmp_path)
+    requests = []
+    reasoning = {"type": "reasoning", "id": "rs_1", "encrypted_content": "PRIVATE_PROGRESS"}
+
+    def post(url, headers, body, **kw):
+        requests.append(body)
+        if len(requests) == 1:
+            reply = {
+                "status": "incomplete",
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "output": [reasoning],
+            }
+        else:
+            if (reasoning in body["input"]) != (len(requests) == 2):
+                return (
+                    400,
+                    {},
+                    b"{}",
+                )  # Recovery state is needed once, then actual tool results suffice.
+            name = "ask_user" if len(requests) == 2 else "finish"
+            args = (
+                {"question": "数据在哪？", "options": [{"id": "a", "label": "A"}]}
+                if name == "ask_user"
+                else {"outcome": "not_fixed", "summary": "仍需提供数据"}
+            )
+            reply = {
+                "status": "completed",
+                "output": [
+                    {
+                        "type": "function_call",
+                        "name": name,
+                        "call_id": f"call_{len(requests)}",
+                        "arguments": json.dumps(args),
+                    }
+                ],
+            }
+        reply["usage"] = {"input_tokens": 10, "output_tokens": 10}
+        return 200, {}, json.dumps(reply).encode()
+
+    model = HttpModel(
+        OpenAIResponsesWire(),
+        base_url="https://example.test",
+        api_key=KEY,
+        model="test",
+        post=post,
+        max_attempts=1,
+    )
+    connect(monkeypatch, model)
+    fid = client.post(
+        "/api/ai/fix", json={"session_id": report["session_id"], "script": "fig.py"}
+    ).get_json()["fix_id"]
+    state = poll(client, fid, lambda b: b["state"] in ("waiting", "finished"))
+    assert state["state"] == "waiting", state
+    card = state["card"]
+    assert card["kind"] == "choice" and len(requests) == 2
+    assert "PRIVATE_PROGRESS" not in json.dumps(state)
+    if cancel:
+        assert client.post(f"/api/ai/fix/{fid}/cancel").status_code == 200
+    else:
+        assert (
+            client.post(
+                f"/api/ai/fix/{fid}/answer", json={"card_id": card["id"], "answer": "a"}
+            ).status_code
+            == 200
+        )
+    done = poll(client, fid, lambda b: b["state"] == "finished")
+    assert done["outcome"] == ("cancelled" if cancel else "not_fixed")
+    assert len(requests) == (2 if cancel else 3)
+    assert "PRIVATE_PROGRESS" not in json.dumps(done)
 
 
 def test_cancel_endpoint_ends_the_session(client, tmp_path, fake_pool, sessions, monkeypatch):
@@ -254,7 +331,7 @@ def test_an_api_connection_still_wins_over_a_cli(
     client, tmp_path, fake_pool, sessions, monkeypatch
 ):
     _root, _pj, report = _create_ready(client, tmp_path)
-    connect(monkeypatch, Scripted([("finish", {"outcome": "fixed", "summary": "好了"})]))
+    connect(monkeypatch, Scripted([("finish", {"outcome": "not_fixed", "summary": "还没修好"})]))
     monkeypatch.setattr(ai_bridge, "agent_caps", lambda agent_id: {"id": agent_id, "usable": True})
     monkeypatch.setattr(
         fixsession, "cli_launcher", lambda *a, **k: pytest.fail("the builtin loop must be used")
@@ -263,4 +340,6 @@ def test_an_api_connection_still_wins_over_a_cli(
         "/api/ai/fix", json={"session_id": report["session_id"], "script": "fig.py"}
     ).get_json()
     assert body["ok"] is True
-    assert poll(client, body["fix_id"], lambda b: b["state"] == "finished")["outcome"] == "fixed"
+    assert (
+        poll(client, body["fix_id"], lambda b: b["state"] == "finished")["outcome"] == "not_fixed"
+    )

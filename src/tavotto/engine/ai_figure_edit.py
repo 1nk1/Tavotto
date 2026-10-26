@@ -607,7 +607,7 @@ def _call_hook(hook):
 #: 渲染这一步量不了、但不是 Agent 的错的运行错误码：写入根绊线（候选脚本把文件写到候选目录以外，如相对路径的 `savefig` /
 #: `to_csv`；校验运行只许写候选目录）。这类结论是“没量到”，不是“坏了”——真正的渲染验证在提交后的 L2 里照常做
 #: `ai_convert.STAGE_PREFIX` 的镜像（import 会成环）；`tests/test_ai_edit_check_app.py` 看护两者一致
-STAGE_PREFIX = "tavotto_convert_probe_"
+STAGE_PREFIX = "_tavotto_convert_probe_"
 NOT_MEASURABLE_CODES = frozenset({"write_outside_roots"})
 
 

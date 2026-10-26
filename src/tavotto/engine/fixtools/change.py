@@ -123,6 +123,7 @@ def install_packages(ctx: FixContext, args: dict) -> ToolResult:
         )
     reqs: list[str] = []
     names: list[str] = []
+    requirements: list[tuple[str, str]] = []
     for item in raw:
         parsed = depresolve.parse_requirement(item.strip())
         if parsed is None:
@@ -133,6 +134,7 @@ def install_packages(ctx: FixContext, args: dict) -> ToolResult:
             )
         reqs.append(f"{parsed[0]}{parsed[1]}")
         names.append(parsed[0])
+        requirements.append((canonical_name(parsed[0]), parsed[1]))
     kind = convertdeps.describe_env(python, "")["kind"]
     if kind in (convertdeps.KIND_SYSTEM, convertdeps.KIND_BUILTIN):
         return err(
@@ -141,9 +143,11 @@ def install_packages(ctx: FixContext, args: dict) -> ToolResult:
             "Choose another environment (list_environments) or create one with change_python.",
         )
     outside = sorted({n for n in names if not convertdeps.in_allowlist(n)})
-    agreed = [ctx.approved_installs.get(canonical_name(n)) for n in outside]
+    outside_names = {canonical_name(n) for n in outside}
+    agreed = [ctx.approved_installs.get(req) for req in requirements if req[0] in outside_names]
     if outside and all(a is not None for a in agreed):
-        # 这些包用户已在 propose_fix 卡上点过头（完全同名才算）：不再弹第二张卡，审计记 user 与同意它的那一步
+        # Same normalized name AND version constraint: a pin cannot authorize
+        # an unpinned upgrade/downgrade or a different range.
         ctx.call_meta["approved_by"] = "user"
         ctx.call_meta["approved_step"] = max(a for a in agreed if a is not None)
     elif outside:  # 名单外 = user_env：一律问
@@ -218,6 +222,49 @@ def switch_execution(ctx: FixContext, args: dict) -> ToolResult:
         "blocked by its own guard."
     )
     return _done(ctx, note, f"execution set to {mode}")
+
+
+# --------------------------------------------------------------------------- switch_workdir
+def switch_workdir(ctx: FixContext, args: dict) -> ToolResult:
+    from .. import workdir
+
+    mode = args.get("mode")
+    if mode not in workdir.MODES:
+        return err("bad_arguments", f"`mode` must be one of {list(workdir.MODES)}.")
+    root = str(ctx.project_root)
+    if workdir.decided(root) and workdir.mode_for(root) == mode:
+        return ok("The project already uses that working directory.", "no change")
+    locations = {
+        "sandbox": "Tavotto's temporary sandbox",
+        "project": "the script's own folder",
+        "project_root": "the project root folder",
+    }
+    denied = approve(
+        ctx,
+        "switch_workdir",
+        f"Run this project's scripts in {locations[mode]}? Relative reads and writes use that folder. "
+        "Safe-mode guards remain enabled; the script's intermediate files may be written there.",
+        details=f"Project: {root}\nWorking directory mode: {mode}",
+    )
+    if denied is not None:
+        return denied
+    if ctx.cancel is not None and ctx.cancel.is_set():
+        return err("cancelled", "The repair was cancelled; the working directory was not changed.")
+    bad = _snapshot_or_error(ctx, "switch_workdir")
+    if bad is not None:
+        return bad
+    try:
+        workdir.set_mode(root, mode)
+    except (OSError, ValueError):
+        return err("settings_not_saved", "The working directory setting could not be saved.")
+    ctx.verification = None
+    if ctx.on_workdir_changed is not None:
+        ctx.on_workdir_changed()
+    return _done(
+        ctx,
+        "The project's working directory was updated. Verify it with try_run.",
+        "working directory selected",
+    )
 
 
 # --------------------------------------------------------------------------- change_python
@@ -470,6 +517,17 @@ CHANGE_TOOLS: tuple[FixTool, ...] = (
         'user first only when it would undo a choice of "safe only" the user made. Takes a snapshot.',
         obj({"mode": {"type": "string", "enum": ["safe", "native"]}}, ["mode"]),
         switch_execution,
+        tier="tavotto",
+        waits_for_user=True,
+    ),
+    FixTool(
+        "switch_workdir",
+        "Choose the project's working directory using Tavotto's existing setting: sandbox, project "
+        "(the script's folder), or project_root. Use when a relative font/input/output path works in "
+        "the project but fails in the application's sandbox. Always asks the user about real-folder "
+        "reads and writes and takes a rollback snapshot. Does not relax safe-mode guards or edit scripts.",
+        obj({"mode": {"type": "string", "enum": ["sandbox", "project", "project_root"]}}, ["mode"]),
+        switch_workdir,
         tier="tavotto",
         waits_for_user=True,
     ),

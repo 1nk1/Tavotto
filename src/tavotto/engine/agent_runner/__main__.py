@@ -24,6 +24,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from . import loop
+from .media import MAX_CHECK_BYTES, CheckResult, from_wire
 from .redact import Redactor
 from .tools import TOOLSETS, RunEnvelope
 from .wires import (
@@ -84,9 +85,11 @@ def _parser() -> argparse.ArgumentParser:
     p.add_argument("--max-turns", type=int, default=None)
     p.add_argument("--max-seconds", type=float, default=None)
     p.add_argument("--max-total-tokens", type=int, default=None)
-    p.add_argument("--request-timeout", type=float, default=120.0)
+    p.add_argument("--request-timeout", type=float, default=None)
     p.add_argument("--prompt-file", default=None, help="提示词文件；缺省读 stdin")
     p.add_argument("--task", default="figure_edit", choices=sorted(TOOLSETS))
+    p.add_argument("--resume-output-sha256", default="")
+    p.add_argument("--checks-used", type=int, default=0)
     p.add_argument("--demo-script", default=None, help="--wire demo 的剧本 JSON")
     p.add_argument(
         "--auth",
@@ -114,16 +117,22 @@ def _ipc_check(emit):
     父进程跑的是 Tavotto 自己的校验流水（ADR 0143 `run_validation`），本进程不碰候选以外的任何东西。
     stdin 关了 / 回复畸形 → 不通过，报告只有稳定短码。"""
 
-    def check() -> tuple[bool, str]:
+    def check() -> tuple[bool, str] | CheckResult:
         emit({"type": "check_request"})
         try:
-            line = sys.stdin.buffer.readline().decode("utf-8", errors="replace")
+            line = sys.stdin.buffer.readline(MAX_CHECK_BYTES * 2 + 16_384).decode(
+                "utf-8", errors="replace"
+            )
+            if not line.endswith("\n"):
+                return False, "check_unavailable"
             msg = json.loads(line)
         except (OSError, ValueError):
             return False, "check_unavailable"
         if not isinstance(msg, dict):
             return False, "check_unavailable"
-        return bool(msg.get("ok")), str(msg.get("report") or "")[:4000]
+        return CheckResult(
+            msg.get("ok") is True, str(msg.get("report") or "")[:4000], from_wire(msg.get("images"))
+        )
 
     return check
 
@@ -215,6 +224,8 @@ def main(argv: list[str] | None = None) -> int:
         limits=limits,
         redactor=redactor,
         output=args.output,
+        resume_output_sha256=args.resume_output_sha256,
+        checks_used=args.checks_used,
         check=_ipc_check(emit) if args.check_ipc else None,
     )
 
@@ -261,7 +272,16 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             effort=args.effort,
             thinking=args.thinking,
-            request_timeout=args.request_timeout,
+            # Conversion emits substantially more code than a figure edit.
+            # A 120s read timeout repeatedly discarded long generations; the
+            # overall deadline and cancellation still bound every request.
+            request_timeout=(
+                args.request_timeout
+                if args.request_timeout is not None
+                else 300.0
+                if args.task == "convert_to_editable"
+                else 120.0
+            ),
             retry_base=args.retry_base,
         )
     del api_key

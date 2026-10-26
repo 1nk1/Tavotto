@@ -9309,8 +9309,8 @@ def _fix_session_env(sess) -> dict:
     """修复会话上下文里能从准备会话拿到的环境事实：当前解释器所在的前缀（可能在主目录外，读取范围要带上它）；
     `change_python` 用缺省执行器（`executors._default_python_changer`，带会话取消信号）。"""
     out: dict = {}
-    env = getattr(sess.plan, "environment", None) or {}
-    py = env.get("python") or env.get("interpreter") or env.get("executable")
+    # The public environment payload deliberately omits absolute paths.
+    py = getattr(sess.plan, "interpreter", None)
     if isinstance(py, str) and py:
         prefix = Path(py).parent.parent
         if prefix.is_dir():
@@ -9329,6 +9329,115 @@ def _fix_remap_notifier(ctx: "ProjectCtx"):
             _publish_remap_changed(root, reason, state["generation"])
 
     return notify
+
+
+def _fix_application_verification(ctx: "ProjectCtx", sess, *, desktop: bool) -> dict:
+    """Bind repair verification to the same preparation session and run action API.
+
+    These callbacks run off the request thread. The original desktop identity is
+    captured by the endpoint; a model cannot manufacture it or select another
+    project/session. Recheck is read-only, never an automatic run-intent advance.
+    """
+    from .engine import fixverification
+
+    def current():
+        if PROJECTS.get(ctx.id) is not ctx:
+            raise engine_prepsession.SessionError(
+                "fix_project_closed", "The project was closed or reopened", 409
+            )
+        found = engine_prepsession.SESSIONS.session(sess.session_id, ctx.id)
+        if found is not sess:
+            raise engine_prepsession.SessionError(
+                "fix_session_changed", "Repair session changed", 409
+            )
+        return found
+
+    def check():
+        with bound_project(ctx):
+            current()
+            checked, _ = engine_prepsession.SESSIONS.check(
+                project_id=ctx.id,
+                project_root=str(ctx.path),
+                target=sess.target,
+                force=True,
+            )
+            if checked is not sess:
+                raise engine_prepsession.SessionError(
+                    "fix_session_changed", "Repair session changed", 409
+                )
+            return _session_report(ctx, sess)
+
+    def claim(action_id, revision):
+        with bound_project(ctx):
+            current()
+            _, claimed, kind = engine_prepsession.SESSIONS.act(
+                sess.session_id,
+                ctx.id,
+                action_id,
+                revision,
+                launch=lambda plan, on_done: _launch_session_attempt(ctx, plan, on_done),
+                finalize=lambda plan, result: _finalize_script_attempt(ctx, plan, result),
+                desktop_initiated=desktop,
+            )
+            return claimed and kind == engine_prepsession.ACTION_RUN
+
+    def owned(action_id):
+        current()
+        if not sess.attempts or sess.attempts[-1].action_id != action_id:
+            raise engine_prepsession.SessionError(
+                "fix_run_superseded", "Another run replaced this repair's run", 409
+            )
+
+    def read(action_id):
+        with bound_project(ctx), sess.lock:
+            owned(action_id)
+            return _session_report(ctx, sess)
+
+    def stop(action_id):
+        with bound_project(ctx), sess.lock:
+            owned(action_id)
+            report = _session_report(ctx, sess)
+            action = next(
+                (a for a in report["actions"] if a["kind"] == engine_prepsession.ACTION_CANCEL),
+                None,
+            )
+            if action is not None:
+                engine_prepsession.SESSIONS.act(
+                    sess.session_id,
+                    ctx.id,
+                    action["id"],
+                    report["config_revision"],
+                    launch=lambda plan, on_done: _launch_session_attempt(ctx, plan, on_done),
+                    finalize=lambda plan, result: _finalize_script_attempt(ctx, plan, result),
+                    desktop_initiated=desktop,
+                )
+
+    def run(python, timeout, cancel, approve):
+        with bound_project(ctx):
+            try:
+                return fixverification.run_preparation(
+                    python=python,
+                    timeout=timeout,
+                    cancel=cancel,
+                    approve=approve,
+                    check=check,
+                    selected_python=lambda: sess.plan.interpreter,
+                    claim=claim,
+                    read=read,
+                    stop=stop,
+                )
+            except engine_prepsession.SessionError as exc:
+                return {"code": exc.code}
+
+    def cwd_changed():
+        with bound_project(ctx):
+            engine_pool.shutdown_all(str(ctx.path))
+
+    return {
+        "application_runner": run,
+        "application_check": check,
+        "on_workdir_changed": cwd_changed,
+    }
 
 
 @app.post("/api/ai/fix")
@@ -9391,6 +9500,7 @@ def api_ai_fix():
             script_path=script_path,
             ctx_kwargs={
                 **_fix_session_env(sess),
+                **_fix_application_verification(ctx, sess, desktop=_desktop_initiated()),
                 "on_input_remap_changed": _fix_remap_notifier(ctx),
             },
         )
@@ -12388,7 +12498,13 @@ def _convert_runner(
 ):
     """校验运行（注入 `ai_convert`）：走现有 probe 路径，**用户同一解释器 / 同一路由**；返回前退役它起的 worker。"""
 
-    def runner(figures_dir: str, rel: str, write_roots: tuple[str, ...] | None = None) -> dict:
+    def runner(
+        figures_dir: str,
+        rel: str,
+        write_roots: tuple[str, ...] | None = None,
+        *,
+        with_images: bool = False,
+    ) -> dict:
         # `write_roots`：写入根绊线（ADR 0141 / 0143）——候选只许写候选目录（与 worker 基础设施目录），写项目文件在事件发生时失败
         roots_kw = {"write_roots": tuple(write_roots)} if write_roots else {}
         try:
@@ -12396,26 +12512,42 @@ def _convert_runner(
         except Exception:  # noqa: BLE001 —— 配置读不出来就按不带参数跑
             run = None
         run_kw = {"run": run} if run is not None else {}
-        # `entry`：只有改图 `check` 传——被改的是登记的那张图，不是静态推断的第一个能出图的入口。转换任务的新脚本没有登记入口，
-        # 仍交给探测自己推断（语义不变）
-        entries_kw = {"entries": [entry]} if entry else {}
-        result = engine_probe.probe(figures_dir, rel, **entries_kw, **run_kw, **roots_kw)
+        # Validate the primary entry used by discovery/reopening. Generic probing
+        # may try a helper after main fails; a helper's figure cannot certify the
+        # complete converted script or hide its original execution error.
+        entries = [entry] if entry else engine_probe.entry_candidates(figures_dir, rel)[:1]
+        result = engine_probe.probe(figures_dir, rel, entries=entries, **run_kw, **roots_kw)
         try:
             if result.get("error"):
                 err = result["error"]
-                # `cause`：探测把底层码折成 script_probe_failed 之前的细分码（写入绊线等），只给要区分的调用方（改图 `check`）
                 cause = (err.get("params") or {}).get("worker_code")
                 return {
                     "error": {
                         "code": err.get("code"),
                         "message": err.get("message"),
                         **({"cause": cause} if cause else {}),
+                        **(
+                            {"write_violation": err["params"]["write_violation"]}
+                            if isinstance((err.get("params") or {}).get("write_violation"), dict)
+                            else {}
+                        ),
                     }
                 }
             stems = list(result.get("stems") or [])
+            # An edit retains its source-owned outputs; a conversion owns new ones.
+            owner = source_script if with_manifests else rel
+            conflicts = engine_probe._live_stem_conflicts(figures_dir, owner, stems)
+            if conflicts:
+                return {
+                    "error": {
+                        "code": engine_probe.ERROR_STEM_CONFLICT,
+                        "message": "Converted outputs still belong to another script; choose independent output names.",
+                    }
+                }
             descs = result.get("descriptors") or []
             size = descs[0].get("size_mm") if descs and isinstance(descs[0], dict) else None
             svg = None
+            images = []
             worker = engine_pool.peek(rel, figures_dir, **run_kw, **roots_kw) if stems else None
             if worker is not None:
                 try:
@@ -12426,7 +12558,43 @@ def _convert_runner(
                         svg = p.read_text(encoding="utf-8", errors="replace")
                 except OSError:
                     svg = None
-            out = {"stems": stems, "size_mm": size, "svg": svg}
+            if worker is not None and with_images:
+                from .engine.agent_runner import media
+
+                total = 0
+                for index, stem in enumerate(stems[: media.MAX_CHECK_IMAGES]):
+                    try:
+                        p = Path(worker.render_png(stem, 1000))
+                        if (
+                            not p.is_file()
+                            or p.is_symlink()
+                            or p.stat().st_size > media.MAX_IMAGE_BYTES
+                        ):
+                            continue
+                        with p.open("rb") as handle:
+                            raw = handle.read(media.MAX_IMAGE_BYTES + 1)
+                        if total + len(raw) > media.MAX_CHECK_BYTES:
+                            break
+                        img = media.from_bytes(raw, f"Captured figure {index + 1}: {stem}")
+                        if img is not None:
+                            images.append(img.as_dict())
+                            total += len(raw)
+                    except Exception:  # noqa: BLE001 - failed live rendering cannot pass a visual check
+                        return {
+                            "error": {
+                                "code": "preview_render_failed",
+                                "message": f"Captured figure {index + 1} could not be rendered as an image.",
+                            }
+                        }
+            out = {
+                "stems": stems,
+                "size_mm": size,
+                "svg": svg,
+                "images": images,
+                "partial": result.get("partial", False),
+                "failed_figures": result.get("failed_figures") or [],
+                "dropped_figures": result.get("dropped_figures", 0),
+            }
             if with_manifests and worker is not None:
                 mans = {}
                 for stem in stems:
@@ -12461,6 +12629,24 @@ def _convert_runner(
         return engine_pool.force_cancel(rel, figures_dir, **run_kw, **roots_kw)
 
     runner.force_cancel = force_cancel  # type: ignore[attr-defined]
+
+    def with_images(figures_dir, rel, write_roots):
+        return runner(figures_dir, rel, write_roots, with_images=True)
+
+    with_images.force_cancel = force_cancel
+    runner.with_images = with_images
+
+    def runtime_hint():
+        # Planning evidence only: do not launch Python, adopt an environment or
+        # confuse the CLI's ambient `python` with the project's validation worker.
+        selected = engine_pool.peek_worker_python(ctx.path)
+        return (
+            {"python": selected[0], "source": selected[1], "verified": False}
+            if selected is not None
+            else {"status": "not_selected", "verified": False}
+        )
+
+    runner.runtime_hint = runtime_hint
     return runner
 
 
@@ -12512,6 +12698,18 @@ def api_ai_convert():
         ), 400
     rel = Path(os.path.relpath(real, os.path.realpath(ctx.path))).as_posix()
     original = body.get("path")
+    try:
+        reference_files = engine_ai_convert.convertcontext.selected_paths(
+            Path(ctx.path), body.get("reference_files")
+        )
+    except ValueError:
+        return jsonify(
+            {
+                "error": "convert_reference_invalid",
+                "code": "convert_reference_invalid",
+                "params": {},
+            }
+        ), 400
     original_rel = None
     if isinstance(original, str) and original:
         got = engine_projectenv.contained_path(ctx.path, original)
@@ -12546,13 +12744,15 @@ def api_ai_convert():
             endpoint_id=endpoint_id,
             task_hooks={
                 "runner": _convert_runner(ctx, rel),
-                # R / MATLAB 转写的新脚本才会要 pandas / statsmodels 这类包：校验运行前按 `convertdeps` 的规则自动装（或停住等用户在依赖卡片上决定）
-                **({"deps": engine_convertdeps.ensure} if foreign else {}),
+                # Every source can introduce Python dependencies. Reuse the same
+                # environment/consent policy and resumable candidate for all of them.
+                "deps": engine_convertdeps.ensure,
             },
             convert={
                 "library": library,
                 "source_language": language,
                 "original_rel": original_rel,
+                **({"reference_files": reference_files} if reference_files else {}),
             },
         )
     except engine_ai.DuplicateRequest as dup:

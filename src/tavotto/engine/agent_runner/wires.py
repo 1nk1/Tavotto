@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
 from .. import netpolicy, tlstrust
+from .media import Image
 
 USER_AGENT = "tavotto-agent-runner/1"
 ANTHROPIC_VERSION = "2023-06-01"
@@ -111,6 +112,14 @@ class ToolResult:
     compact: str | None = None
     #: 这次调用改了文件
     mutated: bool = False
+    #: Bounded visual evidence; only wire adapters consume it, never emit().
+    images: list[Image] = field(default_factory=list)
+    #: Actual injected check outcome; never inferred from its report text.
+    check_passed: bool | None = None
+    #: Trusted tool handler accepted an explicit final validation. The parent
+    #: still runs its own candidate/integrity/adoption checks.
+    completed: bool = False
+    completion_text: str = ""
 
 
 @dataclass
@@ -121,6 +130,60 @@ class Msg:
     text: str = ""
     turn: Turn | None = None
     results: list[ToolResult] = field(default_factory=list)
+    # Interrupted reasoning is temporary handoff state, never a tool operation.
+    recovery_state: bool = False
+
+
+def truncated_continuation(wire: str, turn: Turn) -> Turn | None:
+    """Keep replayable reasoning, never an interrupted message or tool call.
+
+    These opaque blocks stay inside the model conversation. Retaining them is
+    neither executing a call nor accepting an incomplete answer as successful.
+    """
+    native = turn.native
+    if wire == "openai-responses" and isinstance(native, list):
+        items = [
+            item for item in native if isinstance(item, dict) and item.get("type") == "reasoning"
+        ]
+        return Turn(native=items) if items else None
+    if wire == "openai-chat" and isinstance(native, dict):
+        reasoning = native.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning:
+            return Turn(native={"reasoning_content": reasoning})
+    if wire == "anthropic" and isinstance(native, list):
+        items = []
+        for item in native:
+            if not isinstance(item, dict):
+                break
+            kind = item.get("type")
+            field = (
+                "signature"
+                if kind == "thinking"
+                else "data"
+                if kind == "redacted_thinking"
+                else None
+            )
+            if field is None or not isinstance(item.get(field), str) or not item[field]:
+                break  # An unfinished thinking block has no valid replay signature.
+            items.append(item)
+        return Turn(native=items) if items else None
+    return None
+
+
+def _replay_items(turn: Turn, kind: str, argument_key: str) -> list[dict]:
+    """Keep malformed arguments in tool feedback, not in a second invalid request.
+
+    A placeholder object does not authorize execution: the rejected original
+    call already received bad_arguments, paired with this exact call identity.
+    """
+    invalid = {call.id for call in turn.tool_calls if call.args is None}
+    identity = "call_id" if kind == "function_call" else "id"
+    return [
+        {**item, argument_key: "{}" if kind == "function_call" else {}}
+        if isinstance(item, dict) and item.get("type") == kind and item.get(identity) in invalid
+        else item
+        for item in turn.native or []
+    ]
 
 
 class RunnerFailure(Exception):
@@ -283,7 +346,9 @@ class AnthropicWire:
             if m.role == "user":
                 msgs.append({"role": "user", "content": [{"type": "text", "text": m.text}]})
             elif m.role == "assistant" and m.turn is not None:
-                msgs.append({"role": "assistant", "content": m.turn.native or []})
+                msgs.append(
+                    {"role": "assistant", "content": _replay_items(m.turn, "tool_use", "input")}
+                )
             elif m.role == "tool":
                 msgs.append(
                     {
@@ -292,7 +357,26 @@ class AnthropicWire:
                             {
                                 "type": "tool_result",
                                 "tool_use_id": r.call_id,
-                                "content": r.content,
+                                "content": (
+                                    [{"type": "text", "text": r.content}]
+                                    + [
+                                        block
+                                        for img in r.images
+                                        for block in (
+                                            {"type": "text", "text": img.label or "Image"},
+                                            {
+                                                "type": "image",
+                                                "source": {
+                                                    "type": "base64",
+                                                    "media_type": img.mime_type,
+                                                    "data": img.data,
+                                                },
+                                            },
+                                        )
+                                    ]
+                                    if r.images
+                                    else r.content
+                                ),
                                 **({"is_error": True} if r.is_error else {}),
                             }
                             for r in m.results
@@ -429,6 +513,19 @@ class OpenAIChatWire:
                     {"role": "tool", "tool_call_id": r.call_id, "content": r.content}
                     for r in m.results
                 ]
+                # Chat's tool messages are text-only. Close every tool call
+                # before adding the corresponding images as a user message.
+                images = [
+                    block
+                    for r in m.results
+                    for img in r.images
+                    for block in (
+                        {"type": "text", "text": f"Tool {r.call_id}: {img.label or 'Image'}"},
+                        {"type": "image_url", "image_url": {"url": img.url}},
+                    )
+                ]
+                if images:
+                    msgs.append({"role": "user", "content": images})
         body: dict[str, Any] = {
             "model": model,
             self.token_field: max_output_tokens,
@@ -526,10 +623,26 @@ class OpenAIResponsesWire:
             if m.role == "user":
                 items.append({"role": "user", "content": m.text})
             elif m.role == "assistant" and m.turn is not None:
-                items += list(m.turn.native or [])
+                items += _replay_items(m.turn, "function_call", "arguments")
             elif m.role == "tool":
                 items += [
-                    {"type": "function_call_output", "call_id": r.call_id, "output": r.content}
+                    {
+                        "type": "function_call_output",
+                        "call_id": r.call_id,
+                        "output": (
+                            [{"type": "input_text", "text": r.content}]
+                            + [
+                                block
+                                for img in r.images
+                                for block in (
+                                    {"type": "input_text", "text": img.label or "Image"},
+                                    {"type": "input_image", "image_url": img.url, "detail": "auto"},
+                                )
+                            ]
+                            if r.images
+                            else r.content
+                        ),
+                    }
                     for r in m.results
                 ]
         body: dict[str, Any] = {
@@ -605,7 +718,14 @@ class OpenAIResponsesWire:
                     )
                 )
             elif kind == "reasoning":
-                turn.thinking_chars += len(json.dumps(it.get("summary") or "", ensure_ascii=False))
+                # Compatible endpoints may return plain reasoning in content;
+                # summaries alone used to report zero for a full truncated turn.
+                turn.thinking_chars += sum(
+                    len(part["text"])
+                    for field in ("content", "summary")
+                    for part in (it.get(field) if isinstance(it.get(field), list) else [])
+                    if isinstance(part, dict) and isinstance(part.get("text"), str)
+                )
         turn.text = "".join(texts)
         turn.usage = usage
         # 截断优先于工具调用（同 AnthropicWire）

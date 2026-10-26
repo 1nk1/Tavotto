@@ -1054,6 +1054,8 @@ def _cmd(
     target: str | None = None,
     task: str = "figure_edit",
     output: str | None = None,
+    resume_output_sha256: str = "",
+    checks_used: int = 0,
     check_ipc: bool = False,
 ) -> tuple[list[str], dict[str, str]]:
     """→ (命令行, 需要追加到环境的变量)。第三方接口全部走这两样注入，
@@ -1076,6 +1078,8 @@ def _cmd(
                 target=target,
                 task=task,
                 output=output,
+                resume_output_sha256=resume_output_sha256,
+                checks_used=checks_used,
                 check_ipc=check_ipc,
                 model=model,
                 endpoint_args=list(extra_args),
@@ -1334,6 +1338,7 @@ def run(
                     source_language=str(convert.get("source_language") or "python"),
                     original_path=original_path,
                     original_rel=original_rel,
+                    reference_files=convert.get("reference_files") or (),
                 )
                 cand.extras.update(task_hooks or {})
                 convert_prompt = ai_convert.prompt_for(cand)
@@ -1550,22 +1555,34 @@ def run(
     emit = on_event or (lambda *_: None)
 
     log_state = {"log": stderr_log}
+    convert_checks = 0
 
     def _answer_check() -> None:
         """内置执行器的 `check`：跑 ADR 0143 的校验流水（`run_validation`，候选工作区里），把结论写回它的 stdin。"""
         from . import ai_convert, ai_figure_edit
+        from .agent_runner.tools import CONVERT_MAX_CHECKS
 
+        nonlocal convert_checks
+        evidence = []
         try:
-            # 转换：新脚本在用户同一路由下真跑；改图：候选副本的提交前 L1 检查 + 同一路由下真渲染 + 数据指纹
-            ok, report = (
-                ai_convert.agent_check(cand)
-                if builtin_convert
-                else ai_figure_edit.agent_check(cand, ai_convert.run_validation)
-            )
+            if builtin_convert:
+                if convert_checks >= CONVERT_MAX_CHECKS:
+                    ok, report = False, "check_budget"
+                else:
+                    convert_checks += 1
+                    ok, report = ai_convert.agent_check(cand, evidence=evidence)
+            else:
+                ok, report = ai_figure_edit.agent_check(cand, ai_convert.run_validation)
         except Exception:  # noqa: BLE001 - 校验流水自身出错：告诉 Agent 不通过，不拖垮会话
             LOG.exception("内置执行器的 check 回调出错（session %s）", sid)
             ok, report = False, "check_failed"
-        reply = json.dumps({"ok": ok, "report": report}, ensure_ascii=True) + "\n"
+        reply = (
+            json.dumps(
+                {"ok": ok, "report": report, "images": [img.as_dict() for img in evidence]},
+                ensure_ascii=True,
+            )
+            + "\n"
+        )
         try:
             pipe = sess["proc"].stdin
             pipe.write(reply)
@@ -1575,24 +1592,41 @@ def run(
 
     def _consume():
         st: dict = {}
-        for line in sess["proc"].stdout:
-            line = line.rstrip("\n")
-            if not line.strip():
-                continue
-            if builtin_ipc and '"check_request"' in line:
-                _answer_check()
-                continue
-            for kind, text in _classify(agent, line, st):
-                if not text:
-                    continue
-                if kind != "delta":  # delta 只走 SSE，transcript 存终稿
-                    sess["transcript"].append({"kind": kind, "text": text})
-                emit("ai.delta", {"session": sid, "kind": kind, "text": text})
-            if time.time() - sess["started"] > TIMEOUT_S:
-                _terminate(sess)
+        sess.pop("runner_error", None)
+        proc = sess["proc"]
+        complete = threading.Event()
+
+        def expire():
+            # A silent process (or one holding a partial line) never reaches a
+            # timeout check inside the stdout iterator. Watch independently.
+            if not complete.is_set() and sess["proc"] is proc and sess["status"] == "running":
                 sess["status"] = "timeout"
-        _await_exit(sess)
-        log_state["log"].close()
+                _terminate(sess)
+
+        timer = threading.Timer(max(0.0, TIMEOUT_S - (time.time() - sess["started"])), expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if not line.strip():
+                    continue
+                if builtin_ipc and '"check_request"' in line:
+                    _answer_check()
+                    continue
+                for kind, text in _classify(agent, line, st):
+                    if not text:
+                        continue
+                    if kind != "delta":  # delta only streams; transcript keeps final text
+                        sess["transcript"].append({"kind": kind, "text": text})
+                    emit("ai.delta", {"session": sid, "kind": kind, "text": text})
+            _await_exit(sess)
+            if agent == ai_agents.BUILTIN_ID and st.get("runner_error"):
+                sess["runner_error"] = st["runner_error"]
+        finally:
+            complete.set()
+            timer.cancel()
+            log_state["log"].close()
 
     def _respawn(note: str) -> None:
         """TAF 有界修正：在同一个候选目录里、带着原提示词 + 修正指令再起一次 CLI（Phase 4，`ai_tasks._admit_correction`
@@ -1610,8 +1644,17 @@ def run(
             {"session": sid, "task_type": sess["task"]["task_type"], "phase": "correcting"},
         )
         again = prompt + "\n\n" + note
+        correction_kw = dict(cmd_kw)
+        if builtin_convert:
+            correction_kw.update(
+                resume_output_sha256=(
+                    hashlib.sha256(cand.new_bytes).hexdigest() if cand.new_bytes is not None else ""
+                ),
+                checks_used=convert_checks,
+            )
+            again += "\n继续修正现有候选文件，先读取它；此前已用的 check 次数不会重置。"
         cmd2, extra2 = _cmd(
-            agent, again, agent_cwd, model=model, effort=effort, endpoint=endpoint, **cmd_kw
+            agent, again, agent_cwd, model=model, effort=effort, endpoint=endpoint, **correction_kw
         )
         LOG.info(
             "AI 任务修正命令: %s", " ".join("<prompt>" if part == again else part for part in cmd2)
@@ -1736,7 +1779,9 @@ def _drive_task(sess: dict, task_run, cand, consume, on_changed, script: str, re
             # 再看退出码：Windows 上被杀的进程退出码非零，且这一刻 `cancel` 可能还没来得及把会话改成 cancelled
             return
         if sess["proc"].returncode != 0:
-            raise ai_tasks.TaskError("agent_exit_nonzero", str(sess["proc"].returncode))
+            raise ai_tasks.TaskError(
+                sess.get("runner_error") or "agent_exit_nonzero", str(sess["proc"].returncode)
+            )
 
     from . import ai_convert
 

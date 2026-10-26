@@ -3,6 +3,8 @@ show-only 脚本按原名比对、写入绊线被识别为“没量到”。假�
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tavotto.engine import ai_bridge, ai_convert, ai_figure_edit, ai_history, pool, project_watch
@@ -59,26 +61,35 @@ def world(tmp_path, monkeypatch):
         project_watch.stop()
 
 
-def _check(m, figs, base_src, new_src, sid="s1", entry=None):
+def _check(m, figs, base_src, new_src, sid="s1", entry=None, register=False, newline=None):
     script = figs / "plot.py"
     script.write_text(base_src, encoding="utf-8")
+    if register:
+        m.engine_discover.register(figs, "plot.py", ["plot"], entry=entry or "main")
     ctx = next(iter(m.PROJECTS.values())) if hasattr(m, "PROJECTS") else None
     runner = m._convert_runner(ctx, "plot.py", with_manifests=True, entry=entry)
     # 基线 = 原脚本自己的校验运行（stem 是 plot）；只测数据指纹的比对口径，不动热会话
     baseline = runner(str(figs), "plot.py", None).get("manifests")
     assert baseline and "plot" in baseline, baseline
     cand = ai_figure_edit.create_candidate(sid, script, figs, "plot.py")
-    cand.target.write_text(new_src, encoding="utf-8")
+    cand.target.write_text(new_src, encoding="utf-8", newline=newline)
+    # Compare the file at the check boundary, including the platform's line endings.
+    before_check = cand.target.read_bytes()
     cand.extras.update({"runner": runner, "check_before": lambda: baseline})
     try:
-        return ai_figure_edit.agent_check(cand, ai_convert.run_validation)
+        result = ai_figure_edit.agent_check(cand, ai_convert.run_validation)
+        assert cand.target.read_bytes() == before_check, (
+            "Checking an edit must not rewrite its outputs"
+        )
+        return result
     finally:
         ai_figure_edit.remove_candidate(cand.dir)
 
 
-def test_show_only_script_keeps_its_name_when_only_the_title_changes(world):
+@pytest.mark.parametrize("newline", ["\n", "\r\n"], ids=["lf", "crlf"])
+def test_show_only_script_keeps_its_name_when_only_the_title_changes(world, newline):
     m, figs = world
-    ok, report = _check(m, figs, SHOW_ONLY, SHOW_ONLY.replace("'old'", "'new'"))
+    ok, report = _check(m, figs, SHOW_ONLY, SHOW_ONLY.replace("'old'", "'new'"), newline=newline)
     assert ok, report
     assert "data unchanged" in report and "fingerprint not measured" not in report, report
 
@@ -87,6 +98,18 @@ def test_show_only_script_with_changed_data_is_still_caught(world):
     m, figs = world
     ok, report = _check(m, figs, SHOW_ONLY, SHOW_ONLY.replace("[1, 4, 9]", "[1, 4, 10]"))
     assert not ok and "data_changed" in report and "'plot'" in report, report
+
+
+@pytest.mark.parametrize("change_data", [False, True])
+def test_registered_savefig_edit_retains_source_output_identity(world, change_data):
+    m, figs = world
+    source = SHOW_ONLY.replace("plt.show()", "plt.savefig('plot.png')")
+    edited = source.replace("'old'", "'new'")
+    if change_data:
+        edited = edited.replace("[1, 4, 9]", "[1, 4, 10]")
+    ok, report = _check(m, figs, source, edited, register=True)
+    assert ok is not change_data, report
+    assert ("data_changed" if change_data else "data unchanged") in report, report
 
 
 def test_relative_output_write_is_reported_as_not_measured_not_as_a_broken_script(world):
@@ -101,10 +124,11 @@ def test_stage_prefix_mirrors_the_convert_module():
 
 
 def test_convert_validation_gives_the_write_hint_for_a_relative_output_script(world):
-    """转换任务的校验运行走同一条真链路：绊线的码被探测折成 script_probe_failed，也要走到设计好的“写到项目内”提示。"""
+    """真 worker 的写入拒绝须保留候选隔离提示与具体写入，供模型修正后重试。"""
     m, figs = world
     script = figs / "plot.py"
     script.write_text(SHOW_ONLY, encoding="utf-8")
+    original_bytes = script.read_bytes()
     ctx = next(iter(m.PROJECTS.values()))
     cand = ai_figure_edit.create_candidate("c1", script, figs, "plot.py")
     cand.new_bytes = WRITES_CSV.encode()
@@ -113,7 +137,11 @@ def test_convert_validation_gives_the_write_hint_for_a_relative_output_script(wo
     finally:
         ai_figure_edit.remove_candidate(cand.dir)
     assert res["status"] == "error" and res["code"] == ai_convert.WRITE_OUTSIDE_ROOTS_CODE, res
-    assert res["message"] == ai_convert.WRITE_OUTSIDE_HINT
+    hint, detail = res["message"].split("\nRejected write: ", 1)
+    assert hint == ai_convert.WRITE_OUTSIDE_HINT
+    assert json.loads(detail) == {"path": "data.csv", "event": "open"}
+    assert script.read_bytes() == original_bytes
+    assert not (figs / "data.csv").exists()
 
 
 TWO_PLOTS = (

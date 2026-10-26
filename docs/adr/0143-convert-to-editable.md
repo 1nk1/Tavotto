@@ -19,7 +19,7 @@
 
 1. **绝不修改用户的任何脚本**。原脚本字节在整条流程里不变（`tests/test_ai_convert.py::test_original_script_bytes_never_change_through_the_whole_flow`）；
    转换会话的回滚入口被拒（`ai_revert_not_applicable`，回滚会重写用户脚本）。
-2. **Agent 只写候选工作区里的一个新文件**。候选 `data_dir()/cache/ai_convert/<sid>/` 只**复制**原脚本（与 ≤ 8 MB 的原输出图当参考），
+2. **Agent 只写候选工作区里的一个新文件**。候选 `data_dir()/cache/ai_convert/<sid>/` **复制**原脚本、≤ 8 MB 的原输出图与下述有界只读依赖快照，
    不建链接；提交前检查：除这一个新文件外候选树逐字节不变（含原脚本副本）、原项目指纹不变、项目里原脚本仍是起跑那一版。
    CLI 把写入挡在 cwd 之外是 CLI 的行为，指纹只能发现、不能阻止（同 `figure_edit`，R-03）。
    **完整性闸门先于依赖等待（Codex #1330 P1）**：校验运行前的依赖调查期间项目文件被改（`project.untouched` / `project.target` 失败）→ 不进入依赖等待、
@@ -38,9 +38,44 @@
    `pool.build` / `invalidate` / `force_cancel` 同一份根，池键多一段），根只有候选目录——候选把相对路径输出（`out.png` / `data.csv`）写进
    项目目录时在写发生的那一刻以 `write_outside_roots` 失败，用户文件不被打开写；跑完的指纹复核只是兜底。绊线的盲区同 ADR 0141
    （C 层写、子进程、位于系统临时目录 / 用户缓存目录之下的项目）。
+   内置执行器可用 ADR 0147 的 `check(final=true, summary=...)` 在同次真实校验通过后结束模型会话，省去纯收尾的下一次请求；
+   这不是采用或父进程验证的替代品。Task Core 仍独立校验当前候选，失败仍不可采用，用户仍须对照确认。
+   转换校验只执行共享发现逻辑选出的首个入口，与采用后重开的入口一致。主入口报错或未出图时，不能换到
+   辅助绘图函数取得部分图后宣告整份候选成功；真实失败交回既有有界修正流程。普通素材探测的多入口能力不变。
 5. 对照数据（`comparison`）：原图像素宽高 / 字节 / 摘要（PNG / JPEG / GIF 头部）、新版图幅 mm 与图个数、宽高比相对差、新版 SVG 预览
    （沙盒 CSP + nosniff 的 `GET /api/ai/convert/<sid>/preview.svg`，只给 `<img>`）。**不做像素差**（`pixel_diff: null`）：
    原件是位图而新版是矢量重画，逐像素差没有可辩护的含义，交给用户并排看。
+
+### 项目资源上下文修订（2026-10-25）
+
+外部语料复现了“原项目有字体 / helper，但模型只见入口脚本，因而替换字体或放弃转写”。
+`engine/convertcontext.py` 在不运行源码的前提下提名依赖：Python 本地 import 复用 `importscan`，
+文字中的文件引用及 MATLAB 同目录 helper 调用只作提名，不宣称完成运行时依赖解析。按该模块的文件数、
+单文件/总字节与递归预算提供普通文件，保留项目相对路径；敏感路径拒绝，文本视图用 `fixtools.readscope` 脱敏，
+不进入 Python 环境，不跟随链接 / 重解析点，不触发云端占位文件下载。打开时及读后核文件身份，
+防检查后换成链接或特殊文件。未提供与超限项写进 `context.json`，覆盖度明确为 `static_partial`。
+
+`project_context/` 与清单只读，内置工具沿既有路径判据浏览子目录；create/edit 仍只许写顶层一个新候选。
+来源与视图分别记完整 SHA256，脱敏项标 `redacted`；执行仍读取原项目资源，脱敏文本不能当成原始数据或直接采用。
+check、留存、续跑、采用核同一份起跑基线，资源变化即拒绝，不能用 size/mtime
+或续跑时的新基线替代。已有无 context 的持久候选仍按旧契约处理。生成代码沿用原项目位置，不能依赖本次缓存；
+采用后清掉候选目录、从其他 cwd 新起进程仍须能读取原 helper / 数据。看护：`tests/test_convert_context.py`。
+
+数据修复后的转换还须获知运行时读取语义：`input_read_policy` 只说明项目是否配置了用户确认的只读映射，
+不暴露目标路径或复制外部文件。映射仅接管缺失的只读打开，`exists/is_file/glob` 仍返回真实文件系统事实；
+模型必须保留原始输入路径串与读取方式，不能因快照缺项新增跳过绘图的分支或把相对输入改成绝对路径。
+必需输入读取失败交回校验循环，不能宣告部分输出为完整转换。清单记录同一 `inputremap.fingerprint`，
+检查、续跑、留存和采用前复核，映射改变即 `convert_context_changed`；旧清单无此字段时兼容既有契约。
+
+用户可在缺少输入的原因卡中填写项目内参考文件（`reference_files`），点击「带参考文件重试」后才创建新会话。
+Python、R、MATLAB 共用这条路径；无效路径返回 `convert_reference_invalid`，保留输入框供更正，不发模型请求。
+最多 16 个文件；显式参考优先占用既有快照预算，并沿用同一脱敏、文件身份、完整摘要和采用前复查。
+明确选择的文件若不可读或超预算，整次请求失败，不能默默丢掉后继续生成。项目切换不带走未发送输入。
+
+共享转换提示允许读取原字体度量，并先注册项目字体再按真实族名绘制，保留逐字形回退；强调 Pillow anchor、
+独立输出/页面、统计定义与分类顺序。依据：[Pillow anchors](https://pillow.readthedocs.io/en/stable/handbook/text-anchors.html)、
+[Matplotlib addfont](https://matplotlib.org/stable/api/font_manager_api.html)。提示词和成功出图都不是科学保真证明；
+原生参照与数值/几何复测另行记录，不改变 `side_by_side` / `unknown` 的含义。默认执行器路由不变。
 
 ### 三、默认开与逃生口
 
@@ -50,7 +85,7 @@
 
 ### 四、端点
 
-`POST /api/ai/convert`（`{script, library, path?, agent?, client_request_id?}`；`library` 取 `rasterhint.LIBRARIES`；`script` / `path` 经
+`POST /api/ai/convert`（`{script, library, path?, reference_files?, agent?, client_request_id?}`；`library` 取 `rasterhint.LIBRARIES`；`script` / `path` 经
 `contained_path`）、`GET /api/ai/convert/<sid>`、`GET /api/ai/convert/<sid>/preview.svg`、`POST /api/ai/convert/<sid>/adopt`、
 `POST /api/ai/convert/<sid>/discard`。全部过会话认证，候选按**项目**隔离（别的项目的 sid 一律 `convert_not_found`）。
 
@@ -69,7 +104,7 @@ outcome、corrections 个数、是否采用）——不带脚本、路径或图�
 2. **不运行**用户的 R / MATLAB：对照只用脚本旁已有的原图（沿用本 ADR 的 `path` / `original_rel`；请求没给时取脚本旁同主干名的位图）。没有原图时
    `comparison` 带 `reference: null`、`verification: "unknown"`（有原图为 `side_by_side`，只是并排给人看，不是判定），界面一句话说明。
 3. **没有逐一对应的统计方法时停下**：Agent 首行写 `TAVOTTO_NEEDS_INPUT: <原因>` 并且不写新文件 → 任务结局 `needs_input`（`ai_tasks.NeedsInput`，在 Agent 运行结束后判，
-   与 `Plan.needs_input` 的“执行前”不同），不生成新脚本。标记只在“没有新文件”时算数、只认 Agent 的完整回答、行首；原因清洗 + 限长 200 字，只随结局给界面，不进日志 / 遥测。
+   与 `Plan.needs_input` 的“执行前”不同），不生成新脚本。标记只在“没有新文件”时算数、只认 Agent 的完整回答、行首；原因清洗 + 限长 8,192 字（2026-10-26：容纳完整导出指引，超限仍不截断命令），只随结局给界面，不进日志 / 遥测。
    没有标记且没写文件仍是原来的 `target_missing` 失败。
 4. **新脚本缺的 Python 包自动装进用户环境**（用户改了默认值）：不新写 pip 路径，缺什么由 `deprepair.joint_plan_for`（`importscan` 静态扫 + `depplan`）算，装由
    `create_joint_plan` + `prepare`。装好的包进结果 `installed`（界面一句“已为这个项目装好 pandas、statsmodels”）；装失败是不可修正的失败（`dependency_install_failed`）。
@@ -192,3 +227,64 @@ outcome、corrections 个数、是否采用）——不带脚本、路径或图�
 ## 回滚
 
 关总开关即回到 D 的纯提示卡；采用产生的只是项目里一个新文件，删掉即恢复。
+
+### 外部语料复测发现的校验闭环（2026-10-25）
+
+候选校验复用 probe 的逐图隔离能力，但其接受条件更严格：只要本次运行带
+`partial`、非空 `failed_figures` 或 `dropped_figures`，即使已有其他图成功捕获，也以
+`capture_incomplete` 拒绝 check / precommit / resume；应用适配层须原样传递这些事实。
+不能把“至少一张可用”当作“这份转换通过”。语义保真仍由原生参照另验。
+
+临时校验脚本仍放在原脚本同目录，文件名使用有效 Python 私有模块前缀 `_tavotto_convert_probe_`，
+因此相对资源解析不变，而项目发现沿用其既有的基础设施脚本规则，不会把短暂的
+校验副本登记成用户脚本或输出归属。每次运行的 finally 仍负责移除它；不删除
+原项目的任何归属记录来解决冲突。回归：`tests/test_convert_capture_completeness.py`。
+
+新生成的 Matplotlib 候选在真实校验之前，把 savefig 路径规范化为本次转换的
+独立输出名（原目录、扩展名保留，主干追加稳定转换标识）。这是候选文件本身的
+可审阅代码，采用时不再改写；不修改原脚本、原图或抢占原注册表归属。
+`convertoutputs` 用 AST 封装调用，运行时只对实际 Matplotlib savefig 改名；
+同名的其他对象方法、文件流、参数求值顺序保持原样。动态别名未能覆盖时，
+真实捕获仍由现有 `probe._live_stem_conflicts` 判归属冲突，不会默默采用。
+多页 PDF 在 `PdfPages` 构造时就打开路径，必须在构造前赋予独立输出名，不能等
+savefig 收到已打开的流时再处理。已识别的构造调用同样在运行时核对实际类，
+其他同名构造器及 BytesIO 不变；真实两页/五页执行验证原 PDF 字节保留、页数完整。
+回归含多种调用形态、幂等、篡改拒绝和删缓存后的真实应用重开
+（`tests/test_convert_outputs.py`）。
+
+
+### 修订：保真缺口优先于可运行草稿（2026-10-25）
+
+外部 MATLAB 案例中，模型缺少实际 parula 色表，却写出了可运行的 viridis 替代版；这不满足视觉保真要求。当时共享提示将缺失数据、实际 axes 色表和可靠语义对应都纳入 `TAVOTTO_NEEDS_INPUT`。**视觉默认值的阻断范围由下节维护者裁决替代**。标记在写文件或 check 后仍有效，取代上文“只在没有新文件时算数”的限制；提交前不执行/采用明确报告语义缺口的草稿。原项目零改动，界面沿用既有 needs_input 详情。它不是自动科学保真认证，也不把任意代码注释当作判据。
+
+第三路径：不把近似色表当成功，也不按源码词语猜测或禁止整个 MATLAB 类别。保留已有准确转换路径；缺事实时说明原始 axes 色表、版本和导出方法，补齐证据后的转换独立复测。原生事实补充组与未提供数字事实的组分别记账，不计入默认路由放行证据。
+
+### 修订：流程验收与视觉验收分开（维护者 2026-10-25 裁决）
+
+先解决真实用户脚本的完整流程，逐像素一致是后续验收。主体是**本次候选在用户选择的 Python 环境里**完成执行、捕获、经确认采用并可重开；不是 CLI 自己能运行，也不是模型说“修好”。
+
+所有来源与执行器共用 `ai_prompt_pack` 的验收顺序，按能力建立对应关系，不按外部脚本名加例外：
+
+| 能力 | 共同要求 | 来源差异 |
+| --- | --- | --- |
+| 数据和项目资源 | 保留真实数据、路径基准、helper 与字体；不依赖候选缓存；缺输入给出补充步骤 | Pillow 的照片/蒙版；R 的表格和 factor 元数据；MATLAB 的矩阵和 helper |
+| 计算语义 | 不编数据、不改单位/统计定义/缺失值/类别顺序/数学含义 | R 统计函数须核默认参数；MATLAB 核下标、列优先和逐元素运算；Python 沿用原计算 |
+| 可编辑对象与输出 | 保留全部独立图/页面及顺序，文字与形状可编辑，原文件不改 | 原照片的处理可保留 Pillow；不能把绘制完成的文字/形状位图充作可编辑对象 |
+| 目标运行环境 | 三类来源统一进入 `convertdeps.ensure`，沿用既有环境选择、确认、取消、同一候选续跑 | 修的是候选 Python 依赖；不安装/执行原生 R 包或 MATLAB 工具箱 |
+| 视觉验收 | 保留已经提供的样式事实；未知布局/相机/字体像素/抗锯齿独立报告，运行通过不等于保真通过 | MATLAB 原生默认色表未知时可明确使用目标色表，必须保留 CData/CLim/colorbar 数值，不冒充 parula |
+
+先用常规 Matplotlib 对象产生完整候选并运行检查，不因缺原生渲染器事实反复研究像素而耗尽预算。
+外观未知项在候选注释和最终回复中说明；`comparison.verification` 仍只有 `unknown` / `side_by_side`，不增加“保真通过”状态。
+真实数据缺失、统计方法不能可靠对应、必要可编辑对象无法表达，仍用 `TAVOTTO_NEEDS_INPUT` 阻断；该标记不能因已有可运行文件而忽略。
+补充输入说明须给出可执行的命令、运行位置与实际产物；只打印控制台的命令不能声称已写出参考文件。
+颜色/几何编码的数据含义不属于可放宽的像素差异。
+
+第三路径的冲突根因是把执行闭环与渲染器一致性混成一个成功条件。分层验收保留两类证据；不放宽源文件完整性、真实运行、完整捕获、采用确认或环境权限。
+回归：`test_ai_convert_app` 对三种来源跑相同依赖准备及停住/续跑/采用检查，实际 safe worker 执行 Python 候选；安装和模型是桩，真实模型与装包另行记账。
+
+### 2026-10-25 保真收尾补充
+
+候选中能静态指认的 Pillow 绘制文字/形状调用以 `raster_drawing` 拒绝，字体测量与照片读取仍允许。
+这是一条针对已复现假成功的负证据，不替代原生数值、几何、颜色及逐页视觉验收。
+长脚本的单响应预算增为 32768 token（包括隐藏思考），6000 字符的文件分块与总预算不变；
+响应截断、网络、额度和会话期限分别以稳定原因码展示，不再统一成为未知失败。

@@ -40,6 +40,8 @@ GOOD = "import matplotlib.pyplot as plt\nfig, ax = plt.subplots()\nax.plot([1, 2
 #: Agent 在 cwd 里写那一个新文件
 WRITE_GOOD = f"(d / 'fig_matplotlib.py').write_text({GOOD!r}, encoding='utf-8')"
 WRITE_NO_MPL = "(d / 'fig_matplotlib.py').write_text('print(1)\\n', encoding='utf-8')"
+RASTER = "import matplotlib.pyplot as plt\nfrom PIL import ImageDraw\nImageDraw.Draw(mask).ellipse((0,0,10,10))\n"
+WRITE_RASTER = f"(d / 'fig_matplotlib.py').write_text({RASTER!r}, encoding='utf-8')"
 WRITE_SYNTAX = "(d / 'fig_matplotlib.py').write_text('def f(:\\n', encoding='utf-8')"
 WRITE_NOTHING = "pass"
 #: 额外还动了副本里的原脚本 / 多建了一个文件
@@ -83,7 +85,7 @@ def env(monkeypatch, tmp_path):
     (figs / "data.csv").write_text("x,y\n1,2\n", encoding="utf-8")
     state = {"code": WRITE_GOOD, "cwd": [], "prompts": [], "figs": figs, "runner": ok_runner}
 
-    def _cmd(agent_id, prompt, cwd, model=None, effort=None, endpoint=None):
+    def _cmd(agent_id, prompt, cwd, model=None, effort=None, endpoint=None, **_kwargs):
         state["cwd"].append(cwd)
         state["prompts"].append(prompt)
         pre = f"import pathlib, sys; d = pathlib.Path(sys.argv[1]); proj = pathlib.Path({str(figs)!r}); "
@@ -164,7 +166,15 @@ def test_agent_runs_in_a_candidate_workspace_and_only_one_new_file_is_staged(env
     assert sess["task"]["outcome"] == "completed", sess["task"]
     # 候选留存待采用：目标文件 + meta + 预览；原脚本副本与参考图原样
     names = sorted(p.name for p in cand_dir.iterdir())
-    assert names == ["fig.py", "fig_matplotlib.py", "meta.json", "preview.svg", "reference"]
+    assert names == [
+        "context.json",
+        "fig.py",
+        "fig_matplotlib.py",
+        "meta.json",
+        "preview.svg",
+        "project_context",
+        "reference",
+    ]
     assert (cand_dir / "fig.py").read_text(encoding="utf-8") == ORIGINAL
     # 项目里什么都没多、什么都没少
     assert sorted(_project_files(env["figs"])) == ["data.csv", "fig.py", "out.png"]
@@ -198,6 +208,36 @@ def test_revert_of_a_convert_session_is_refused(env):
     assert ai_bridge.get(sid)["revert_available"] is False
 
 
+@pytest.mark.parametrize(
+    ("reason", "detail", "expected"),
+    [
+        ("budget", "output_truncated", "agent_output_truncated"),
+        ("network", "provider echoed private source", "agent_network"),
+        ("unknown-secret", "secret", "agent_exit_nonzero"),
+    ],
+)
+def test_builtin_terminal_reason_survives_task_failure_without_provider_text(
+    env, monkeypatch, reason, detail, expected
+):
+    import json
+
+    monkeypatch.setattr(ai_bridge.ai_providers, "builtin_conn", lambda *_args: {"id": "test"})
+    event = json.dumps({"type": "done", "ok": False, "reason": reason, "detail": detail})
+    env["code"] = f"print({event!r}, flush=True); sys.exit(1)"
+    sid = ai_bridge.run(
+        "builtin",
+        "fig.py",
+        "convert",
+        str(env["figs"]),
+        task_hooks={"runner": env["runner"]},
+        convert={"library": "pillow", "original_rel": "out.png"},
+    )
+    sess = _wait(sid)
+    assert sess["status"] == "failed" and sess["error"] == expected
+    assert "provider echoed" not in str(sess) and "unknown-secret" not in str(sess)
+    assert not (env["figs"] / "fig_matplotlib.py").exists()
+
+
 # --------------------------------------------------------------------------- 检查失败路径
 @pytest.mark.parametrize(
     ("code", "failed"),
@@ -205,6 +245,7 @@ def test_revert_of_a_convert_session_is_refused(env):
         (WRITE_NOTHING, ("candidate.target", "target_missing")),
         (WRITE_SYNTAX, ("candidate.syntax", "syntax_error")),
         (WRITE_NO_MPL, ("candidate.matplotlib", "no_matplotlib_import")),
+        (WRITE_RASTER, ("candidate.editable", "raster_drawing")),
         (TOUCH_COPY, ("candidate.tree", "other_file_changed")),
         (EXTRA_FILE, ("candidate.tree", "other_file_changed")),
         (WRITE_PROJECT, ("project.untouched", "project_files_changed")),
@@ -276,6 +317,19 @@ def test_validation_run_is_isolated_by_write_roots_and_user_out_png_is_untouched
     }
 
 
+def test_write_guard_guidance_requires_a_structured_cause(env):
+    """A script's error text must not masquerade as a sandbox diagnosis."""
+    message = "User exception mentioning write_outside_roots is not a write denial"
+    env["runner"] = lambda figures_dir, rel, write_roots=None: {
+        "error": {"code": "script_probe_failed", "message": message, "cause": "script_error"}
+    }
+    sid = _run(env)
+    sess = _wait(sid)
+    assert sess["task"]["outcome"] == "failed"
+    assert message in env["prompts"][1]
+    assert all(ai_convert.WRITE_OUTSIDE_HINT not in prompt for prompt in env["prompts"])
+
+
 def test_no_figure_captured_is_a_failure_with_a_reason(env):
     env["runner"] = lambda figures_dir, rel, write_roots=None: {
         "error": {"code": "no_figures_captured", "message": "x"}
@@ -336,7 +390,9 @@ def test_adopt_creates_the_file_and_never_overwrites(env):
     made = ai_convert.adopt(sid, _project(env))
     assert made == {"script": "fig_matplotlib_2.py", "name": "fig_matplotlib_2.py"}
     assert (figs / "fig_matplotlib.py").read_text(encoding="utf-8") == "# user's own file\n"
-    assert (figs / "fig_matplotlib_2.py").read_text(encoding="utf-8") == GOOD
+    assert (figs / "fig_matplotlib_2.py").read_bytes() == (
+        ai_convert.CONVERT_DIR / sid / "fig_matplotlib.py"
+    ).read_bytes()
     # 重入：不再写第二个文件
     assert ai_convert.adopt(sid, _project(env)) == made
     assert sorted(p.name for p in figs.glob("fig_matplotlib*")) == [
@@ -578,3 +634,38 @@ def test_create_script_requires_the_script_guard(tmp_path):
     with scriptlock.script_guard(p):
         scriptlock.create_script(p, b"x")
     assert p.read_bytes() == b"x"
+
+
+def test_meta_read_retries_a_transient_windows_sharing_violation(tmp_path, monkeypatch):
+    """Windows 上续跑 `os.replace` 换 meta 的瞬间，读者拿到 PermissionError：重试后读到，不报 convert_not_ready。"""
+    meta = tmp_path / "meta.json"
+    meta.write_text('{"state": "resuming"}', encoding="utf-8")
+    real = Path.read_text
+    calls = {"n": 0}
+
+    def flaky(self, *a, **k):
+        if self == meta and calls["n"] < 2:
+            calls["n"] += 1
+            raise PermissionError(13, "The process cannot access the file")
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr(ai_convert, "META_READ_RETRY_S", 0.0)
+    assert ai_convert._read_meta_file(meta) == {"state": "resuming"}
+    assert calls["n"] == 2
+
+
+def test_meta_read_does_not_retry_a_missing_or_corrupt_file(tmp_path, monkeypatch):
+    calls = {"n": 0}
+    real = Path.read_text
+
+    def counting(self, *a, **k):
+        calls["n"] += 1
+        return real(self, *a, **k)
+
+    monkeypatch.setattr(Path, "read_text", counting)
+    assert ai_convert._read_meta_file(tmp_path / "absent.json") is None
+    bad = tmp_path / "bad.json"
+    bad.write_bytes(b"{not json")
+    assert ai_convert._read_meta_file(bad) is None
+    assert calls["n"] == 2

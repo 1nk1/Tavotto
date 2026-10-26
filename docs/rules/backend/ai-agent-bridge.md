@@ -338,13 +338,28 @@ order: 240
 永不覆盖），采用前再核原脚本 sha256 与候选摘要。校验 = 在用户同一路由下 probe 一遍（紧挨原脚本的 `tavotto_convert_probe_<sid>.py`
 临时文件，后端建、跑完删），必须捕获到 Matplotlib 图。看护：`tests/test_ai_convert.py`、`tests/test_ai_convert_app.py`。
 
+校验的写入绊线错误沿 `probe.error.params.worker_code` 传给转换层，不能被通用
+`script_probe_failed` 丢掉原因。转换层统一提示候选 / 临时目录的写入边界，删除仅为输出准备的
+目录创建，保留正常 Matplotlib `savefig` 捕获；不沿用「改写到项目里」的通用 MCP 指导，也不按错误文本猜原因。
+
+**项目依赖上下文（2026-10-25，ADR 0143）**：`convertcontext` 只读静态提名 helper/字体/数据，按预算复制到
+`project_context/`；`context.json` 记原项目相对路径、来源/视图各自完整 SHA256 与未覆盖项，不扫描拷贝整个项目、
+不跟随链接、不读敏感路径或环境；文本视图经同一 `readscope` 脱敏并标注。内置 `list_dir(path)` 可浏览子目录，写仍只有一个候选；check/留存/续跑/采用均核
+起跑资源与快照摘要。生成代码使用原项目资源位置；看护 `tests/test_convert_context.py`（含读时换链接、资源漂移与删缓存后重开）。
+`input_read_policy` 说明是否有已确认的项目读取映射，不暴露目标路径、不复制外部数据；映射只覆盖缺失的只读打开，
+不覆盖 exists/glob。生成代码保持原输入路径串，让读取失败进入校验修复，不因快照缺项新增静默跳过分支。
+同一 `inputremap.fingerprint` 绑定起跑读取策略；检查、续跑与采用拒绝映射漂移。旧清单无字段仍按旧契约处理。
+
+转换运行检查与采用后重开共用发现逻辑的首个入口；主入口失败或不出图，不能改跑辅助函数取得部分图后放行。
+真实错误交回既有有界修正流程。看护 `tests/test_ai_convert_app.py`（真 worker 主入口失败、辅助函数可出图、修正后采用）。
+
 **R / MATLAB 来源（ADR 0143 修订，2026-10-23）**：`POST /api/ai/convert` 多一个可选 `source_language`（`python` 缺省 | `r` | `matlab`）。
 r / matlab 时 `library` 必须缺省，后端用 `sourcelang.detect`（纯标准库；`.R` / `.r` / `.m` 纯文本、≤ 1 MB、UTF-8；`.m` 带 Objective-C 特征或
 MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `convert_source_language_mismatch`。**不运行 R / MATLAB**：对照只用请求给的 `path` 或脚本旁
 同名位图（`ai_convert.sibling_original`），没有原图时 `comparison.reference=null`、`verification="unknown"`（界面说一句“请并排看一眼再采用”）。
 提示词是 `ai_prompt_pack` convert 一节的变体（逐步搬运 + R→Python / MATLAB→Python 对照表）。Python 里没有可靠对应时 Agent 首行写
-`TAVOTTO_NEEDS_INPUT: <原因>` 且不写新文件 → `ConvertExecutor` 抛 `ai_tasks.NeedsInput` → 结局 `needs_input`（原因清洗后限长 200 字，只进 `unmet[].detail`，
-不进日志 / 遥测）；写了文件则按文件走，无标记照旧 `target_missing`。新脚本缺包：校验运行前 `convertdeps.ensure(project, rel, cancel)`（app 注入 `task_hooks["deps"]`，仅 r / matlab；`cancel` = `TaskRun.cancel_event`）
+`TAVOTTO_NEEDS_INPUT: <原因>` → `ConvertExecutor` 抛 `ai_tasks.NeedsInput` → 结局 `needs_input`（完整导出指引清洗后限长 8,192 字，只进 `unmet[].detail`，
+不进日志 / 遥测）；已写出可运行草稿也不能覆盖明确报告的数据/计算语义缺口，不进入采用。纯视觉未知项独立验收，见 ADR 0143「流程验收与视觉验收分开」；无标记照旧检查候选。新脚本缺包：校验运行前 `convertdeps.ensure(project, rel, cancel)`（app 对所有来源注入 `task_hooks["deps"]`；`cancel` = `TaskRun.cancel_event`）
 走 `deprepair.joint_plan_for` → `create_joint_plan` → `prepare`（不新写 pip 路径；取消经 `deprepair.cancel_status` 传到安装）。**名单**：只装 `engine/autoinstall_dists.txt`
 （PEP 503 名；14 个种子 ∪ 30 个常见大包 ∪ PyPI 30 天下载前 1000（ClickHouse 公开 PyPI 数据集）− 排除名单（pip/setuptools/wheel 等管理环境与打包工具），`scripts/dev/refresh_autoinstall_list.py` 生成，spec datas 带上）里的包；名单外的包不自动装。**每个环境问一次**：
 `project_venv` / 已存在的受管一代名单内直接装；系统 Python / 内置 runtime 永不装；其余环境（Conda / 指定 / 环境变量 / 用户采用）第一次出卡片，点主按钮才记
@@ -384,6 +399,7 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   系统提示与最后一个工具定义带 `cache_control: ephemeral`）、`openai-chat`（`{base}/chat/completions`）、`openai-responses`
   （`{base}/responses`，`store: false`）、`demo`（剧本回放，不联网，端到端测试用）。anthropic 的思考由**调用方声明** `--thinking {adaptive,budget,none}`（默认 `none`，runner 不猜：第三方兼容网关各不相同）：`adaptive` 发 `thinking:{type:adaptive}` + 有 effort 才发 `output_config.effort`（新模型，不发已弃用的 `budget_tokens`）；`budget` 发旧式 `budget_tokens`（必须配 `--effort low|medium|high|max`，`max` 映射到 high 档；缺省 effort 起跑即 `internal/bad_args`、0 次请求，不静默不发 thinking）；`none` 都不发。thinking 块按原样回放，不做 assistant prefill，工具参数一律 `json.loads`。openai-chat 回复里的 `reasoning_content` 存进该轮 `native` 并在回放这一轮 assistant 消息时原样带回（DeepSeek 思考模式必需，报错原文见 wires.py；没有思考内容的轮次不加该键，不加空格占位——会话内始终同一模型）。openai-responses 只在给了 `--effort` 时传 `reasoning.effort`。`--wire openai-responses` 配 `--effort max` 起跑即 `internal/bad_args`、0 次请求（Responses 没有 max 档，不静默不发 reasoning）。
   系统提示 + 工具定义在请求最前且逐字稳定（吃提示缓存）；变化的东西（目标名、用户指令）只在第一条用户消息里。
+  历史压缩是 thinking 原样回放的例外：`none` / `adaptive` 压缩改变签名前缀后，删除失效的 `thinking` / `redacted_thinking` 块，保留工具调用与结果；`none` 也可能收到服务端签名块。`budget` 不压缩、只追加，仍受总预算约束；不暗改调用方的模式或 effort。看护 `tests/test_agent_runner_media.py` 的真实 HTTP 签名前缀接收器。
 - **出站**：只许 https，或明文 http 但主机属本机回环 / 私网（`10/8`、`172.16/12`、`192.168/16`、`100.64/10`、`fc00::/7`；链路本地 / 公网 / 保留段拒；云元数据地址与主机名先于放行段排除（`netpolicy.METADATA_IPS` / `METADATA_HOSTS`，出处 URL 写在注释里，含 GCP / Akamai 的 IPv6 端点 `fd20:ce::254` / `fd00:a9fe:a9fe::1`）；主机名要全部解析结果都在放行段）——判据只在 `engine/netpolicy.py`（`check_base_url` 与 `ai_catalog.url_refusal` 共用），连接时钉住判定那次解析出的 IP 直连、`Host` 头保留原主机名；URL 不带用户信息 / 查询 / 片段。https 走 `_opener()`（`build_opener(tlstrust.https_handler(tlstrust.client_context()))`
   + 不跟随重定向，代理沿用环境变量）；明文 http 走 `netpolicy.pinned_connection` 直连已校验的 IP、**不经代理**（出站门禁只认这一处变量主机的 `HTTPConnection`）。响应体有上限；
   请求有超时；`tests/test_outbound_https_trust.py` 的 `OUTBOUND` 登记了 `engine/agent_runner/wires.py: _opener`。
@@ -398,7 +414,12 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   `write_file`（整份覆盖，兜底）、`check`（调用方注入的回调，没注入 = `not_available` 工具错误；**最多 3 次**，第 4 次 `check_budget`，改图与转换同一处 `tools.MAX_CHECKS`）。**没有 shell、网络、MCP 工具。**
   路径判据只有一处 `FigureEditSession._resolve`：`realpath` 后须在候选目录内（符号链接先解开再判，链出界即越界）；写只许目标脚本，
   目标本身是符号链接也拒写。越界 / 写非目标 / 超大 / 非文本一律返回**工具错误结果**，不抛、不执行、文件零改动。
+  大型只读资源可用 `read_file.byte_offset/byte_limit` 分段查看（单次 ≤ 64 KiB，默认 16 KiB）；返回完整 UTF-8 字符边界的 `next_byte_offset` / `eof`。打开前后核对文件身份与路径；分段读取不授予目标写权限，完整目标读取及写入的 200 KiB 限制不变。看护 `tests/test_agent_read_windows.py`。
   换行：读出时统一成 `\n`，写回恢复文件原有的 `\r\n`（混合换行的文件会被统一成首见的那种）。
+  参数拒绝仍由各工具 handler 判定；`bad_arguments` 且未写入时，循环从该工具公开 schema 补充缺失必填键、可用键名及类型，提示原样重发一条修正调用。
+  文本替换取值与 schema 共用 `_EDIT_TEXT_ARGUMENTS`：`old` / `old_string`、`new` / `new_string` 是明确声明的两组名称；同组重复提供时值必须相同。
+  schema 使用平铺属性（Anthropic 拒绝顶层 anyOf / oneOf / allOf），名称组必填与重复值一致性由共同 handler 验证，不复制另一套参数判据。
+  不猜测未知名称，不回显模型给出的键名或参数内容；冲突值或类型错误在写入前拒绝。figure_edit 与转换共用这条契约，原有路径与内容验证不变。
   将来 `data_to_figure` 的工具集**没有写文件工具**（只出结构化列映射，ADR 0138 §四）。
 - **事件**（stdout 每行一条 JSON，ASCII 转义）：`thinking`（只有字符数）、`tool`（工具名、成败、一句话摘要，**不带文件内容 / 提示词 / 密钥**）、
   `text`（模型对用户说的话）、`usage`（每轮用量）、`done`（最后一条，恰好一条）。stderr 只写诊断级错误码。
@@ -408,21 +429,28 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   anthropic `stop_reason=refusal`、responses `status:incomplete` 且原因不是 `max_output_tokens`，`detail` 如 `incomplete_content_filter`）；
   responses 顶层 `status` 为 `failed`（`detail=failed_<error.code>`）或 `cancelled / queued / in_progress`（`status_<名>`）→ `network`，不再当作空的 end 轮。
   重试等待 = min(退避, Retry-After, 30 s, 距总时限的剩余)，剩余 ≤ 0 不再发请求 → `budget`（`detail=time`）；单次请求超时也不超过剩余时间。**等响应时也看总时限**：服务端以小于 socket 超时的间隔慢慢吐字节时每次 read 都成功，所以等待循环（与取消同一处、每 50 ms）同时判 deadline，到点即 `budget/time`，在途请求丢弃、回复不接受。
-  **只有 `stop == end` 且无工具调用才算 `completed`**：其它停止值（未知 `stop_reason` / `finish_reason`，或 `tool_calls` / `tool_use` 结束却没有可用调用）→ `network`，`detail=bad_stop_<值>`（值只留小写字母数字下划线、≤ 24 字符）；`max_tokens` 仍是 `budget/output_truncated`。同一工具的同一错误码连续 3 次 → `tool_error_loop`。
+  **`stop == end` 且无工具调用，或转换任务的显式最终校验实际通过，才算 `completed`**；最终校验见下，不从模型文字推断成功。其它停止值（未知 `stop_reason` / `finish_reason`，或 `tool_calls` / `tool_use` 结束却没有可用调用）→ `network`，`detail=bad_stop_<值>`（值只留小写字母数字下划线、≤ 24 字符）；`max_tokens` 的有界续写规则见本节末，耗尽后为 `budget/output_truncated`。同一工具、同一参数、同一错误码连续 3 次 → `tool_error_loop`。
   SIGTERM / SIGINT / Ctrl-Break → `cancelled`。
 - **预算与账本**：轮数、token（input+output）、秒数三道上限。每轮 input / output / 耗时入账，结束时核「合计 == 各轮之和」，不等记
   `done.ledger_mismatch=true`（不抛）。每轮记账后立刻复查 token：**终止答复**（`end` 且无工具调用）累计 `>` 上限才拒，恰好用满上限仍 `completed`；带工具调用 / 要开下一轮的答复累计 `>=` 上限即 `budget/tokens`，工具不执行、不开新轮。估计上下文超阈值时把早先的 `read_file` 结果换成「已读过 X（第 a–b 行，sha 前缀）」。
 - **`convert_to_editable` 工具集**（`tools.py` 的 `ConvertToEditableToolset` / `ConvertSession`，ADR 0147 §四；入口 `--task convert_to_editable --target <原脚本> --output <原名>_matplotlib.py`，
   默认任务仍是 `figure_edit`）。权限边界即 ADR 0143 §二：**原脚本永远不可写，Agent 只写候选目录顶层的那一个新文件**。
-  - 工具只有 `read_file` / `list_dir`（候选内只读，与 figure_edit **同一个** `_resolve`，没有第二份路径判据）、`create_file(content)`、`edit_file(old, new)`、`check`；
+  - 工具含 `read_image`、`read_file` / `list_dir`（候选内只读，与 figure_edit **同一个** `_resolve`，没有第二份路径判据）、`create_file(content)`、`append_file(content, expected_sha256)`、`edit_file(old, new)`、`check` / `finish(summary)`；
     没有 `write_file`、没有 shell / 网络 / MCP。`create_file` 的可选 `path` 与 `edit_file` 的可选 `path` 只能是 `--output`：指向原脚本 → `source_readonly`，
     其它路径 → `not_output`，越界 → `path_outside`；一律工具错误、磁盘字节不变。第一次 `create_file` 用 `O_CREAT|O_EXCL` 新建（此刻已存在含悬空链接 → `output_exists`，不覆盖），
     之后允许整份覆盖这个新文件（模型自我修正）；`edit_file` 必须在本次运行里已 `create_file`（否则 `not_created`），`old` 恰好出现一次。含密钥的内容 → `secret_in_content`（新建 / 覆盖 / edit 三处）。
-  - `--output` 起跑即校验：必须恰为 `<原名>_matplotlib.py`（原名 = `--target` 的 stem）、只有文件名（无目录、无反斜杠）、尚不存在（`lexists`）；不合格 → `done{ok:false, reason:"internal", detail:"bad_output"}`，**0 次模型请求**、磁盘不动。
-  - `check`：同 figure_edit 的注入回调，语义是 ADR 0143 的 `run_validation`（用户同一路由下跑新脚本，必须捕获到 Matplotlib 图），回调返回 `(ok, 报告)`；**本阶段 CLI 入口没有注入方 → `not_available`**。
+    create / append / edit 的回执均含当前文本 SHA-256；编辑后继续追加使用最新回执，不用旧 create 摘要。追加前仍核内容，过期摘要拒绝。
+  - `--output` 起跑即校验：必须恰为 `<原名>_matplotlib.py`（原名 = `--target` 的 stem）、只有文件名（无目录、无反斜杠）、尚不存在（`lexists`）；不合格 → `done{ok:false, reason:"internal", detail:"bad_output"}`，**0 次模型请求**、磁盘不动。外层修正续跑只接受父进程传入的上次候选字节 SHA-256，拒绝链接、非普通文件、字节变化及超读限文件；`checks_used` 继承已用次数，子进程重启不重置校验预算。
+  - `check`：同 figure_edit 的注入回调，语义是 ADR 0143 的 `run_validation`（用户同一路由下跑新脚本，必须捕获到 Matplotlib 图），回调可返回 `(ok, 报告)` 或 `CheckResult`（报告 + 有界图像）；转换入口经 IPC 调用应用同一校验，实时渲染 PNG 后才退役 worker。未注入回调则 `not_available`。
     新文件还没写出就 `check` → `not_created`（不调回调、不计数）。**回调最多被调 3 次**（ADR 0143「校验运行 ≤ 3」），第 4 次 `check_budget`。
-  - 预算默认值由工具集给（`default_limits`；命令行不给 `--max-turns` 等就用它）：convert 为 20 轮 / 900 s / 400k token / 单轮输出 16384（整份脚本可能很长；20 轮 ≈ 读 1–3 + 写 1 + 至多 3 轮 check/修 + 收尾，留余量）；figure_edit 不变。
-  - 系统提示是英文（要求用用户指令的语言回复）；产品要求三条（保留数据读取与计算 / 必须 Matplotlib 出图 / 图幅字号对齐）**引用 `ai_prompt_pack.convert_requirements()` 的同一份文字**（CLI 路径的 `convert_prompt` 也用它，不各抄一份），
+    可选 `final: boolean`（默认 false）与 `summary: string`：模型明确声明整份候选已可交付，且同次回调返回布尔 true，工具才标记本轮完成；报告文字不能代替布尔结果。
+    最终校验通过后不再请求模型收尾，同批后续工具也不执行；summary 沿正常脱敏出口发给用户。普通检查仍非终态，最终检查失败可继续修正，参数错误不消耗检查次数。
+    始终受配置的轮数 / token / 取消 / deadline 边界约束；父进程仍独立执行 Task Core 校验、完整性与待采用检查，不从失败任务抢救候选，也不自动采用。
+    `finish(summary)` 是同一个 `check(final=true)` 的明确收尾入口，共用回调、次数和终态条件；它自己不执行文件写入或采用。
+  - 预算默认值由工具集给（`default_limits`；命令行不给 `--max-turns` 等就用它）：convert 为 32 轮 / 900 s / 800k token / 单轮输出 32768（含模型思考）；figure_edit 不变。
+    原 20 轮 / 400k 在同输入真模型对照中截断了可成功交付的流程：Pillow 需要 22 轮 / 420k，MATLAB 需要 677k。只增加转换的轮数/token 余量，保留 15 分钟截止、取消、文件/路径及 3 次校验边界。
+    转换的 `budget_hint` 使循环在任一资源使用达到 50% / 75% 时各插入一次剩余轮数、累计 token、秒数和收尾指导，随下一次正常模型请求发送；无额外请求，不重置账本或预算。普通检查通过仍非终态。
+  - 系统提示是英文（要求用用户指令的语言回复）；共同验收顺序及要求（数据计算 / 完整可编辑出图 / 视觉另验）**引用 `ai_prompt_pack.convert_requirements()` 的同一份文字**（CLI 路径的 `convert_prompt` 也用它，不各抄一份），
     执行器特有的部分（只写一个新文件、不运行脚本、check ≤ 3 次）写在 `tools.py`。`ai_prompt_pack` 是纯标准库，所以 `agent_runner` 对它的 import 不破坏依赖方向（`test_import_architecture` 兜底）。
   - 看护 `tests/test_agent_runner_convert.py`（Demo 协议端到端 + 单元）。
 
@@ -445,8 +473,8 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
     明文 http 的局域网网关（`netpolicy` 放行、非回环）带可选 `insecure_lan: true`。
     每条带 `vendor`（合并后的厂商 id）与 `method`（接入方式 id）；logo 取它自己那一行的图标。多条可同时 `ready`，同厂商多条时 `label` 带用户起的名字 / 密钥尾四位；OpenAI / Claude 的官方 Key 连接名带「 API」后缀以便和订阅那条分开。没有地址的旧记录（官方 Key）不进视图。`state`：缺 Key → `needs_auth`；
     不兼容旧记录 / 保存时被服务商拒绝（`last_error: unauthorized` 落盘）/ 路由走不通 / 内置路由缺型号 → `error` 且带原因码 `error`。
-  - **路由 `route_for`**（`route` 只给诊断与测试，界面不显示）：订阅 → `cli:<agent>`；Key 类：该家族 CLI 可用且 `ai.builtin_default` 不为 true（默认 false，FigureBench 过线后改 true）→ `cli:<家族>` + 注入；
-    否则 → `builtin`（内置循环必须能用该记录：`ai_providers.builtin_conn`，不行则退回可用的 CLI）。账号登录类：CLI 装了且启用就走 CLI（不看 CLI 自己的官方登录，凭据由我们注入）；没装走内置，anthropic wire 只发 Bearer（`--auth bearer`），令牌在 spawn 前 `ensure_fresh`、只进环境变量。
+  - **路由 `route_for`**（`route` 只给诊断与测试，界面不显示）：订阅 → `cli:<agent>`；Key 类：该家族 CLI 可用且显式 `ai.builtin_default=false` → `cli:<家族>` + 注入；缺省 true（2026-10-26 用户授权，ADR 0147 §五），不覆盖已存 false；
+    否则 → `builtin`（内置循环必须能用该记录：`ai_providers.builtin_conn`，不行则在派发前退回可用的 CLI；不在任务中途自动重放）。账号登录类也受默认偏好与强制开关控制，其 CLI 可用性只看安装且启用（不看 CLI 自己的官方登录，凭据由我们注入）；anthropic wire 只发 Bearer（`--auth bearer`），令牌在 spawn 前 `ensure_fresh`、只进环境变量。
     `TAVOTTO_AI_BUILTIN=1` 强制内置、`=0` 强制不用（没 CLI 即走不通）。
 - **管理接口**（照常过会话守卫与 Host/Origin 校验）：`POST /api/ai/connections`（`{vendor | method, api_key, base_url?, model?, label?, wire?, id?}` → `{ok, connection}`；Key 形状 = 可打印 ASCII 无空白 ≤ 4096；
   `base_url` 须 https 或回环 http；保存前 `live_models` 试取一次，**失败也保存**，返回的连接 `state:"error"` + `error` 原因码，只有 `unauthorized` 才落盘；`custom` 必须给 `base_url` 与 `wire`
@@ -488,7 +516,8 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
 - **「试」的子进程**（`trial.run_python`）：与体检同一纪律——`runtime.probe_args`（`-B`）、`runtime.probe_env` + `launcher.activate_env`、`stdin=DEVNULL`、
   `creationflags=CREATE_NO_WINDOW`、UTF-8 解码（`errors="replace"`）、超时、cwd 为一次性临时目录。环境只认会话的**环境 id**（`list_environments` 登记），不接受解释器路径。
   模块名走 `fullmatch` 的点分标识符校验，并作为 `argv` 传入（不拼进 `-c`）。`try_run` 把脚本所在目录复制到临时目录（超 64 MiB / 5000 个文件只复制脚本）跑一次，
-  MPLBACKEND=Agg；`FixContext.runner` 可注入执行器（接准备会话 / 运行器的现成路径留给后续 PR）。
+  MPLBACKEND=Agg；这是 `mode=diagnostic`（或无应用回调时）的诊断路径，不能证明应用修好。生产 `mode=script`
+  走注入的 `application_runner`（下节），不再以副本执行代替应用验证。
   **fixtools 起的每个子进程只有 `run_python` 这一条执行路径，全部在 safe 守卫下跑**（`try_run` 的脚本、`try_import` 的 import 副作用、`inspect_environment` 的探测代码一视同仁；
   不再有系统临时目录里的 `tavotto-fixtool-*`，临时目录一律建在 `fix_trials/` 下，清理一律走 `_remove_tree` + `.cleanup_pending` + `sweep_stale_trials`，清不掉如实报 `cleanup_pending`）。
   **守卫的做法**：子进程按文件加载 `engine/writetripwire.py`（worker 的 safe 执行同一个写入根绊线，ADR 0141），写入根只有本次试跑目录
@@ -504,7 +533,7 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
 
 ### D2a：「改」组（`change.py` / `snapshots.py` / `executors.py`，ADR 0149 §七）
 
-六个工具：`install_packages`（`listed`）、`switch_execution` / `change_python` / `convert_script` / `rollback`（`tavotto`）、`select_environment`（`user_env`）。`run_command` 已拆出 D2a，由 #1374 落地（见下面「`run_command`」一节）。
+工具：`install_packages`（`listed`）、`switch_execution` / `switch_workdir` / `change_python` / `convert_script` / `rollback`（`tavotto`）、`select_environment`（`user_env`）。`run_command` 见下面专节。
 看护 `tests/test_fixtools_change.py`。`FIX_SESSION_TIERS` 放行 observe / run / tavotto / listed / user_env / outward，**放行 ≠ 不问**：要不要问用户由各工具自己经 `FixContext.ask` 把关
 （`change.approve`：没有 `ask`、回答不是 `yes`、`ask` 抛了、超时，一律 `needs_approval` 且审计记 `blocked`；通过则审计记 `approved_by=user`）。
 
@@ -515,7 +544,7 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   执行器全部可经 `FixContext` 注入（`installer` / `uninstaller` / `freezer` / `python_changer`）；**测试一律注入假的，不往真实环境装包**。
   `change_python` 缺省接 `executors._default_python_changer`（#1342 `pyversionfix` 的公开入口 `plan_python_change` → `apply_python_change`：只在 Tavotto 受管环境另建、不碰用户环境、私有 Python 锁里没有的版本不下载；本机关了 `TAVOTTO_AUTO_PYTHON_CHANGE` 或版本推不出就如实报错，不换；修复会话暂无进度事件通道，下载进度不推前端），可经 `python_changer` 注入替换；`convert_script` 没有执行器（见下，只记交接）。
 - **快照**（`snapshots.py`）：除 `rollback` 外每个会改东西的工具执行前先 `snapshots.take`，存 `data_dir()/cache/fix_snapshots/<会话>/<id>.json`：项目设置里 `execution_policy` / `environment` 两个键的原值（含「没有」）+
-  目标环境的 `pip freeze` 解析成 `{规范名: 版本}`（只留 `名==版本` 行，URL / 路径行不存）+ 环境目录顶层条目名。**打不出快照就不改**（`snapshot_failed`）；快照 id 进工具返回与审计行 `snapshot` 字段；每会话留最近 30 份。
+  数据改指与工作目录设置、目标环境的 `pip freeze` 解析成 `{规范名: 版本}`（只留 `名==版本` 行，URL / 路径行不存）+ 环境目录顶层条目名。**打不出快照就不改**（`snapshot_failed`）；快照 id 进工具返回与审计行 `snapshot` 字段；每会话留最近 30 份。
   `rollback` 只认本会话 + 本项目的快照、id 形状固定（`snap_<时间>_<6 位十六进制>`）；设置**精确恢复**（原来没有的键清掉，并 `projectenv.reset_cache`）；包按 freeze 差异——快照后新装的卸掉
   （`pip` / `setuptools` / `wheel` 不卸），被改版本 / 被卸掉的装回快照里的版本，走同一条 `executors`。
 - **`run_command`**：D2a 拆出、#1374 以两档落地，见 D2a 之后的「`run_command`」一节。
@@ -550,6 +579,7 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   卡：`{kind:"approve", tool:"run_command", danger:true, summary:"…会在沙盒外运行，可以修改你电脑上的文件", command, reason, cwd, scripts:<备份个数>, sandbox:"outside", details}`；前端红色强调（`danger-tinted` 主按钮「在沙盒外运行」、次按钮「不了」，完整命令在可见区，理由与备份说明在折叠详情里以守「一句话读懂」）。只对这一条命令有效，不记成长期授权（再来一次照样问）。
   结果多 `scripts_backed_up: N` / `scripts_restored: N (…)` / `scripts_not_backed_up` / `scripts_restore_failed`（后者 `is_error`，`code=scripts_restore_failed`，让模型告诉用户）。**不自动升级**：第①档任何失败都不会让第②档无卡执行（`test_a_refused_write_in_the_sandbox_suggests_tier2_but_never_runs_it`）。
 - **用户看到的 = 实际执行的**：命令（`argv` 拼成一行）超过 `CARD_COMMAND_CHARS`（8000）字符，或 `reason` 超 300 字，审批**之前**就拒（`command_too_long_to_show` / `bad_arguments`），两档都适用；卡上的 `command` 不截断（脱敏只会让它更短）。
+  参数开头的 `~/`（只读工具脱敏后的主目录路径）在政策检查、审批和执行之前统一展开；不启用 shell，也不展开变量、通配符或命令替换。
 - **进程树**：命令的直接进程退出（或超时被叫停）后，`_reap_tree` 结束并**确认**整棵受管进程树退出，才收输出、才核对 / 放锁。POSIX：命令在自己的新会话 / 进程组里，`killpg(SIGKILL)` 到 `ProcessLookupError`（组里一个不剩）才算干净；Windows：Job Object（`KILL_ON_JOB_CLOSE`）终止并等活动进程归零，起不来退回 `taskkill /T`（Windows 路径未在 Windows 上实测）。确认不了时结果带 `processes_left`。这样后台孙进程既绕不过时限，也不会在第②档核对、放锁之后才去改脚本。盲区：自己 `setsid` 逃出进程组的进程 POSIX 上追不到（Linux 沙盒内有 `--unshare-pid`，随 init 退出全被收掉）。
 - **快照与可写清单同源**：快照覆盖 `writable_envs` 里**每一个**命令获准写入的环境（`change_python` 新建、只靠 `env_prefixes` 进来的都算；没登记 id 的现场登记 `cmd_env_<hash>`），不只会话创建时的前缀。
 - **Windows / 无沙盒**：#1358 之前没有沙盒，第①档直接 `sandbox_unavailable`，只有第②档（备份 + 单独点头照旧）。
@@ -575,7 +605,7 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   装不上如实报 `input_remap: …could not load…`，不静默当没有。自定义 runner 仅在有规则时多收一个 `input_remap` 关键字。
 - **已知取舍**：同一处的旧 `file` 规则（`remap_target` 里 `file` 优先）会盖住后来的 `prefix` 规则——与弹窗行为一致，没有为此改规则优先级；`known_requests` 不含已被现有规则救回的 `open` 读取。
 
-- **诊断三缺口（覆盖率测量补）**：① 项目内同名包遮蔽——`engine/importshadow.py`（纯函数、只读文件系统）对 `No module named 'a.b'` / `cannot import name … (项目内路径)` 判「父包目录在项目根 / 脚本目录下、缺的子模块不在里面」，`read_run_report`（`project_package_shadow` 放最前）与 `try_run` / `try_import` 失败输出都带 `base.shadow_note`；`regular`（有 `__init__.py`）装同名包不管用、`namespace`（无 `__init__.py`）装真包能修，提示词 3f 同此；② 安装失败：`--only-binary=:all:` 下「只有源码包」与「没这个包」同样是 `(from versions: none)`，`executors._default_installer` 对 `dependency_not_found` 追一次 `pip index versions`（`index_has_project`），索引里有就改报 `dependency_requires_build`，并带脱敏后的 `ERROR:` 一两行（`detail`），`install_packages` 回给模型；③ `read_logs(worker)` 从前没人填 `ctx.log_paths["worker"]` 恒 `no_log`，现按 `diagnostics.owned_worker_logs(项目)` 取当前项目最近一份。看护 `tests/test_fixdiagnostics.py`。
+- **诊断三缺口（覆盖率测量补）**：① 项目内同名包遮蔽——`engine/importshadow.py`（纯函数、只读文件系统）对 `No module named 'a.b'` / `cannot import name … (项目内路径)` 判「父包目录在项目根 / 脚本目录下、缺的子模块不在里面」；`read_run_report` 与应用 `try_run` 共用 `runreport.project_run_report`，以当前错误为准、`project_package_shadow` 放最前，历史失败不覆盖当前判断；诊断副本 `try_run` / `try_import` 按自己的导入范围调用 `base.shadow_note`。`regular` 包装同名包不管用；无 `__init__.py` 或扩展包路径的 namespace 可由安装真包修复，提示词 3f 同此。② 安装失败只按安装器输出分类，并带脱敏后的 `ERROR:` 一两行（`detail`），由 `install_packages` 回给模型；不再另起 `pip index` 探测，以免忽略私有源设置并泄露包名。`dependency_not_found` 不断言包不存在，也可能仅没有当前 Python / 平台的可用版本；取消事件贯穿安装。③ `read_logs(worker)` 按 `diagnostics.owned_worker_logs(项目)` 取当前项目最近一份日志。看护 `tests/test_fixdiagnostics.py` / `tests/test_fixdiagnostics_report.py`。
 
 ### D2b：「问与报」组 + 修复会话 + `POST /api/ai/fix`（`fixtools/ask.py`、`engine/fixsession.py`）
 
@@ -587,7 +617,16 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   模型只有 `HttpModel` 一条出站路径；密钥只在内存，卡片文字过 `Redactor` + `readscope.scrub`，SSE `ai.fix` 只带 `{pj, fix_id}`（「重读」提示），状态以 `GET /api/ai/fix/<id>` 为准。
   卡片回答 `POST …/answer {card_id, answer, text?}` 按卡种类校验（坏回答 400、过期卡 409）；`POST …/cancel` 唤醒阻塞中的工具。预算：40 轮 / 30 分钟（含用户思考时间）/ 60 万 token；`finish` 之后不再请求模型。
 - **连接**：`connection()` 只认当前选中的第三方 API 接口（有地址 / 密钥 / 型号、地址过 `check_base_url`）；只连了 CLI 时由 D3 的 MCP 接法接手（见下一节），`ai_fix_available` 随之为真。
-- **验证**：会话结束后由前端重跑准备会话；`finish(fixed)` 只是 AI 的说法。诊断包 `detail-runs.json` 多 `fix_audit`（审计尾部，本来就不含内容）。看护 `tests/test_fixasks.py`、`tests/test_ai_fix_endpoint.py`。
+- **应用验证（2026-10-25，ADR 0149 修订）**：生产 `try_run` 的 `script` 模式经 `fixverification` 消费同一准备会话的
+  check → 单次运行批准卡 → 原 action id/config_revision → launch/finalize/report；不自批安装或运行意图，不切解释器。
+  卡片披露真实 cwd/写入范围/执行方式，旧临时副本授权不代替这次批准；取消只管本次 action，过期/被替代即拒。
+  `switch_workdir` 经明确批准与快照走已有 `workdir.set_mode`，改动/回滚后退役旧 worker，守卫不变。
+  `finish(fixed)` 须匹配本会话最后一次实际成功执行的 session/revision/plan/attempt；`execution_finished` 不能单独证明修好，
+  还须是准备会话的 `completed/succeeded` 或 `partial/execution_finished_no_figure`。缺包待重跑、登记失败、部分图捕获失败
+  均不算证据。任何可能改执行结果的工具（含失败后的部分改动）使证据与依赖缓存失效。`no_figures` 允许证明脚本已执行完，
+  不证明可编辑；转写仍另行交接。
+  `read_run_report` 保留 nested `result.error` 与实际 launch/workdir。前端收尾复查照旧；诊断包仍只记审计摘要。
+  看护 `tests/test_fix_application_verification.py`、`tests/test_fixasks.py`、`tests/test_ai_fix_endpoint.py`。
 
 ### D3：CLI 经 MCP 修复模式（`engine/fixmcp.py`、`fixsession.py` 的 CLI 分支、`ai_agents` 的 `build_fix_command`）
 
@@ -617,11 +656,48 @@ MATLAB 特征不足一律 None）复核文件与声明一致，对不上 400 `co
   `stalled = {reason, detail}`（`reason ∈ cli_waiting_approval | cli_tool_not_delivered | stalled`）。来源：内置循环包装工具 handler 的开始 / 结束；CLI 每次 `/tool` 回调；CLI 结构化输出
   （Codex `exec --json`、Claude `-p --output-format stream-json --verbose`）经适配器的 `fix_event_parser()` 逐行解析成 `mcp_begin / mcp_end / approval / denied / output`——**只用于进度与卡住线索，从不当结论**。
   看门狗线程（每会话一个，`_watch`）：`DELIVER_WAIT`=20 s 内 CLI 报告的调用没收到回调 → `cli_tool_not_delivered`；出现 CLI 审批请求 → `cli_waiting_approval`（回调一到即解除）；`STALL_IDLE`=120 s 无工具在跑、无 CLI 输出 / 模型事件 → `stalled`；
-  等卡片（`state=waiting`）与在途工具都不算。卡住持续 `STALL_HARD`=300 s 自动取消：`stall_code` 记下，`_settle` 判 `failed` + 该原因码；内置循环的模型请求挂住、循环线程回不来时 `FORCE_SETTLE`=10 s 后看门狗强行收尾（`_settle` 幂等，迟到的循环线程不再改结局）。
+  等卡片（`state=waiting`）不算；在途工具有独立上限（`TOOL_TIMEOUT` 与本会话 `limits.max_seconds` 的较小值），到点显示 `stalled` 并传取消，工具真正退出前不释放占位。卡住持续 `STALL_HARD`=300 s 自动取消：`stall_code` 记下，`_settle` 判 `failed` + 该原因码；内置循环的模型请求挂住、循环线程回不来时 `FORCE_SETTLE`=10 s 后看门狗强行收尾（`_settle` 幂等，迟到的循环线程不再改结局）。
   卡住与自动取消、Claude 的权限拒绝（`cli_permission_denied`）都写 `fix_audit.jsonl`（`tool=_session`）。
 - **Codex 的取舍**：`--ignore-user-config` 仅在 `endpoint_args` 非空（Tavotto 显式给了 provider）时加并带 `-m <接口型号>`；官方登录态不加。**没核实的**：Codex `--json` 里 MCP 调用 / 审批事件的确切字段名（解析器按 `item.*` 的 `type` 含 `mcp` / `approval` 写，且对未知事件一律当「有输出」）。
 - **`change_python` 的旧代租约与回滚（Codex #1383 P2）**：换到新一代后 `deprepair._run_generation` 会 `managedenv.retire_unused` 删掉没人占着的旧代，所以 `change_python` 动手前给项目当前用的受管环境那一代
   （`managedenv.python_of` 与设置里记着的受管解释器）加 **保留型**租约 `envlease.acquire_retain`（`fix:<会话>`；与 native 占用在同一模块、两种用途：保留型只让 `deprepair._generation_in_use` 不清这一代，**不**被 `envlease.mutating()` 当成 native 会话拒绝——用 native 租约会把换代事务自己挡死；真正的 native 会话仍照旧拒绝换代），换成功则持到会话收尾（`_settle` → `ctx.release_leases()`，finish / 取消 / 失败 / 自动取消都走），没换成立即放（`release_retain`）。
   快照多存 `managed = {generation}`；`rollback` 先核旧代解释器真的在（不在 = `rollback_target_gone`，**一个字不改**），再恢复设置、`managedenv.activate` 指回旧代并让池 / 缓存放弃新一代，恢复后核设置里记着的解释器在不在（不在同样 `rollback_target_gone`，不报成功）。
-  `FixContext.cancel`（= 会话的 `s.cancel`）传给缺省换 Python 执行器 `_default_python_changer(req, cancel)`，规划完、动手前先看一眼（与 #1381 同一件事）。看护 `tests/test_fixrollback_managed.py`。
+  `FixContext.cancel`（= 会话的 `s.cancel`）同样传给 pip 安装/卸载执行器（含逐项执行前复查），并传给缺省换 Python 执行器 `_default_python_changer(req, cancel)`，规划完、动手前先看一眼（与 #1381 同一件事）。看护 `tests/test_fixrollback_managed.py`。
 
+
+### 2026-10-25 补充参考与会话期限
+
+转换缺少输入时，用户在原因卡补充项目相对路径，显式重试提交 `reference_files`；原因中的多行代码完整保留在卡片正文，超限不截断命令；全流程见 ADR 0143。
+`convertcontext.selected_paths` 是读策略的共同入口，不能绕过敏感路径、链接、脱敏和摘要校验。
+修复会话的总期限从创建开始计时（包括等卡片确认），与单工具期限分开。总期限到达记 `budget` 并传播取消；
+工具收尾期间保留占用，不把已有取消/期限结局重新标成 stalled。看护 `test_fixstall.py`、`test_fixmcp.py`。
+
+### 转换的保真失败与协议回放
+
+`convertfidelity.raster_drawing` 只报告候选 AST 中能静态指认的 Pillow 像素绘制调用；
+字体度量与照片读取放行，存在重绑定的不明确接收者不据此判错。内置 `check` 与最终采用前检查共用判据；
+`raster_drawing` 阻止把“Pillow 画完再 imshow”称为可编辑转写。没有命中不是全面保真证明。
+看护 `test_convert_fidelity.py` 和 `test_ai_convert.py` 的真实会话收尾用例。
+
+长转换允许单响应 32768 token（含模型思考），建议按约 6000 字符分块；完整接收的代码块不因超过建议值而丢弃，
+实际创建 / 覆盖 / 累计追加仍核同一个 200 KiB UTF-8 文件上限。所有调用仍受配置的 token、时间、轮数预算约束。
+共享 loop 截断后只保留协议可回放的思考状态，拒绝该轮文字与工具，反馈让模型继续；连续三次截断终止，正常响应重置连续计数。
+成功工具结果接替临时续写状态；manual thinking 保留签名前缀，其余 Anthropic 历史变化后清失效签名。转换的写入拒绝保留有界原错误现场，不能只反馈 mkdir 建议。
+错误参数经同源 schema 反馈；非对象参数仅在回放时换成空对象并配对原错误结果，不能执行。缺失/重复调用 ID 整批拒绝并反馈，连续三次终止。
+恢复不能绕过取消、校验次数、权限与用户确认；思考只在模型历史中，不进日志。完整契约与看护见 ADR 0147「共享恢复循环」。
+默认单次请求 300 秒，总期限仍会截断它，用户取消仍随时生效。
+Anthropic adaptive thinking 的签名绑定历史前缀；客户端压缩工具结果后删除历史内全部 thinking / redacted_thinking 块，
+保留工具调用及结果，不改用户推理强度。manual/budget 模式要求末轮思考块，保持追加历史并沿用总预算。
+依据：[官方排错规则](https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting)。
+看护 `test_agent_runner_media.py` 的接收端前缀验证，不能只断言请求 JSON 形状。
+内置失败只把闭集短码沿 Task Core 传给卡片；不传供应商错误体、模型思考或用户内容。
+
+### 参考图尺寸与上下文预算
+
+`imageheader.image_dimensions` 是 PNG / JPEG / GIF / WebP 画布尺寸的标准库只读入口，
+转换对照与内置模型图片预算共用。WebP 的 VP8 / VP8L / VP8X 分别读取图像或扩展画布头；
+不解码像素、不把头部识别当作完整文件校验，未知 / 截断头继续保守估算。
+`read_image` 向模型交付实际像素宽高；不能把小 WebP 当作未知大图触发压缩、反复丢掉源码与参考。
+Windows 的路径 stat 与句柄 fstat 可能给 ctime 不同含义，只在同一 API 内比较变化时间，
+跨 API 仍比较设备、inode、大小和 mtime；读取前后的身份校验与拒绝替换不变。
+看护 `test_image_header.py`、`test_agent_runner_media.py`；后者直接断言接收端后续请求仍带源码和图像。

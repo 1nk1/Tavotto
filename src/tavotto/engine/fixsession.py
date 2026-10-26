@@ -51,6 +51,7 @@ CARD_KINDS = ("approve", "choice", "pick", "send")
 DELIVER_WAIT = 20.0  # CLI 报「MCP 工具调用开始」后应用这边这么久没收到回调 = 工具没送达（多半在等 CLI 自己的审批）
 STALL_IDLE = 120.0  # 没有工具在跑、没有 CLI 输出 / 模型事件这么久 = 卡住
 STALL_HARD = 300.0  # 卡住持续这么久自动取消，outcome=failed，原因码 = 卡住的原因
+TOOL_TIMEOUT = FIX_LIMITS.max_seconds  # A blocked tool must also obey the task's time bound.
 FORCE_SETTLE = 10.0  # 自动取消后内置循环（模型请求挂住）还没返回，这么久后强行收尾
 WATCH_TICK = 0.5
 STALL_APPROVAL = "cli_waiting_approval"
@@ -84,8 +85,9 @@ programmer: talk in plain words, one short sentence at a time, no jargon.
 Work in this order:
 1. LOOK first. Call read_run_report, then use the read tools (read_file, list_dir, find_files, grep_files, \
 inspect_environment, list_environments, read_logs, lookup_package) until you know the cause. Do not guess.
-2. TRY next. try_import and try_run run things in a throw-away copy and change nothing. Use them to confirm a theory \
-before you change anything.
+2. TRY next. try_import checks an import in a guarded temporary process. try_run verifies through Tavotto's actual \
+preparation session, using the project's selected environment and execution settings, after a separate run approval. \
+mode=diagnostic uses a temporary copy in a candidate environment; it does not prove Tavotto is fixed.
 3. CHANGE only what you must, and only with the tools you are given. Before any change to the user's environment \
 or files, call propose_fix with ONE plain sentence (and, if it installs anything, the package names in `packages`) and wait: if the user declines, do not do it. Tavotto takes a \
 snapshot before each change so it can be rolled back; if a change did not help, roll it back.
@@ -97,7 +99,7 @@ unless you know one is needed), then install_packages for anything still missing
 change_python returned, then try_run to check, then finish with outcome `fixed`. Only if that path fails call \
 prepare_diagnostics and finish with `not_fixed`.
 3c. ARBITRARY COMMANDS. Prefer the dedicated tools: install_packages, change_python, select_environment, \
-switch_execution, convert_script. Only when none of them can do it, use run_command. By default it runs in a \
+switch_execution, switch_workdir, convert_script. Only when none of them can do it, use run_command. By default it runs in a \
 protective sandbox (the project is read-only for it; it can write only to its own scratch folder, this project's \
 Python environment and pip/conda caches; it has network access). Only if the command must write somewhere else, \
 call it again with `outside_sandbox: true` and a one-sentence `reason` in plain words: the user is asked in a \
@@ -113,7 +115,9 @@ compare it with how the script uses the file (column names, separator, shape, ex
 link_data_file, with your evidence in the card. Several or unsure: ask_user listing the candidates (path and one \
 difference each; put the file in each option's `path`) plus an option "None of these, I will choose", which then goes to pick_file; then link_data_file, try_run, \
 finish. link_data_file asks the user itself, so do NOT propose_fix for it; a file the user already chose is linked without \
-another card. NEVER edit the script; if the script checks the path in a way a link cannot reach, say so and finish not_fixed.
+another card. NEVER edit the script. If a relative font, input, or output path works in the project but fails in Tavotto's \
+sandbox, inspect the current launch context and consider switch_workdir: it asks the user to approve the project's \
+real working directory while keeping safe guards. Then verify with try_run in the application.
 3f. PROJECT FOLDER SHADOWS A PACKAGE. If a report or trial output has `project_package_shadow` (or the error is \
 `No module named 'a.b'` while the project has its own folder `a/`): the import that failed is `a.b`, not `a`; Python \
 found `a` in the project folder. Say exactly that, naming the missing piece and the project folder. If the note says \
@@ -125,9 +129,14 @@ no tool here can do that safely, call prepare_diagnostics if useful and finish `
 If the note says the folder is not a regular package (no `__init__.py`, or one that extends the package path), installing the real package can fix it as usual.
 4. If you need something only the user knows, use ask_user (a multiple-choice question) or pick_file (the system file \
 chooser). Never ask for a password, key or token.
-5. If you cannot fix it, call prepare_diagnostics with a short note of what you found and tried (the user decides \
-whether to send), then finish with outcome not_fixed.
-6. ALWAYS end by calling finish exactly once: outcome `fixed` only if a trial run now succeeds, `convert` after convert_script, otherwise `not_fixed`, \
+5. If you cannot fix it, distinguish missing user inputs/environment failures from a product defect. If evidence \
+points to a product defect, call prepare_diagnostics with an issue draft: title, reproduction, expected, actual, \
+evidence, attempts and product_reason. Include exact relevant commands/errors and the application-versus-direct-run \
+comparison when available; never infer a product defect just because one attempt failed. State uncertainty. \
+Keep the whole draft under 1000 characters; the reviewed diagnostics package carries full logs. The user reviews \
+the draft and package before sending through private feedback. Otherwise send a short summary of findings. \
+Only the user can choose to send; then finish with outcome not_fixed.
+6. ALWAYS end by calling finish exactly once: outcome `fixed` only if the current application run succeeds after the last change, `convert` after convert_script, otherwise `not_fixed`, \
 plus one plain sentence for the user.
 
 Hard rules: never edit or delete the user's scripts or data; never read credential locations (they are blocked \
@@ -233,6 +242,16 @@ class _FinishAware:
             return Turn(text="", stop="end")
         return self.inner.complete(**kw)
 
+    def truncated_continuation(self, turn: Turn) -> Turn | None:
+        return getattr(self.inner, "truncated_continuation", lambda turn: None)(turn)
+
+    def compress_history(self, history) -> int:
+        # Preserve the wire's signed-thinking rules in repair sessions too.
+        return getattr(self.inner, "compress_history", loop.compress)(history)
+
+    def release_recovery_state(self, history) -> int:
+        return getattr(self.inner, "release_recovery_state", lambda history: 0)(history)
+
 
 @dataclass
 class _Pending:
@@ -298,6 +317,9 @@ class FixSession:
     stall_code: str = ""  # 自动取消时记下的原因码；收尾时据此判 failed
     last_progress: float = field(default_factory=time.monotonic)
     inflight: int = 0
+    tool_started: float | None = None
+    tool_timeout: float = TOOL_TIMEOUT
+    deadline: float | None = None
     #: CLI 报告的 MCP 工具调用开始时刻 / 应用实际收到的回调次数（按工具名）；开始数多于回调数 = 有调用没送达
     begins: dict = field(default_factory=dict)
     cbs: dict = field(default_factory=dict)
@@ -412,6 +434,8 @@ class FixSessions:
                 script=script,
                 prep_session_id=prep_session_id,
                 token=secrets.token_urlsafe(32) if cli is not None else "",
+                tool_timeout=min(TOOL_TIMEOUT, (limits or FIX_LIMITS).max_seconds),
+                deadline=time.monotonic() + (limits or FIX_LIMITS).max_seconds,
             )
             self._by_id[s.id] = s
             while len(self._by_id) > KEEP_SESSIONS:
@@ -523,9 +547,13 @@ class FixSessions:
             }
             s.last_progress = now
             if phase == "start":
+                if s.inflight == 0:
+                    s.tool_started = now
                 s.inflight += 1
             elif phase == "end":
                 s.inflight = max(0, s.inflight - 1)
+                if s.inflight == 0:
+                    s.tool_started = None
         self._notify(s)
 
     def _audit_event(self, s: FixSession, code: str, summary: str, tool: str = "") -> None:
@@ -575,13 +603,34 @@ class FixSessions:
         while not s.done.wait(WATCH_TICK):
             now = time.monotonic()
             new_stall = auto_cancel = None
+            budget_expired = False
             changed = False
             with self._lock:
                 if s.state == STATE_FINISHED:
                     return
                 code, detail = "", ""
-                if s.state == STATE_WAITING:
+                if (
+                    s.deadline is not None
+                    and now >= s.deadline
+                    and not s.cancel.is_set()
+                    and s.reported is None
+                ):
+                    s.stall_code = "budget"
+                    s.cancel.set()
+                    forced_at = now
+                    budget_expired = changed = True
+                if s.cancel.is_set() or s.closing.is_set():
+                    pass  # Do not relabel an intentional shutdown while tools drain.
+                elif s.state == STATE_WAITING:
                     s.last_progress = now
+                    # Human review time is not executable tool time.
+                    s.tool_started = now if s.inflight else None
+                elif (
+                    s.inflight
+                    and s.tool_started is not None
+                    and now - s.tool_started > s.tool_timeout
+                ):
+                    code, detail = STALL_IDLE_CODE, (s.activity or {}).get("tool", "")
                 elif s.approval is not None:
                     code, detail = STALL_APPROVAL, s.approval
                 else:
@@ -602,11 +651,20 @@ class FixSessions:
                 if (
                     s.stalled
                     and s.stall_since is not None
-                    and now - s.stall_since > STALL_HARD
+                    and (
+                        now - s.stall_since > STALL_HARD
+                        or (
+                            s.inflight
+                            and s.tool_started is not None
+                            and now - s.tool_started > s.tool_timeout
+                        )
+                    )
                     and not s.cancel.is_set()
                 ):
                     s.stall_code = s.stalled["reason"]
                     auto_cancel = (s.stall_code, s.stalled["detail"])
+            if budget_expired:
+                self._audit_event(s, "budget", "the repair session reached its time limit")
             if new_stall:
                 self._audit_event(s, new_stall[0], "the repair AI looks stuck", new_stall[1])
             if auto_cancel:
@@ -664,6 +722,11 @@ class FixSessions:
                     break
             if now - started > max_seconds:
                 reason = "budget"
+                with self._lock:
+                    if not s.cancel.is_set():
+                        s.stall_code = "budget"
+                        s.cancel.set()
+                        self._audit_event(s, "budget", "the repair session reached its time limit")
                 break
             time.sleep(0.1)
         s.closing.set()  # 先拒新调用；卡片上阻塞的在途工具由 `_ask` 看到它而醒来

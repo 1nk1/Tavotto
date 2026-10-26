@@ -55,6 +55,7 @@ export interface ConvertEntry {
   library: string | null
   sourceLanguage: ConvertSourceLanguage
   path: string | null
+  referenceFiles?: string[]
   /** Agent 停下说明“哪一步换不了”的那一句（`needs_input`；后端已清洗并限长）；没有 = null */
   detail: string | null
   /** `deps` / `resuming` 时的依赖卡片事实（后端 `convertdeps` 的 card）；没有 = null */
@@ -74,7 +75,7 @@ export interface ConvertEntry {
 interface ConvertState {
   entries: Record<string, ConvertEntry>
   /** `language` 缺省 python（`library` 必填）；`r` / `matlab` 时 `library` 传 null */
-  start: (script: string, library: string | null, path: string | null, language?: ConvertSourceLanguage) => Promise<void>
+  start: (script: string, library: string | null, path: string | null, language?: ConvertSourceLanguage, referenceFiles?: string[]) => Promise<void>
   adopt: (script: string) => Promise<string | null>
   discard: (script: string) => Promise<void>
   /** 依赖卡片的主按钮（问一次 / 名单外）：回显卡片摘要，后端装 + 接着校验同一个候选；`system` 卡片没有这个动作 */
@@ -119,9 +120,9 @@ const set1 = (script: string, patch: Partial<ConvertEntry>) =>
   }))
 
 /** 后端失败原因 → 一句话（任务的 unmet 里挑第一条能说清的；说不清就笼统一句，由卡片的文案键给） */
-function failureCode(unmet: { constraint_id: string; reason_code: string }[] | undefined): string {
+function failureCode(unmet: { constraint_id: string; reason_code: string }[] | undefined, error?: string | null): string {
   const first = (unmet ?? []).find((u) => u.constraint_id !== 'correction') ?? unmet?.[0]
-  return first ? first.reason_code : 'unknown'
+  return first ? first.reason_code : error ?? 'unknown'
 }
 
 /** 任务结局里的依赖卡片事实（`unmet[].reason_code === 'dependency_decision'` 的那条的 `data`） */
@@ -336,11 +337,12 @@ const postFor = (session: string, kind: ResumeKind) => (pj: string | null) =>
 export const useConvertStore = create<ConvertState>((set, get) => ({
   entries: {},
 
-  start: async (script, library, path, language = 'python') => {
+  start: async (script, library, path, language = 'python', referenceFiles) => {
     const guard = captureProjectEpoch()
     const pj = currentProjectId()
     // 续查只认「失败卡上留着的、且登记为已受理」的那个会话（条目被重置后遗留的登记不算）
     const prior = get().entries[script]
+    const references = referenceFiles ?? prior?.referenceFiles ?? []
     // 续跑（装 / 重判 / 继续）遇到传输错误落下的「暂时连不上」：先以转换自己的状态对账，再决定要不要重发——
     // 不能去轮询那条已终结的 AI 会话（它永远是 needs_input，会盖掉已经 ready 的候选）
     if (prior?.phase === 'failed' && prior.session && prior.lost) {
@@ -361,6 +363,7 @@ export const useConvertStore = create<ConvertState>((set, get) => ({
           library,
           sourceLanguage: language,
           path,
+          referenceFiles: references,
           detail: null,
           card: null,
           envBase: null,
@@ -396,6 +399,7 @@ export const useConvertStore = create<ConvertState>((set, get) => ({
             // Python 来源带位图库；R / MATLAB 来源带语言、不带库（后端据此分流并复核文件内容）
             ...(language === 'python' ? { library: library ?? undefined } : { source_language: language }),
             path,
+            ...(references.length ? { reference_files: references } : {}),
             client_request_id: rid,
             ...(agent ? { agent, model, effort } : {}),
           },
@@ -477,7 +481,7 @@ export const useConvertStore = create<ConvertState>((set, get) => ({
           acceptedSessions.delete(key) // 任务明确终局失败：重试起新会话
           set1(script, {
             phase: 'failed',
-            reason: failureCode(sess.task?.unmet as { constraint_id: string; reason_code: string }[] | undefined),
+            reason: failureCode(sess.task?.unmet as { constraint_id: string; reason_code: string }[] | undefined, sess.error),
             stopping: false,
           })
         }
@@ -490,7 +494,13 @@ export const useConvertStore = create<ConvertState>((set, get) => ({
       }
       if (!guard.still()) return
       if (!isCurrent()) return // 已被停止 / 被更新的一次发起取代：旧 POST 的失败不能写进新会话的条目
-      set1(script, { phase: 'failed', error: backendErrorText(e) })
+      set1(script, {
+        phase: 'failed',
+        error: backendErrorText(e),
+        reason: e instanceof ApiError && e.status === 400 && e.body.code === 'convert_reference_invalid'
+          ? 'convert_reference_invalid'
+          : null,
+      })
     }
   },
 

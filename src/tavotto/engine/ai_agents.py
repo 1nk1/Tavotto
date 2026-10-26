@@ -181,6 +181,8 @@ class RunContext:
     #: 内置执行器的任务（`figure_edit` | `convert_to_editable`）与转换任务要新建的文件名
     task: str = "figure_edit"
     output: str | None = None
+    resume_output_sha256: str = ""
+    checks_used: int = 0
     #: 内置执行器：`check` 经 stdout/stdin 回调父进程（改图任务只在有 TAF 候选时才给；转换任务恒给）
     check_ipc: bool = False
 
@@ -1262,6 +1264,10 @@ class BuiltinAgent(AgentDefinition):
         if ctx.task == "convert_to_editable":
             # 转换任务：`check` 经 stdin/stdout 回调父进程的校验流水（提示词是 stdin 的第一行 JSON）
             cmd += ["--task", ctx.task, "--output", ctx.output or "", "--check-ipc"]
+            if ctx.resume_output_sha256:
+                cmd += ["--resume-output-sha256", ctx.resume_output_sha256]
+            if ctx.checks_used:
+                cmd += ["--checks-used", str(ctx.checks_used)]
         elif ctx.check_ipc:
             # 改图任务：同一条 IPC，父进程在候选副本上跑提交前同一套检查（`ai_figure_edit.agent_check`）。
             # 两家 CLI 没有这个入口——它们的 Agent 看不到校验结果，只有提交后被 TAF 拦下时的有界修正一轮
@@ -1302,6 +1308,14 @@ class BuiltinAgent(AgentDefinition):
             and not ev.get("ok")
             and ev.get("reason") not in (None, "completed", "cancelled")
         ):
+            # Preserve only closed short codes, never model/provider error text.
+            reason = str(ev["reason"])
+            if reason in self._FAILURES:
+                state["runner_error"] = (
+                    "agent_output_truncated"
+                    if reason == "budget" and ev.get("detail") == "output_truncated"
+                    else "agent_" + reason
+                )
             return [("message", self._FAILURES.get(str(ev["reason"]), "出错"))]
         return []
 

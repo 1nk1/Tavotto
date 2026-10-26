@@ -3,7 +3,7 @@
 
 权限边界（逐条有看护用例，`tests/test_ai_convert.py`）：
 
-* 候选工作区 `data_dir()/cache/ai_convert/<sid>/`：**只复制**原脚本（与原输出图的参考副本），不建链接；Agent 的 cwd 在这里，
+* 候选工作区 `data_dir()/cache/ai_convert/<sid>/`：复制原脚本、原图参考与有界依赖快照，不建链接；Agent 的 cwd 在这里，
   它能写的只有候选目录里的**一个新文件** `<原名>_matplotlib.py`。提交前检查：除这一个新文件外候选树逐字节不变（含原脚本副本）、
   原项目指纹不变、原脚本字节不变；
 * Agent **从不**写项目目录：任务的 `commit` 只是把通过检查的候选“留存待采用”（候选目录 + `meta.json`，不碰用户文件）；
@@ -28,9 +28,9 @@ import json
 import os
 import re
 import shutil
-import struct
 import threading
 import time
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,6 +40,9 @@ from . import (
     ai_tasks,
     atomicio,
     config,
+    convertcontext,
+    convertfidelity,
+    convertoutputs,
     discover,
     projectenv,
     rasterhint,
@@ -48,6 +51,7 @@ from . import (
     sourcelang,
 )
 from .ai_tasks import FAILED, UNKNOWN, VERIFIED, CheckResult, NeedsInput, TaskError
+from .imageheader import image_dimensions
 
 TASK_TYPE = "convert_to_editable"
 CONVERT_DIR = config.data_dir() / "cache" / "ai_convert"
@@ -61,14 +65,16 @@ PREVIEW_MAX_BYTES = 6 * 1024 * 1024
 RETAIN_S = 24 * 3600
 NAME_SUFFIX = "_matplotlib"
 #: 校验运行用的临时文件名前缀。worker 按 `importlib.import_module(stem)` 加载脚本，stem 必须是合法模块名（不能以点开头）
-STAGE_PREFIX = "tavotto_convert_probe_"
+STAGE_PREFIX = "_tavotto_convert_probe_"
 MAX_NUMBERED = 99
 META_NAME = "meta.json"
 PREVIEW_NAME = "preview.svg"
 
-#: Agent 判定“Python 里没有可靠对应”时的固定标记句式：首行 `TAVOTTO_NEEDS_INPUT: <原因>`，并且不写新文件
+#: Agent 判定缺少保真所需证据或可靠对应时：首行 `TAVOTTO_NEEDS_INPUT: <原因>`；已写出的草稿也不能采用
 NEEDS_INPUT_MARKER = "TAVOTTO_NEEDS_INPUT:"
-NEEDS_INPUT_REASON_MAX = 200
+#: A complete export guide includes prerequisites, commands and output names.
+#: Keep the whole guide within a bounded card; never truncate executable blocks.
+NEEDS_INPUT_REASON_MAX = 8192
 _NEEDS_INPUT_RE = re.compile(r"^[ \t>*`_-]*TAVOTTO_NEEDS_INPUT:[ \t]*(.*)$", re.M)
 #: 对照数据里 `verification` 的取值：没有原图 = `unknown`（Tavotto 没运行 R / MATLAB，也没有原图可比）；有原图 = 并排给人看
 VERIFICATION_UNKNOWN = "unknown"
@@ -105,8 +111,10 @@ NO_FIGURE_CODES = frozenset(
 #: 绊线拦下候选写项目文件的稳定码（`writetripwire.CODE` 的镜像）与写给 Agent 的一句
 WRITE_OUTSIDE_ROOTS_CODE = "write_outside_roots"
 WRITE_OUTSIDE_HINT = (
-    "校验运行里脚本想写项目目录里的文件（例如 savefig('out.png') / to_csv），被拦下了；"
-    "新脚本只许读原数据，不要保存任何文件，让 Tavotto 自己导出图。"
+    "转换校验只允许写候选目录和运行时临时目录，不能写原项目。"
+    "根据下面的实际错误定位写入；删除仅为输出准备的 mkdir / makedirs，额外文件写入和中间数据改用内存或 tempfile。"
+    "保留 Matplotlib savefig 调用，Tavotto 会捕获图像，不需要预建输出目录；"
+    "不要把写入改到项目的其他位置。"
 )
 _SID = re.compile(r"[0-9a-f]{12}")
 _STATES = (
@@ -166,36 +174,6 @@ def sibling_original(script_path: Path) -> Path | None:
     return None
 
 
-# --------------------------------------------------------------------------- 原图事实（对照用）
-def image_dimensions(data: bytes) -> tuple[int, int] | None:
-    """PNG / JPEG / GIF 的像素宽高（只读头部，纯标准库）；认不出回 None。"""
-    try:
-        if data[:8] == b"\x89PNG\r\n\x1a\n" and data[12:16] == b"IHDR":
-            w, h = struct.unpack(">II", data[16:24])
-            return int(w), int(h)
-        if data[:6] in (b"GIF87a", b"GIF89a"):
-            w, h = struct.unpack("<HH", data[6:10])
-            return int(w), int(h)
-        if data[:2] == b"\xff\xd8":
-            i = 2
-            while i + 9 < len(data):
-                if data[i] != 0xFF:
-                    i += 1
-                    continue
-                marker = data[i + 1]
-                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
-                    i += 2
-                    continue
-                (seg,) = struct.unpack(">H", data[i + 2 : i + 4])
-                if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB):
-                    h, w = struct.unpack(">HH", data[i + 5 : i + 9])
-                    return int(w), int(h)
-                i += 2 + seg
-    except (struct.error, IndexError):
-        return None
-    return None
-
-
 # --------------------------------------------------------------------------- 候选工作区
 @dataclass
 class ConvertCandidate:
@@ -218,6 +196,7 @@ class ConvertCandidate:
     project_before: dict
     #: 来源语言（`sourcelang.LANGUAGES`）
     source_language: str = sourcelang.PYTHON
+    context: dict = field(default_factory=dict)
     #: 校验运行前自动装上的发行包（`convertdeps.ensure`）
     installed: list = field(default_factory=list)
     #: 校验运行前停住等用户决定时的卡片事实（`convertdeps` 的 `card`）；非 None = 候选要留着等 `resume`
@@ -293,6 +272,7 @@ def create_candidate(
     source_language: str = sourcelang.PYTHON,
     original_path: Path | None = None,
     original_rel: str | None = None,
+    reference_files: tuple[str, ...] = (),
 ) -> ConvertCandidate:
     """建候选目录并**复制**原脚本（与大小合适的原输出图，当参考）；拍原项目指纹基线。失败时不留半个目录。"""
     project_root = Path(project_root)
@@ -315,6 +295,9 @@ def create_candidate(
             (cdir / REFERENCE_DIR).mkdir()
             reference_name = original_path.name
             (cdir / REFERENCE_DIR / reference_name).write_bytes(original_path.read_bytes())
+        context = convertcontext.snapshot(
+            project_root, script_rel, base, cdir, reference_files=reference_files
+        )
         cand = ConvertCandidate(
             sid=sid,
             dir=cdir,
@@ -326,6 +309,7 @@ def create_candidate(
             base_mode=script_path.stat().st_mode & 0o7777,
             library=library or None,
             source_language=source_language,
+            context=context,
             original_rel=original_rel,
             reference_name=reference_name,
             tree_before=ai_figure_edit._tree(cdir) or {},
@@ -352,13 +336,45 @@ def release(cand: ConvertCandidate) -> None:
 
 
 def prompt_for(cand: ConvertCandidate) -> str:
-    return ai_prompt_pack.convert_prompt(
+    prompt = ai_prompt_pack.convert_prompt(
         script=Path(cand.script_rel).name,
         target=cand.target_name,
         library=cand.library,
         source_language=cand.source_language,
         reference=f"{REFERENCE_DIR}/{cand.reference_name}" if cand.reference_name else None,
         project_root=cand.project_root,
+    )
+    hint = getattr(cand.extras.get("runner"), "runtime_hint", None)
+    runtime = hint() if callable(hint) else {"status": "unknown", "verified": False}
+    prompt += (
+        "\n\n候选校验环境的只读规划线索（未启动解释器，未验证能力）："
+        + json.dumps(runtime, ensure_ascii=False)
+        + "\nCLI 的 PATH/python、Agent 自身解释器与候选校验 worker 可能不同。"
+        "不能根据裸 python 的版本就认定用户的校验环境不支持；若检查能力，只针对这里指明的解释器。"
+        "没有选定解释器时能力仍未知，不要猜版本或要求用户修复 CLI 自己的环境。"
+        "新候选的实际 check/后端校验才是执行证据，环境也可能在用户确认准备后变化；"
+        "保留必要能力检查，不能静默降级排版。"
+    )
+    return prompt + (
+        f"\n\n只读项目上下文：先读 {convertcontext.MANIFEST}，其中 source 是原脚本的项目相对路径，"
+        f"files 的逐项路径映射到 {convertcontext.DIRECTORY}/。这些是有界静态依赖快照，"
+        "user_selected 是用户明确补充的参考文件；先读取其中的原始色表、数据或运行时信息，不能忽略后继续猜测。"
+        "不是完整项目；omitted / limitations 表示未提供的证据，不能据此认定依赖不存在。"
+        "input_read_policy 说明真实应用的读取语义：项目可能有用户已确认的数据映射，"
+        "所以快照里没有的文件仍可能在应用内可读。映射只接管只读打开失败，"
+        "不会改变 exists/is_file/glob 等文件系统探测。保留原脚本的输入路径串和读取方式，"
+        "尤其不能把相对输入擅自改成绝对路径，或新增 exists 判断、捕获后跳过绘图来掩盖缺失输入；"
+        "沿用原有可选分支，必需输入则实际读取，让失败交给 check 的修复循环。"
+        "不凭快照缺项删除输出、替换数据或降级为部分图；不把项目缓存路径写入生成代码。"
+        "redacted=true 表示只读快照已脱敏，sha256 是原资源摘要，snapshot_sha256 是所见副本摘要；"
+        "脱敏占位符不是原始数据，不能把占位符当作常量搬进新代码。"
+        "可用 list_dir(path=...) 浏览快照子目录并 read_file 读 helper / 数据。二进制字体可见其路径与摘要，"
+        "校验时仍从原项目加载；沿用原项目字体，不因工具不能读取二进制而改用近似字体。"
+        "候选采用后位于原脚本同目录。新代码必须保持原项目的相对路径语义：manifest 的 source"
+        " 与 files[].path 都相对项目根，先计算资源相对 source 所在目录的路径，再以"
+        " Path(__file__).resolve().parent 定位脚本相对资源；"
+        "不能引用本次快照映射路径或候选缓存绝对路径。原项目本就存在的同名目录仍可使用。"
+        "只能写指定的新 .py；快照、来源和清单都只读。"
     )
 
 
@@ -374,16 +390,44 @@ def _static_uses_matplotlib(tree: ast.AST) -> bool:
     return False
 
 
-def run_validation(cand: ConvertCandidate, runner) -> dict:
+def normalize_outputs(cand: ConvertCandidate) -> dict | None:
+    """Give this reviewable candidate its own output identity before any execution."""
+    try:
+        data = convertoutputs.normalize(cand.new_bytes or b"", cand.sid)
+        if data != cand.new_bytes:
+            if cand.target.is_symlink():
+                raise ValueError("candidate_symlink")
+            atomicio.write_bytes(cand.target, data)
+            cand.new_bytes = data
+    except (
+        OSError,
+        UnicodeError,
+        SyntaxError,
+        ValueError,
+        StopIteration,
+        tokenize.TokenError,
+    ) as exc:
+        return {"status": "error", "code": "convert_output_identity", "message": str(exc)}
+    return None
+
+
+def run_validation(
+    cand: ConvertCandidate | ai_figure_edit.Candidate, runner, *, evidence: list | None = None
+) -> dict:
     """在用户同一解释器 / 同一路由下跑候选脚本一遍。
 
     `runner(figures_dir: str, script_rel: str, write_roots: tuple[str, ...]) -> {"stems": [...], "size_mm": [w, h] | None, "svg": str | None,
-    "error": None | {"code": str, "message": str}}`（app 注入，走现有 probe 路径并在返回前退役它起的 worker）。
+    "error": None | {"code": str, "message": str, "cause": str | None}}`（app 注入，走现有 probe 路径并在返回前退役它起的 worker）。
     **隔离写入（Codex #1277 P1）**：运行带写入根绊线（ADR 0141 的 `write_roots`，现有机制）——根只有候选目录（加 worker 自己的
     基础设施目录），所以候选脚本把相对路径输出（`out.png` / `data.csv`）写进项目目录时，在**写发生的那一刻**失败
     （`write_outside_roots`），用户文件根本没被打开写过；跑完的指纹复核只是兜底（绊线挡不住 C 层写）。
-    候选以紧挨原脚本的**临时文件**（`tavotto_convert_probe_<sid>.py`）形式存在（O_EXCL 新建、跑完即删）：相对路径的数据读取与 cwd 判据同原脚本。
+    候选以紧挨原脚本的**临时文件**（`_tavotto_convert_probe_<sid>.py`）形式存在（O_EXCL 新建、跑完即删）：相对路径的数据读取与 cwd 判据同原脚本。
     回 `{"status": "ok" | "no_figure" | "error", ...}`。"""
+    # Editing preserves source-owned output names; only conversion creates a new identity.
+    if isinstance(cand, ConvertCandidate):
+        issue = normalize_outputs(cand)
+        if issue is not None:
+            return issue
     stage_path = cand.script_path.parent / f"{STAGE_PREFIX}{cand.sid}.py"
     rel = stage_path.relative_to(cand.project_root).as_posix()
     try:
@@ -397,7 +441,10 @@ def run_validation(cand: ConvertCandidate, runner) -> dict:
                 if cancel is not None and cancel.is_set():
                     # 依赖旁路没报取消（调研 none / skipped / 不缺包）而取消已置位：不启动校验运行
                     return {"status": "cancelled"}
-                out, killed = _run_with_cancel(runner, cand, rel, cancel)
+                checked_runner = (
+                    getattr(runner, "with_images", runner) if evidence is not None else runner
+                )
+                out, killed = _run_with_cancel(checked_runner, cand, rel, cancel)
                 if killed:
                     return {"status": "cancelled"}
             finally:
@@ -408,23 +455,56 @@ def run_validation(cand: ConvertCandidate, runner) -> dict:
     except OSError as exc:
         code = "exists" if isinstance(exc, FileExistsError) else "write_failed"
         return {"status": "error", "code": f"stage_{code}", "message": str(exc)}
+    if evidence is not None:
+        from .agent_runner.media import from_wire
+
+        evidence.extend(from_wire(out.get("images")))
     err = out.get("error")
     if err:
         code = str(err.get("code") or "run_failed")
         if code in NO_FIGURE_CODES:
             return {"status": "no_figure", "code": code}
         if ai_figure_edit.tripped_write_roots(code, err.get("cause")):
-            # 生产 runner 里码被探测折成 script_probe_failed，绊线的码在 `cause`：两种来源同一个结论、同一句提示
+            # Keep the concrete failure as well as the scope guidance: the
+            # rejected operation can be a file write, not just mkdir.
+            violation = err.get("write_violation")
+            detail = (
+                "\nRejected write: " + json.dumps(violation, ensure_ascii=False)
+                if isinstance(violation, dict) and violation
+                else ""
+            )
             return {
                 "status": "error",
                 "code": WRITE_OUTSIDE_ROOTS_CODE,
-                "message": WRITE_OUTSIDE_HINT,
+                "message": WRITE_OUTSIDE_HINT + detail,
             }
         return {
             "status": "error",
             "code": code,
             "message": str(err.get("message") or "")[:400],
             **({"cause": str(err["cause"])} if err.get("cause") else {}),
+        }
+    # Probe isolates per-figure failures so other pages remain usable. A
+    # conversion, however, must not certify a candidate which lost some pages.
+    if out.get("partial") or out.get("failed_figures") or out.get("dropped_figures"):
+        failures = out.get("failed_figures") or []
+        detail = "; ".join(
+            f"{f.get('stem', 'figure')}: {f.get('code', 'capture_failed')}"
+            for f in failures
+            if isinstance(f, dict)
+        )
+        return {
+            "status": "error",
+            "code": "capture_incomplete",
+            "message": (
+                "Not all figures could be captured. "
+                + detail
+                + (
+                    f" Dropped figures: {out['dropped_figures']}."
+                    if out.get("dropped_figures")
+                    else ""
+                )
+            )[:400],
         }
     if not out.get("stems"):
         return {"status": "no_figure", "code": "no_figures_captured"}
@@ -438,7 +518,7 @@ def run_validation(cand: ConvertCandidate, runner) -> dict:
     }
 
 
-def agent_check(cand: ConvertCandidate) -> tuple[bool, str]:
+def agent_check(cand: ConvertCandidate, *, evidence: list | None = None) -> tuple[bool, str]:
     """内置执行器 `check` 工具的回调（Agent 在候选里写完新脚本后自己要一次校验）→ `(是否通过, 给 Agent 看的一段报告)`。
 
     与流水线的提交前检查同一套规则（ADR 0143）：新文件在不在 → 语法 → 静态上用了 Matplotlib → 在用户同一路由下真跑一遍
@@ -456,13 +536,37 @@ def agent_check(cand: ConvertCandidate) -> tuple[bool, str]:
         return False, f"syntax_error: line {problem.get('lineno')}: {problem.get('detail')}"
     if not _static_uses_matplotlib(tree):
         return False, "no_matplotlib_import: the new script must draw with Matplotlib"
+    if convertfidelity.raster_drawing(tree):
+        return False, (
+            "raster_drawing: the candidate still paints text or shapes with Pillow. "
+            "Use editable Matplotlib Text/Line/Patch objects, including mask geometry; "
+            "reading photographs and measuring fonts are allowed. If exact conversion "
+            "is unavailable, report TAVOTTO_NEEDS_INPUT instead of embedding the bitmap."
+        )
+    if convertcontext.transient_reference(tree, cand.dir):
+        return False, "transient_resource_path: use the original project resource location"
+    if not convertcontext.unchanged(cand.project_root, cand.context, snapshot_dir=cand.dir):
+        return False, "convert_context_changed"
     runner = cand.extras.get("runner")
     if runner is None:
         return False, "check_unavailable"
-    res = run_validation(cand, runner)
+    res = run_validation(cand, runner, evidence=evidence)
+    if not convertcontext.unchanged(cand.project_root, cand.context, snapshot_dir=cand.dir):
+        return False, "convert_context_changed"
     status = res.get("status")
     if status == "ok":
-        return True, f"check passed: {len(res.get('stems') or [])} figure(s) captured"
+        count = len(res.get("stems") or [])
+        message = f"check passed: {count} figure(s) captured"
+        if evidence is not None:
+            message += f"; {len(evidence)} rendered preview(s) attached in capture order."
+            if len(evidence) != count:
+                message += " Visual evidence is incomplete (preview unavailable or image budget reached). Do not claim full visual verification."
+            message += (
+                " This runtime result does not certify fidelity. If the whole script is complete and there are no known "
+                "data, semantic or missing-output problems, deliver it now and report visual differences for later review; "
+                "do not start another edit/check cycle to polish pixels."
+            )
+        return True, message
     detail = " ".join(str(res.get(k) or "") for k in ("code", "message")).strip()
     return False, f"check failed ({status}): {detail}"[:1500]
 
@@ -693,6 +797,12 @@ class ConvertAdapter:
                 if _static_uses_matplotlib(tree_)
                 else _check("candidate.matplotlib", st, "goal", FAILED, "no_matplotlib_import")
             )
+        if tree_ is not None and convertcontext.transient_reference(tree_, cand.dir):
+            out.append(
+                _check("candidate.resources", st, "integrity", FAILED, "transient_resource_path")
+            )
+        if tree_ is not None and convertfidelity.raster_drawing(tree_):
+            out.append(_check("candidate.editable", st, "goal", FAILED, "raster_drawing"))
         out += self._project_untouched(cand, st)
         if any(c.verdict != VERIFIED for c in out):
             return out  # 静态检查都没过就不浪费一次真运行
@@ -709,6 +819,10 @@ class ConvertAdapter:
 
     def _project_untouched(self, cand: ConvertCandidate, st: str) -> list[CheckResult]:
         out = []
+        if not convertcontext.unchanged(cand.project_root, cand.context, snapshot_dir=cand.dir):
+            out.append(
+                _check("project.context", st, "integrity", FAILED, "convert_context_changed")
+            )
         try:
             now = cand.script_path.read_bytes()
         except OSError:
@@ -829,10 +943,32 @@ def convert_fix_text(key: tuple[str, str | None], observed: dict) -> str | None:
 
 # --------------------------------------------------------------------------- 执行器（AI 桥的那一次 CLI 运行）
 def clean_needs_input_reason(text: str) -> str:
-    """Agent 给的“换不了”原因 → 一行干净的短句：去控制字符 / 换行折叠 / 去首尾标点装饰，截到 `NEEDS_INPUT_REASON_MAX`。"""
+    """清洗补充输入原因；有代码围栏时保留换行，超长命令不截断后交给用户。"""
+    if re.search(r"(?m)^\s*(?:```|~~~)", text):
+        # Newlines are executable syntax in R/Python/MATLAB examples. Never
+        # flatten a fenced command into a different command or truncate it.
+        clean = re.sub(
+            r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", " ", text.replace("\r\n", "\n").replace("\r", "\n")
+        )
+        if len(clean.strip()) <= NEEDS_INPUT_REASON_MAX:
+            return clean.strip()
+        return "Additional input is required. The agent's explanation exceeds the display limit; request a shorter explanation with complete commands."
     one = re.sub(r"[\x00-\x1f\x7f]+", " ", str(text or ""))
-    one = re.sub(r"\s+", " ", one).strip(" \t*_`>-")
-    return one[:NEEDS_INPUT_REASON_MAX].rstrip()
+    one = re.sub(r"\s+", " ", one).strip()
+    # Strip only a balanced wrapper; stripping individual backticks corrupts a
+    # leading function/command followed by explanatory text.
+    for wrapper in ("**", "__", "`", "*", "_"):
+        if one.startswith(wrapper) and one.endswith(wrapper) and len(one) > 2 * len(wrapper):
+            one = one[len(wrapper) : -len(wrapper)].strip()
+    if len(one) > NEEDS_INPUT_REASON_MAX:
+        # Never offer a silently chopped command as executable guidance. Keep
+        # complete sentences only, or a plain bounded explanation if none fit.
+        prefix = one[:NEEDS_INPUT_REASON_MAX]
+        boundary = max(prefix.rfind("。"), prefix.rfind(". "), prefix.rfind("; "))
+        if boundary >= 0 and prefix[: boundary + 1].count("`") % 2 == 0:
+            return prefix[: boundary + 1].rstrip()
+        return "Additional input is required. The agent's explanation exceeds the display limit; request a shorter explanation with complete commands."
+    return one
 
 
 def needs_input_reason(transcript) -> str | None:
@@ -842,16 +978,17 @@ def needs_input_reason(transcript) -> str | None:
     for item in transcript or []:
         if not isinstance(item, dict) or item.get("kind") != "message":
             continue
-        for m in _NEEDS_INPUT_RE.finditer(str(item.get("text") or "")):
-            found = clean_needs_input_reason(m.group(1))
+        text = str(item.get("text") or "")
+        for m in _NEEDS_INPUT_RE.finditer(text):
+            found = clean_needs_input_reason(text[m.start(1) :])
     return found
 
 
 class ConvertExecutor(ai_figure_edit.BridgeExecutor):
     """`commit` = 把通过检查的候选留存待采用（候选目录 + meta.json）；**不写任何用户文件**。
 
-    Agent 运行结束后若**没有写出新文件**而回答里带着 `TAVOTTO_NEEDS_INPUT:` 标记 → `NeedsInput`（任务结局 `needs_input`，
-    不生成新脚本）；没有标记照旧交给提交前检查（`target_missing`，可修正一次）。"""
+    Agent 运行结束后的回答带着 `TAVOTTO_NEEDS_INPUT:` 标记 → `NeedsInput`，即使已写出草稿。
+    运行成功不能覆盖 Agent 明确报告的保真缺口；没有标记照旧交给提交前检查。"""
 
     writes_user_files = False
 
@@ -863,8 +1000,6 @@ class ConvertExecutor(ai_figure_edit.BridgeExecutor):
         if self._transcript is None:
             return
         try:
-            if cand.target.exists() or cand.target.is_symlink():
-                return  # 写了新文件就按新文件走：标记只在“没写文件”时算数
             reason = needs_input_reason(self._transcript())
         except Exception:  # noqa: BLE001 —— 读转录失败当作没有标记
             return
@@ -904,6 +1039,7 @@ def stage(cand: ConvertCandidate) -> None:
         "target_name": cand.target_name,
         "library": cand.library,
         "source_language": cand.source_language,
+        "context": cand.context,
         "installed": list(cand.installed),
         "original_rel": cand.original_rel,
         "comparison": cand.comparison,
@@ -932,6 +1068,7 @@ def _hold_meta(cand: ConvertCandidate, state: str) -> dict:
         "target_name": cand.target_name,
         "library": cand.library,
         "source_language": cand.source_language,
+        "context": cand.context,
         "installed": list(cand.installed),
         "original_rel": cand.original_rel,
         "reference_name": cand.reference_name,
@@ -993,14 +1130,34 @@ def ensure_registered() -> None:
 
 
 # --------------------------------------------------------------------------- 状态 / 采用 / 丢弃
+#: Windows 上续跑线程 `os.replace` 换 meta 的那一瞬，同时打开它的读者拿到 PermissionError（WinError 5 / 32），
+#: 不是「还没就绪」。短暂重试几次再下结论；POSIX 上 replace 对读者原子，第一次就成。
+META_READ_RETRIES = 5
+META_READ_RETRY_S = 0.02
+
+
+def _read_meta_file(path: Path) -> object | None:
+    """读 meta JSON；读不到 / 不是 JSON → None。只对「被占用」的那种 OSError 重试。"""
+    for attempt in range(META_READ_RETRIES):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            locked = isinstance(exc, PermissionError) or getattr(exc, "winerror", None) in (5, 32)
+            if not locked or attempt == META_READ_RETRIES - 1:
+                return None
+            time.sleep(META_READ_RETRY_S)
+        except ValueError:
+            return None
+    return None
+
+
 def _load_meta(sid: str, project: str) -> tuple[Path, dict]:
     cdir = CONVERT_DIR / _check_sid(sid)
     if not cdir.is_dir() or cdir.is_symlink() or not _under_convert_dir(cdir):
         raise ConvertError("convert_not_found", 404)
-    try:
-        meta = json.loads((cdir / META_NAME).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        raise ConvertError("convert_not_ready", 409) from None
+    meta = _read_meta_file(cdir / META_NAME)
+    if meta is None:
+        raise ConvertError("convert_not_ready", 409)
     if not isinstance(meta, dict) or meta.get("sid") != sid or meta.get("project") != project:
         raise ConvertError("convert_not_found", 404)
     return cdir, meta
@@ -1099,6 +1256,10 @@ def _adopt_locked(cdir: Path, meta: dict, root: Path, script_rel: str, script_pa
         raise ConvertError("convert_source_changed", 409) from None
     if _sha256(data) != meta["candidate_sha256"]:
         raise ConvertError("convert_candidate_changed", 409)
+    if meta.get("context") is not None and not convertcontext.unchanged(
+        root, meta["context"], snapshot_dir=cdir
+    ):
+        raise ConvertError("convert_context_changed", 409)
     parent_rel = Path(script_rel).parent
     stem = Path(meta["target_name"]).stem
     for n in range(1, MAX_NUMBERED + 1):
@@ -1198,6 +1359,9 @@ def _rebuild(cdir: Path, meta: dict, project: Path) -> ConvertCandidate:
         raise ConvertError("convert_source_changed", 409)
     if _sha256(new) != meta["candidate_sha256"]:
         raise ConvertError("convert_candidate_changed", 409)
+    context = meta.get("context")
+    if context is not None and not convertcontext.unchanged(project, context, snapshot_dir=cdir):
+        raise ConvertError("convert_context_changed", 409)
     baseline = meta.get("project_before")
     if not isinstance(baseline, dict):
         raise ConvertError("convert_project_changed", 409)
@@ -1221,6 +1385,7 @@ def _rebuild(cdir: Path, meta: dict, project: Path) -> ConvertCandidate:
         reference_name=meta.get("reference_name"),
         tree_before=ai_figure_edit._tree(cdir) or {},
         project_before=baseline,
+        context=context or {"version": 1, "files": []},
         source_language=str(meta.get("source_language") or sourcelang.PYTHON),
         installed=list(meta.get("installed") or []),
         new_bytes=new,
@@ -1285,7 +1450,11 @@ def run_resume(
         try:
             cand = _rebuild(cdir, meta, root)
         except ConvertError as exc:
-            if exc.code in ("convert_project_changed", "convert_source_changed"):
+            if exc.code in (
+                "convert_project_changed",
+                "convert_source_changed",
+                "convert_context_changed",
+            ):
                 _drop_candidate_files(cdir, meta)  # 完整性失败：候选不可再被采用
             _set_state(cdir, meta, STATE_FAILED, failure={"reason": exc.code})
             return {"state": STATE_FAILED, "reason": exc.code}

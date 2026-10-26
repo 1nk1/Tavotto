@@ -14,7 +14,8 @@ from pathlib import Path
 
 from ..agent_runner.wires import ToolResult
 from . import readscope
-from .base import FixContext, FixTool, err, home_relative, obj, ok, resolve_or_error, shadow_note
+from .base import FixContext, FixTool, err, home_relative, obj, ok, resolve_or_error
+from .runreport import project_run_report
 
 LIST_LIMIT = 200
 FIND_LIMIT_MAX = 500
@@ -29,71 +30,14 @@ SKIP_DIRS = frozenset(
 SITE_PACKAGES_DEPTH = 2
 GREP_FILE_BYTES = 2 * 1024 * 1024
 LOG_LINES_MAX = 400
-REPORT_MAX_CHARS = 8000
 
 _LOG_SOURCES = ("app", "worker")
 
 
 # --------------------------------------------------------------------------- read_run_report
-def _tail(text: str, n: int = 40) -> str:
-    lines = text.splitlines()
-    return "\n".join(lines[-n:])
-
-
-def _precis(value, depth: int = 0):
-    if isinstance(value, str):
-        return _tail(value, 40) if len(value) > 1200 else value
-    if isinstance(value, list):
-        return [_precis(v, depth + 1) for v in value[-12:]]
-    if isinstance(value, dict) and depth < 4:
-        return {str(k): _precis(v, depth + 1) for k, v in list(value.items())[:30]}
-    return value if isinstance(value, bool | int | float | type(None)) else str(value)[:200]
-
-
-_REPORT_KEYS = (
-    "phase",
-    "outcome",
-    "code",
-    "error",
-    "error_tail",
-    "attempt_history",
-    "remedy",
-    "dependency",
-)
-
-
 def read_run_report(ctx: FixContext, args: dict) -> ToolResult:
     report = ctx.report() if ctx.report else None
-    if not isinstance(report, dict):
-        return err("no_report", "There is no preparation session report right now.")
-    picked = {
-        k: _precis(report[k]) for k in _REPORT_KEYS if report.get(k) not in (None, "", [], {})
-    }
-    for item in report.get("requirements") or []:
-        # 数据失联（ADR 0106）：脚本要的那串和脚本里别处写着、此刻也找不到的路径——`link_data_file` 的 `requested` 就取自这里
-        if isinstance(item, dict) and item.get("kind") == "input_location":
-            if isinstance(item.get("payload"), dict):
-                picked["missing_input"] = _precis(item["payload"])
-            break
-    # 同名包遮蔽（`importshadow`）：报告里的 `No module named 'a.b'` 实际是项目里的 `a/` 缺了 `b`，写明
-    # 真实准备会话报告（`prepsession.report`）把异常放在 `result.error`（code / message / traceback），顶层没有
-    # `error` / `error_tail`；两种位置都读。`result` 不在 `_REPORT_KEYS` 里，模型原先看不到异常文本，这里把 `result.error` 补成 `error`
-    result = report.get("result")
-    nested = result.get("error") if isinstance(result, dict) else None
-    if nested and "error" not in picked:
-        picked["error"] = _precis(nested)
-    err_text = "\n".join(
-        v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str)
-        for v in [report.get(k) for k in ("error", "error_tail", "attempt_history")] + [nested]
-        if v
-    )
-    note = shadow_note(ctx, err_text).removeprefix("\nproject_package_shadow: ")
-    if note:
-        picked = {"project_package_shadow": note, **picked}  # 放最前：超长截断先丢后面的
-    text = json.dumps(picked, ensure_ascii=False, indent=1, default=str)
-    if len(text) > REPORT_MAX_CHARS:
-        text = text[:REPORT_MAX_CHARS] + "\n[truncated]"
-    return ok(text, f"report with {len(picked)} sections")
+    return project_run_report(report, ctx)
 
 
 # --------------------------------------------------------------------------- read_file / list_dir

@@ -346,7 +346,7 @@ def test_incompatible_legacy_record_is_an_error_connection(world):
     assert c["state"] == "error" and c["error"] == ai_providers.INCOMPATIBLE_CODEX_CHAT
 
 
-def test_oauth_record_prefers_the_cli_and_falls_back_to_the_builtin_executor(world, monkeypatch):
+def test_oauth_record_defaults_to_builtin_and_preserves_the_cli_choice(world, monkeypatch):
     monkeypatch.setenv("TAVOTTO_OAUTH_CLIENT_ID_MINIMAX", "placeholder-not-a-real-client-id")
     ai_providers.store_oauth(
         ai_oauth._record_defaults("minimax", "cn"),
@@ -355,8 +355,10 @@ def test_oauth_record_prefers_the_cli_and_falls_back_to_the_builtin_executor(wor
     caps = _caps()
     c = _conn(caps, "minimax-oauth")
     assert c["vendor"] == "minimax" and c["method"] == "minimax:oauth"
-    assert c["state"] == "ready" and c["route"] == "cli:claude"
+    assert c["state"] == "ready" and c["route"] == "builtin"
     assert "tok-secret" not in json.dumps(caps)
+    config.set_ai_settings({"builtin_default": False})
+    assert _conn(_caps(), "minimax-oauth")["route"] == "cli:claude"
     world["cli"] = False  # 没装 CLI：账号登录的连接走内置执行器（Bearer 令牌）
     ai_bridge.invalidate_capabilities()
     c = _conn(_caps(), "minimax-oauth")
@@ -372,36 +374,43 @@ def _route(rec_id: str) -> str:
     return _conn(_caps(), rec_id)["route"]
 
 
-@pytest.mark.parametrize("agent", ["claude", "codex"])
+@pytest.mark.parametrize("agent,auth", [("claude", "key"), ("codex", "key"), ("claude", "oauth")])
 @pytest.mark.parametrize("cli", [True, False])
-@pytest.mark.parametrize("default_builtin", [False, True])
+@pytest.mark.parametrize("default_builtin", [None, False, True])
 @pytest.mark.parametrize("env", [None, "0", "1"])
-def test_routing_matrix(world, monkeypatch, agent, cli, default_builtin, env):
+def test_routing_matrix(world, monkeypatch, agent, auth, cli, default_builtin, env):
     base = "https://api.deepseek.com/anthropic" if agent == "claude" else "https://api.deepseek.com"
-    _save("k", agent=agent, base=base)
+    if auth == "oauth":
+        cid = _oauth_rec()["id"]
+    else:
+        _save("k", agent=agent, base=base)
+        cid = "k"
     world["cli"] = cli
     config.set_ai_settings({"builtin_default": default_builtin})
     if env is not None:
         monkeypatch.setenv(ai_connections.ENV_BUILTIN, env)
     ai_bridge.invalidate_capabilities()
+    # Subscription identity is independent of the Key/OAuth rollout and forced overrides.
+    assert ai_bridge.resolve_connection("sub:codex") == ("codex", None)
+    assert ai_bridge.resolve_connection("sub:claude") == ("claude", None)
     if env == "1":
         want = "builtin"
     elif env == "0":
         want = f"cli:{agent}" if cli else None
-    elif cli and not default_builtin:
+    elif cli and default_builtin is False:
         want = f"cli:{agent}"
     else:
         want = "builtin"
-    c = _conn(_caps(), "k")
+    c = _conn(_caps(), cid)
     if want is None:
         assert c["state"] == "error" and c["error"] == "cli_unavailable"
         with pytest.raises(ai_connections.ConnectionRefused) as ei:
-            ai_bridge.resolve_connection("k")
+            ai_bridge.resolve_connection(cid)
         assert ei.value.code == "ai_agent_not_usable"
         return
     assert c["route"] == want and c["state"] == "ready"
-    got_agent, rec = ai_bridge.resolve_connection("k")
-    assert got_agent == ("builtin" if want == "builtin" else agent) and rec["id"] == "k"
+    got_agent, rec = ai_bridge.resolve_connection(cid)
+    assert got_agent == ("builtin" if want == "builtin" else agent) and rec["id"] == cid
 
 
 def test_no_cli_means_the_builtin_executor_is_used_by_default(world):
@@ -409,6 +418,24 @@ def test_no_cli_means_the_builtin_executor_is_used_by_default(world):
     world["cli"] = False
     assert _route("k") == "builtin"
     assert ai_bridge.resolve_connection("k")[0] == "builtin"
+
+
+@pytest.mark.parametrize("agent", ["claude", "codex"])
+def test_api_key_defaults_to_builtin_and_preserves_explicit_cli_choice(world, agent):
+    base = "https://api.deepseek.com/anthropic" if agent == "claude" else "https://api.deepseek.com"
+    _save("key", agent=agent, base=base)
+    assert "builtin_default" not in config.ai_settings()
+    assert world["cli"] is True
+    assert _route("key") == "builtin"
+    assert ai_bridge.resolve_connection("key")[0] == "builtin"
+    config.set_ai_settings({"builtin_default": False})
+    ai_bridge.invalidate_capabilities()
+    assert _route("key") == f"cli:{agent}"
+    config.set_ai_settings({"builtin_default": None})
+    ai_bridge.invalidate_capabilities()
+    assert _route("key") == "builtin"
+    assert ai_bridge.resolve_connection("sub:codex") == ("codex", None)
+    assert ai_bridge.resolve_connection("sub:claude") == ("claude", None)
 
 
 def test_insecure_gateway_falls_back_to_the_cli_when_builtin_cannot_take_it(world):
@@ -425,7 +452,7 @@ def test_connection_resolves_to_its_own_provider_not_the_active_one(world):
     _save("b", base="https://api.moonshot.cn/anthropic")
     ai_providers.set_active("claude", "a")
     agent, rec = ai_bridge.resolve_connection("b")
-    assert (agent, rec["id"]) == ("claude", "b")
+    assert (agent, rec["id"]) == ("builtin", "b")
     assert ai_bridge.resolve_connection("sub:claude") == ("claude", None)
     assert ai_bridge.resolve_connection("sub:codex") == ("codex", None)
     with pytest.raises(ai_connections.ConnectionRefused) as ei:
@@ -447,7 +474,7 @@ def test_post_saves_a_key_connection_and_never_echoes_the_key(client, world, cap
     conn = body["connection"]
     assert body["ok"] is True and conn["state"] == "ready" and conn["vendor"] == "deepseek"
     assert conn["models"] == ["deepseek-v4-pro", "deepseek-flash", "other"]
-    assert conn["default_model"] == "deepseek-v4-pro" and conn["route"] == "cli:claude"
+    assert conn["default_model"] == "deepseek-v4-pro" and conn["route"] == "builtin"
     assert world["fetched"] == [
         ("https://api.deepseek.com/anthropic", KEY)
     ]  # 试取用的是去空白后的 Key
@@ -569,7 +596,7 @@ def test_post_accepts_a_loopback_gateway(client, world):
     conn = _post(
         client, vendor="custom", api_key=KEY, base_url="http://127.0.0.1:8123", wire="anthropic"
     ).get_json()["connection"]
-    assert conn["state"] == "ready" and conn["route"] == "cli:claude"
+    assert conn["state"] == "ready" and conn["route"] == "builtin"
 
 
 # --------------------------------------------------------------------------- DELETE / login
@@ -694,7 +721,7 @@ def test_run_with_a_connection_resolves_agent_endpoint_and_model(client, world, 
     ai_providers.set_active("claude", "other")  # 旧的 active 不参与
     assert _run_req(client, connection="a").status_code == 200
     call = project[-1]
-    assert (call["agent"], call["endpoint_id"], call["model"]) == ("claude", "a", "m2")
+    assert (call["agent"], call["endpoint_id"], call["model"]) == ("builtin", "a", "m2")
     # 请求里显式给的型号优先
     _run_req(client, connection="a", model="m1")
     assert project[-1]["model"] == "m1"
@@ -1193,6 +1220,7 @@ def _needs_cli_login(monkeypatch):
 
 
 def test_oauth_connection_does_not_depend_on_the_clis_own_login(world, monkeypatch, tmp_path):
+    config.set_ai_settings({"builtin_default": False})
     monkeypatch.setenv("TAVOTTO_OAUTH_CLIENT_ID_MINIMAX", "placeholder-not-a-real-client-id")
     _needs_cli_login(monkeypatch)
     ai_providers.store_oauth(
@@ -1683,7 +1711,9 @@ def test_builtin_converts_to_an_editable_script_through_the_normal_pipeline(
     # 采用：只新建兄弟脚本
     made = ai_convert.adopt(sid, str(figs.resolve()))
     assert made["name"] == "fig_matplotlib.py"
-    assert (figs / "fig_matplotlib.py").read_text(encoding="utf-8") == GOOD_MPL
+    assert (figs / "fig_matplotlib.py").read_bytes() == (
+        ai_convert.CONVERT_DIR / sid / "fig_matplotlib.py"
+    ).read_bytes()
     assert (figs / script).read_bytes() == orig.encode()
 
 
@@ -1807,6 +1837,7 @@ def test_official_key_connections_carry_efforts_on_the_builtin_route(client, wor
     assert o["efforts"] == LMH
     # 有 CLI 且 builtin_default=false：官方 Key 走 CLI + 注入，不给 Claude 之外的档位承诺
     world["cli"] = True
+    config.set_ai_settings({"builtin_default": False})
     ai_bridge.invalidate_capabilities()
     assert _conn(_caps(), a["id"])["route"] == "cli:claude"
 

@@ -301,6 +301,8 @@ USER_VISIBLE_CODES = {
     "convert_not_found": set(),
     "convert_not_ready": set(),
     "convert_source_changed": set(),
+    "convert_context_changed": set(),
+    "convert_reference_invalid": set(),
     "convert_project_changed": set(),
     "convert_candidate_changed": set(),
     "convert_outside_project": set(),
@@ -638,6 +640,11 @@ SCANNED = [n for n in _SOURCE_FILES if (SRC_DIR / n).is_file()]
 #: 分诊）。会话 guard 那几个的拒绝对象是攻击页面/畸形请求，正常界面路径由
 #: main.tsx 的专用启动页兜住；401 的 session_auth_required 另有 backend 文案。
 NON_UI_CODES = {
+    # Conversion-run diagnostics are mapped by ai_convert._failure_check to the
+    # existing UI reason run_failed; they are not HTTP response codes.
+    "capture_incomplete",
+    "convert_output_identity",
+    "preview_render_failed",
     "telemetry_rejected",
     "invalid_telemetry_event",
     "bad_nonce",

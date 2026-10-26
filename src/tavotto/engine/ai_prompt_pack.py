@@ -267,6 +267,26 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
         "原脚本画出的图片的参考副本：{reference}（只读）。让新图的尺寸、字号、配色、标注位置尽量与它一致。",
     ),
     "rules_heading": (frozenset(), "硬性要求："),
+    "acceptance": (
+        frozenset(),
+        "交付与验收顺序（所有来源语言共用）：先交付可运行的可编辑候选，再独立评价视觉保真。"
+        "先读入口与必要的项目数据/helper，完成整份代码，然后用 check 验证实际执行及全部输出；"
+        "缺 Python 包交给应用的依赖准备/确认/续跑，不删掉依赖对应的计算来绕过错误。"
+        "数据读取、计算定义、单位、分类顺序、数学含义、原始逻辑文字与出图数量必须保留；"
+        "真实数据缺失、科学方法无可靠对应时仍须明确请求输入，不能伪造数据或相似结果。"
+        "需要用户补充文件时，给出可直接执行的完整命令、运行位置和输出文件名；"
+        "命令必须实际写出所说的文件，只打印到控制台时须明确说明如何另存，不能声称已经导出文件。"
+        "补充输入的最终答复只保留缺什么、运行前提、完整命令和补充哪些文件，不重复展开已完成的转写分析。"
+        "视觉验收独立：沿用源码和已提供参考里的尺寸、字体、配色、布局及相机信息；"
+        "未提供的渲染器默认值、字形像素、刻度端点和抗锯齿不是可运行候选的前置条件。"
+        "这些未知项使用目标库的公开 API 和明确命名的默认值，在候选注释及最终回复中列出待核对差异；"
+        "不能把替代色表冒充原色表，也不能宣称已经逐像素或科学保真通过。"
+        "不要为消除边缘像素差反复重写已通过运行检查的代码，或自行复刻整个原生渲染器。"
+        "整份脚本已出图且没有已知数据、计算语义或缺页问题时，立即交付候选，"
+        "不要为写最终说明再开启一轮改写；有最终校验入口时使用它完成交付。"
+        "如果颜色/几何本身编码科学数据，须保留数据、归一化范围、类别映射和三维深度；"
+        "不能以视觉待核对为由改动这些含义。全部候选仍由用户查看对照并确认后采用。",
+    ),
     "rule_keep_data": (
         frozenset(),
         "1. 保留原脚本的数据读取与计算部分（读文件、拟合、统计……）原样沿用，只把「绘图」换成 Matplotlib。"
@@ -276,12 +296,17 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
     "rule_matplotlib": (
         frozenset(),
         "2. 图必须用 matplotlib 生成，并经 Figure.savefig(...) 落盘（沿用原脚本的输出文件名与格式）。"
+        "逐一保留原脚本的出图数量、独立页面和顺序，不把几张图合成一张子图，也不省略后续输出。"
+        "绘图可全部写在顶层，或放进 main() 并只由 if __name__ == '__main__': main() 启动；"
+        "不要在模块导入时无条件调用 main()，避免应用选择 main 入口时重复出图。"
         "禁止再用 PIL / OpenCV / plotly / ROOT 画布出图。",
     ),
     "rule_size": (
         frozenset(),
-        "3. 输出图幅（figsize × dpi）与字号尽量对齐原图。字体用字体族名（rcParams['font.family']），"
-        "不要用 FontProperties(fname=...) 指定字体文件。",
+        "3. 按已知信息设置输出图幅（figsize × dpi）、字号、文字位置；像素差异按独立视觉验收处理。原脚本指定了字体文件时，沿用该文件，"
+        "先用 font_manager.fontManager.addfont 注册，再用 FontProperties(fname=...).get_name() 读取真实族名，"
+        "绘制时按族名及原字重/样式选择字体，保留逐字形回退，不把 fname 属性绑定到绘制的文字。"
+        "字体路径相对原脚本位置解析，不写入临时候选目录的绝对路径；不要用近似字体或猜测字体度量替代已有字体。",
     ),
     "rule_scope": (
         frozenset(),
@@ -293,11 +318,30 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
         "Pillow → Matplotlib 对照（原脚本是 Pillow 直接画的；Pillow 的原点在左上角、y 向下，搬运时务必处理坐标翻转）：\n"
         "- ImageDraw.line / rectangle / ellipse / polygon → ax.plot / matplotlib.patches.Rectangle / Ellipse / Polygon；"
         "坐标翻转：画布像素坐标直接沿用，并设 ax.set_xlim(0, W); ax.set_ylim(H, 0)（或自行换算 y = H - y）。\n"
-        "- ImageDraw.text + ImageFont → ax.text；字号按 px 换算成 pt：pt = px × 72 / dpi。\n"
+        "- 像素坐标还要核对像素中心、包含端点的边界、线宽与绘制顺序：先 paste 后描边不能随意重排。"
+        "Matplotlib 的线条自动 snap 会再次对齐像素；若已显式做半像素定位，应核对并关闭重复对齐，"
+        "不能无依据给所有坐标加 0.5。用 check 返回的实际像素图检查一像素线与网格交点。\n"
+        "- ImageDraw.text + ImageFont → ax.text；字号按 px 换算成 pt：pt = px × 72 / dpi。"
+        "保留原 anchor 的含义：横排默认 la 是 left-ascender，不等于可见字形的左上角，不能直接换成 va='top'。"
+        "用原字体的 getmetrics / getbbox 或 textbbox 测量基线与字形偏移，再定位 Matplotlib 文字；"
+        "横排单行文字可比较同一文本在原 anchor 和 ls（left-baseline）下的 getbbox，"
+        "x/y 两方向都用对应边界的差恢复基线原点，不能只用 getlength 的浮点 advance 猜整数锚点位置。"
+        "同一字体文件、字号和基线仍可能因 shaping/kerning、hinting 和亚像素取整产生字形像素差，"
+        "这些差异单独记为待视觉核对，不为贴图任意平移或拆分原文。"
+        "必须保留原字形与阅读顺序，不得用禁用原 shaping、换字体或嵌入字形位图来消除像素差。"
+        "阿拉伯连写、双向文字、组合附标及 OpenType 联字须保留完整逻辑文本 run；不反转字符串，"
+        "不按字符分别测量排版，也不把已塑形的显示字符串再次交给 shaping。"
+        "先核对目标 Matplotlib 的实际文本塑形能力：支持时用完整 Text 及公开的 fontfeatures/language 属性"
+        "保留原 features 和语言；不能假定所有版本支持这些参数，或把参数被接受当成排版保真。"
+        "原 direction、anchor 与混合文字阅读顺序也须从实际渲染核对。缺少必要塑形能力时请求兼容环境，"
+        "说明所缺能力和验证命令，不能静默降成逐字绘制。"
+        "允许 Pillow 读取图片和测量字体，但文字与形状仍须是 Matplotlib 可编辑对象，不能先画成位图再嵌入。\n"
         "- Image.new((w, h), color) → fig = plt.figure(figsize=(w / dpi, h / dpi), dpi=dpi)，背景色设到 figure / axes，"
         'ax.axis("off")，fig.subplots_adjust(0, 0, 1, 1)，让坐标轴铺满整张图。\n'
         "- 已有照片 / Image.open / paste → ax.imshow(np.asarray(img), extent=...)，extent 按像素位置给。\n"
-        "- 遇到没有可靠对应的 Pillow 操作（滤镜、混合模式、复杂变换……）：不要近似替换。此时停下，"
+        "- 原始照片的 crop/resize/rotate、滤镜、透明度蒙版与混合仍可用 Pillow 处理像素后 imshow，"
+        "保留实际参数；这不等于把文字/形状或整张成品图栅格化后当成可编辑转换。"
+        "只有无法保留计算/内容语义或必要可编辑对象时停下，"
         "你的回答第一行写 `TAVOTTO_NEEDS_INPUT: ` 紧跟一句话说清是哪一步换不了、为什么，并且不要写任何新文件。",
     ),
     "note": (
@@ -315,7 +359,11 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
     "rule_foreign_steps": (
         frozenset(),
         "1. 按原脚本的顺序逐步搬运：读数据 → 整理 / 筛选 / 分组 → 统计与拟合 → 绘图。数据文件沿用原脚本里的路径写法"
-        "（相对路径照旧）；每一步用 Python 里最直接、可核对的对应物，不要“顺便优化”或改动计算的科学含义。",
+        "（相对路径照旧）；每一步用 Python 里最直接、可核对的对应物，不要“顺便优化”或改动计算的科学含义。"
+        "先读提供的本地 helper 定义再转写；逐项核对默认参数、分位数定义、样本/总体方差、缺失值、"
+        "筛选和汇总的先后次序、分类水平及图例顺序，不能假定同名函数默认等价。"
+        "数学标注、求和上下限、坐标轴、透明度及二维/三维几何也保留原语义；"
+        "check 通过只说明新脚本可运行和出图，不证明计算或图像保真。",
     ),
     "rule_foreign_mapping_r": (
         frozenset(),
@@ -325,7 +373,26 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
         "ggplot 的 geom_point / geom_line / geom_col / geom_errorbar / geom_boxplot / geom_histogram → ax.scatter / plot / bar / errorbar / boxplot / hist；"
         'geom_smooth(method = "loess") → statsmodels.nonparametric.smoothers_lowess.lowess（把 span 对应到 frac，并在代码注释里写明）；'
         "facet_wrap / facet_grid → plt.subplots 的多个子图；scale_*_log10 → ax.set_xscale / set_yscale('log')；"
-        "ggsave(width, height, dpi) → figsize 与 dpi（英寸）。",
+        "ggsave(width, height, dpi) → figsize 与 dpi（英寸）。"
+        "CSV 只保留分类标签，通常不保留 R factor 的 levels、ordered 属性和未出现的水平；"
+        "不能凭数据集名称、标签字母序或出现顺序猜原 factor 顺序。若原脚本依赖这些属性，"
+        "先读取项目提供的元数据；缺失时用 TAVOTTO_NEEDS_INPUT 请求原 R 对象的 levels/is.ordered，"
+        "给出针对该变量的 base::dput(..., file='metadata.txt') 导出命令，"
+        "数据用 utils::write.csv 导出；只用函数实际所属的命名空间（writeLines 属于 base，不属于 utils）。"
+        "让用户把实际输出的文件作为参考补充后再转写。"
+        "boxplot.stats 使用 fivenum 的 Tukey hinges，并非所有样本量都等于默认 quantile；"
+        "离群点判断只调整两端 whisker，不剔除后重算中位数、hinges 或 conf；"
+        "conf 使用原非缺失样本数和原 hinges 的 IQR，保留原公式与计算顺序。"
+        "plotmath 要翻译实际显示的表达式，不能按源码字符串猜：函数调用中 `name=value` 是参数标签，"
+        "标签本身不成为显示的数学等式，`name==value` 才是等式表达式；求和/乘积/积分的上下限只取实际操作数。"
+        "保留 plain/italic/bold、上下标、分式、间距及括号语义，不能补入原图没有的变量或下限；"
+        "plotmath 的默认字形跟随 R 当前 font/family，不能套用 TeX 默认全斜体。"
+        "核对 frac/over/atop 的实际字号和 display/text/script style；Matplotlib 的 \\frac 常会缩小操作数，"
+        "需要全尺寸时使用 \\dfrac 或指定 style 的 \\genfrac。phantom 保留被隐藏表达式的实际宽、高和深度，"
+        "不能用几个空格替代，分数线也不能丢掉；用普通可编辑 Text/Line/Patch 组合，不能只在自定义 Artist.draw 中临时画字。"
+        "使用 Matplotlib 支持的 mathtext 语法，并检查每页实际渲染。"
+        "R 的颜色名按 col2rgb 解析，不能直接交给 Matplotlib 同名颜色：例如 grey/gray 是 #BEBEBE，"
+        "green 是 #00FF00，grey50 是 #7F7F7F；数字颜色还取决于 R 的当前 palette。",
     ),
     "rule_foreign_mapping_matlab": (
         frozenset(),
@@ -334,13 +401,36 @@ _CONVERT_TEMPLATES: dict[str, tuple[frozenset[str], str]] = {
         "xlabel / ylabel / title / legend / xlim / ylim / grid → ax.set_xlabel / set_ylabel / set_title / legend / set_xlim / set_ylim / grid；"
         "subplot / tiledlayout → plt.subplots；polyfit / polyval → numpy.polyfit / polyval；"
         "fitlm → statsmodels.formula.api.ols；linspace / meshgrid → numpy 同名函数；"
-        "MATLAB 的下标从 1 开始、矩阵按列优先、`.^` `.*` 是逐元素运算——搬运时逐处核对下标与形状。",
+        "MATLAB 的下标从 1 开始、矩阵按列优先、`.^` `.*` 是逐元素运算——搬运时逐处核对下标与形状。"
+        "颜色不能直接照抄同名快捷色：MATLAB 的 g/green 是 RGB(0,1,0)，不同于 Matplotlib 的 g；"
+        "线条颜色顺序、每个 axes 的 colormap、LUT 行数、CLim、CDataMapping 及 alpha 均要独立保留。"
+        "自动 CLim 取实际被绘图对象用于映射的 CData 范围；等高线按其实际绘制的 level 着色，不能直接拿全部 Z 矩阵的极值。"
+        "保留三维对象的 XData/YData/ZData 和投影：即使原图使用俯视图，也不能把 ZData 换成二维 zorder 或删掉高度维。"
+        "布局与相机使用源码/参考已知的 figure/axes Units/Position、View/Projection、"
+        "DataAspectRatio/PlotBoxAspectRatio 和相机信息；缺少原生自动布局事实时用目标库公开默认值并列为待核对。"
+        "MATLAB 的 stretch-to-fill 与 Matplotlib Axes3D viewport 不等价，不把相近布局称为精确匹配。"
+        "MATLAB 与 Matplotlib 的方位角零点不同；普通 z-up 视图的 Matplotlib azim=MATLAB azimuth-90，"
+        "自定义相机/反向坐标轴则应从实际方向与 up vector 求变换。二维 pcolor 不要擅自设 equal aspect。"
+        "画幅优先采用参考文件的实际宽高；屏幕 Position、points 和导出 dpi 不混为同一量。"
+        "保留显式 FontName/FontSize/FontUnits、TickDir/TickLength、网格及曲面 FaceColor/EdgeColor/alpha。"
+        "先用 Axes3D/Poly3DCollection 等常规对象保留 XYZ、拓扑和深度遮挡，不为匹配刻度像素改写投影或自制 painter。"
+        "flat 面色的首顶点规则与四角平均不同；原生三角化、边线覆盖、字体像素和抗锯齿差异单独列出，"
+        "不能以关闭抗锯齿、模糊整图或栅格贴图掩盖差异。"
+        "默认色表随 MATLAB 版本变化（R2019b 起默认长度 256，之前 64；parula 本身也有版本差异），"
+        "优先使用项目提供的原始 RGB 数组/运行时信息，不能用几枚控制点、viridis 或近似色表冒充原始 parula；"
+        "无法确定原始色表时，不为外观默认值阻塞候选；明确使用的是哪种目标色表并列为待核对，"
+        "保留原 CData、CLim 和 colorbar 数值，不能谎称 parula 已精确复现。"
+        "可请用户在原 MATLAB 图窗口中用 version('-release') 和 cmap=colormap(ax) 获取版本和实际 axes 色表，"
+        "再用 writematrix(cmap,'colormap.csv') 导出；ax 必须是原图对应坐标轴，多 axes 分别导出，不能用全局默认值替代。",
     ),
     "rule_foreign_needs_input": (
         frozenset(),
-        "3. 遇到 Python 里没有可靠逐一对应的统计方法或函数（例如特定的混合效应模型、专用的非参数检验、某个包独有的拟合器），"
+        "3. 缺少数据或计算语义必需的输入，或 Python 里没有可靠逐一对应的统计方法或函数"
+        "（例如特定的混合效应模型、专用的非参数检验、某个包独有的拟合器），"
         "不要用近似方法替换，也不要编一个相似的结果。此时停下：你的回答第一行写 `TAVOTTO_NEEDS_INPUT: ` 紧跟一句话，"
-        "说清是哪一步（原脚本里的函数名）换不了、为什么；并且不要写任何新文件。",
+        "说清是哪一步（原脚本里的函数名）换不了、缺少什么证据或可靠实现、下一步如何获取；不要写替代结果。"
+        "若在已写草稿或 check 后才发现，也必须用这个标记结束；草稿可运行不能把未解决的语义差异变成成功。"
+        "只有视觉默认值或像素差异未知时，按共同验收顺序交付候选并说明，不使用此阻断标记。",
     ),
     "fix_no_matplotlib": (
         frozenset({"target"}),
@@ -388,10 +478,11 @@ _FOREIGN_NAMES = {"r": "R", "matlab": "MATLAB"}
 
 
 def convert_requirements() -> list[str]:
-    """convert 任务里与「谁来执行」无关的三条硬性要求（保留数据与计算 / 必须 Matplotlib 出图 / 图幅字号对齐）。
+    """convert 任务里与执行器无关的验收顺序与要求；运行通过不代表视觉保真。
 
     CLI 提示词（`convert_prompt`）与内置执行器（`agent_runner` 的 convert 系统提示）共用这一份文字，不各抄一份。"""
     return [
+        _convert_render("acceptance"),
         _convert_render("rule_keep_data"),
         _convert_render("rule_matplotlib"),
         _convert_render("rule_size"),
@@ -425,6 +516,7 @@ def convert_prompt(
     lines += ["", _convert_render("rules_heading")]
     if foreign:
         lines += [
+            _convert_render("acceptance"),
             _convert_render("rule_foreign_steps"),
             _convert_render(f"rule_foreign_mapping_{source_language}"),
             _convert_render("rule_foreign_needs_input"),

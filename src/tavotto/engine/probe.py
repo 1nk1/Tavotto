@@ -134,7 +134,7 @@ def _error_from_worker(
     映射是收敛的：缺包与超时各有可执行出口（换环境 / 检查死循环），单独
     成码；会话被中途终止（脚本在探测期间被改、workerd 会话被回收）是
     execution_cancelled；其余一律 script_probe_failed——绝大多数是脚本自己
-    的问题，worker 侧的细分 code（如 script_error）留在 params 里备查。
+    的问题，worker 侧的细分 code（如 script_error）留在 params.worker_code 里备查。
     """
     reason = _short(str(exc), exc.traceback_text)
     if exc.code == "missing_dependency":
@@ -261,7 +261,7 @@ def _error_from_worker(
             return _err(
                 ERROR_PROBE_FAILED,
                 f"试运行失败（入口 {entry}）：{exc}",
-                params={"entry": entry, "reason": str(exc)},
+                params={"entry": entry, "reason": str(exc), "worker_code": exc.code},
                 traceback_text=exc.traceback_text,
             )
         return _err(
@@ -277,6 +277,16 @@ def _error_from_worker(
         params={"entry": entry, "reason": reason, "worker_code": str(exc.code or "")},
         traceback_text=exc.traceback_text,
     )
+    if exc.code == "write_outside_roots":
+        # Worker-owned, already relativized evidence; consumers must not parse
+        # localized advice or replay advice for a different execution scope.
+        extra = getattr(exc, "extra", None) or {}
+        if isinstance(extra, dict):
+            out["params"]["write_violation"] = {
+                key: extra[key][:limit]
+                for key, limit in (("path", 512), ("event", 64))
+                if isinstance(extra.get(key), str)
+            }
     # C++ 读取器找不到数据（ADR 0110 §一）：码照旧是「试运行失败」，载荷原样带出——素材库弹同一个
     # 「指认数据位置」对话框（`pool._offer_missing_input` 只在对上脚本里一串常量时挂）
     offer = getattr(exc, "missing_input", None)

@@ -1275,6 +1275,16 @@
         "no_matplotlib_figure": "The generated script ran but drew no Matplotlib figure",
         "run_failed": "The generated script failed to run",
         "no_matplotlib_import": "The generated script doesn’t use Matplotlib",
+        "raster_drawing": "The generated script still paints text or shapes as pixels",
+        "agent_output_truncated": "The model reached its response limit before finishing the script. No candidate was adopted.",
+        "agent_budget": "The conversion reached its time or token limit. No candidate was adopted.",
+        "agent_network": "The model service request failed. You can retry.",
+        "agent_auth": "The model credential is invalid or expired. Check the AI connection.",
+        "agent_quota": "The model service has no available quota or is rate limited.",
+        "agent_refused": "The model declined this conversion.",
+        "agent_max_turns": "The conversion reached its step limit.",
+        "agent_tool_error_loop": "The conversion stopped after repeated tool errors.",
+        "agent_internal": "The conversion executor encountered an error. You can review and send a private report.",
         "target_missing": "The assistant didn’t write the new script",
         "syntax_error": "The generated script has a syntax error",
         "other_file_changed": "The assistant changed files it shouldn’t have, so it was discarded",
@@ -1286,6 +1296,7 @@
         "needs_input": "One step in this script has no reliable Python equivalent, so no new version was made",
         "needs_input_reason": "No new version was made: {{reason}}",
         "convert_source_changed": "The original script changed in the meantime, so this new version was written against an older one. Please generate it again",
+        "convert_context_changed": "Resources used for this conversion changed. Generate it again.",
         "convert_project_changed": "Project files changed in the meantime. Please generate it again",
         "convert_candidate_changed": "The new version's file was modified. Please generate it again",
         "resume_unreachable": "Can’t connect right now. Try again in a moment",
@@ -1324,6 +1335,12 @@
           "continue": "Continue",
           "chooseEnv": "Choose a runtime environment"
         }
+      },
+      "references": {
+        "label": "Additional reference files",
+        "placeholder": "One project-relative path per line",
+        "disclosure": "When you retry, these files will be provided to your selected AI as references.",
+        "retry": "Retry with references"
       }
     },
     "envNotUsed": {
