@@ -1693,7 +1693,10 @@ def test_desktop_live_modes_are_a_closed_set_of_host_extension_cells():
     assert t.modes == A.DESKTOP_LIVE_MODES == tuple(A.DESKTOP_LIVE)
     assert t.networks == ("direct",) and t.needs_model_conf  # --network 不开放；要一次性模型凭据
     for cell in A.DESKTOP_LIVE.values():
-        assert cell.host in A.DESKTOP_HOSTS and cell.extension in A.DESKTOP_EXTENSIONS
+        assert cell.host in A.DESKTOP_HOSTS
+        assert (
+            cell.extension in A.DESKTOP_EXTENSIONS
+        ) != cell.native  # 要么装扩展，要么用宿主自己的 Agent
     assert A.validate_test_args(t, [], None, "direct", mode="vscode-claude") is None
     for ok in ("cursor-claude", "trae-claude"):
         assert A.validate_test_args(t, [], None, "direct", mode=ok) is None
@@ -2400,7 +2403,7 @@ def test_host_cli_is_found_only_inside_the_install_dir_for_each_vscode_like_host
 
 def test_each_desktop_live_cell_opens_the_panel_through_its_own_host_url_scheme(tmp_path):
     for mode, cell in A.DESKTOP_LIVE.items():
-        assert A.DESKTOP_HOSTS[cell.host].vscode_like, mode
+        assert A.DESKTOP_HOSTS[cell.host].vscode_like or cell.native, mode
     # Cursor 打开扩展 URI 前弹模态确认框：只走命令面板
     assert A.DESKTOP_HOSTS["vscode"].url_scheme == "vscode"
     assert A.DESKTOP_HOSTS["cursor"].url_scheme == ""
@@ -2506,3 +2509,222 @@ def test_native_probe_that_aborts_after_the_window_is_an_error_not_a_passed_prob
     run_dir.mkdir()
     res = A.run_desktop_hosts_task(lab, "rid", run_dir, {}, "zcode", native=True)
     assert res["result"] == "error" and "aborted" in res["summary"]
+
+
+# --- ZCode 原生 Agent：落盘例外 ---------------------------------------------------
+def test_zcode_key_goes_only_into_provider_config_and_mcp_points_at_the_recorder(tmp_path):
+    key = "sk-" + "k" * 32
+    conf = {
+        "api_key": key,
+        "base_url": "https://api.deepseek.com/anthropic",
+        "provider": "deepseek",
+    }
+    zdata, proj = tmp_path / "zdata", tmp_path / "proj"
+    proj.mkdir()
+    pc = A.zcode_isolated_config(
+        zdata, proj, ["py", "rec.py", "log", "--", "py", "server.py"], {"X": "1"}, conf
+    )
+    assert key in pc.read_text(encoding="utf-8")
+    p = json.loads(pc.read_text(encoding="utf-8"))["config"]["providerConfigRules"][
+        "providerRules"
+    ][0]
+    assert p["config"]["api"] == {
+        "type": "anthropic-messages",
+        "baseUrl": "https://api.deepseek.com/anthropic/v1",
+    }
+    for f in (
+        proj / ".zcode" / "config.json",
+        zdata / ".zcode" / "cli" / "config.json",
+        zdata / ".zcode" / "workspace" / "default" / ".zcode" / "config.json",
+    ):
+        txt = f.read_text(encoding="utf-8")
+        assert key not in txt  # 运行配置（含 MCP）里没有 key
+        run = json.loads(txt)
+        srv = run["mcp"]["servers"]["tavotto"]
+        assert srv["type"] == "stdio" and srv["command"] == "py" and srv["args"][0] == "rec.py"
+        assert {"Bash", "Write", "Edit", "WebFetch"} <= set(run["permission"]["disallowedTools"])
+        assert run["permission"]["allowedTools"] == []  # 没给工具名就不放行任何东西
+    # 只有 provider_config.json 一个文件含 key
+    assert A._files_containing([tmp_path], key.encode()) == ([pc], [])
+
+
+def test_ondisk_key_is_wiped_and_any_residual_fails_the_run(tmp_path, monkeypatch):
+    key = "sk-" + "w" * 32
+    run_dir = tmp_path / "run"
+    conf = {"api_key": key, "base_url": "https://x/anthropic"}
+    proj = run_dir / "work" / "project"
+    proj.mkdir(parents=True)
+    A.zcode_isolated_config(run_dir / "work" / "zdata", proj, ["py"], {}, conf)
+    (run_dir / "evidence").mkdir()
+    (run_dir / "evidence" / "log.txt").write_text(f"echo {key}", encoding="utf-8")
+    appdata = tmp_path / "appdata"
+    (appdata / "ZCode" / "Local Storage").mkdir(parents=True)
+    (appdata / "ZCode" / "Local Storage" / "leveldb.log").write_bytes(b"x" + key.encode())
+    env = {"APPDATA": str(appdata), "LOCALAPPDATA": str(tmp_path / "none")}
+    res = A.wipe_ondisk_key(run_dir, env, key)
+    assert res["wiped"] is True and res["checked_app_dirs"] == ["ZCode"]
+    assert A._files_containing([run_dir, appdata], key.encode()) == ([], [])
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="winlab.py 是 Mac 端入口：密钥文件的 0600 权限位检查只在 POSIX 上有意义"
+)
+def test_ondisk_modes_use_their_own_dedicated_key_file_and_never_fall_back(tmp_path, monkeypatch):
+    assert W.ONDISK_MODES == A.DESKTOP_LIVE_ONDISK_MODES
+    default = tmp_path / "model.json"
+    default.write_text("{}")
+    default.chmod(0o600)
+    monkeypatch.setattr(W, "MODEL_CONF_PATH", default)
+    monkeypatch.setattr(W, "MODEL_CONF_ONDISK_PATH", tmp_path / "model-ondisk.json")
+    assert W.load_model_secret("vscode-claude") == b"{}"
+    assert W.load_model_secret("zcode-native") is None  # 专用 key 没录：不跑，不拿默认那把凑数
+
+
+def test_native_onboarding_never_clicks_continue_connect_or_login():
+    for b in D.NATIVE_ONBOARDING_BUTTONS:
+        assert not re.search(r"continue|connect|sign|log ?in|登录|授权", b, re.I), b
+    assert (
+        "Skip for now" in D.NATIVE_ONBOARDING_BUTTONS
+        and "Use API key" in D.NATIVE_ONBOARDING_BUTTONS
+    )
+
+
+def test_tavotto_tool_names_come_from_the_server_handlers_table():
+    names = A.tavotto_tool_names(ROOT / "codex-plugin" / "mcp")
+    assert (
+        "tavotto_health" in names
+        and "tavotto_open_figure" in names
+        and "tavotto_close_session" in names
+    )
+    assert len(names) == len(set(names)) >= 8
+
+
+def test_driver_stops_waiting_when_the_host_shows_a_permission_prompt(tmp_path, monkeypatch):
+    """run 20261026T154420Z-ca5927：ZCode 的权限框没人点，驱动器干等到 1200 s 上限。"""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(D.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(D.time, "sleep", lambda s: clock.__setitem__("t", clock["t"] + s))
+    rec = tmp_path / "rec.jsonl"
+    rec.write_text("a\nb\n", encoding="utf-8")
+    reason, _ = D.wait_quiet(
+        rec, 1, 45, 1200, 300, lambda: True, lambda: True, lambda: clock["t"] > 10
+    )
+    assert reason == "permission_prompt" and clock["t"] < 20
+    assert D.PERMISSION_PROMPT_RE.search(
+        "MCP Tavotto Health\n\nPermission required\n\nAwaiting approval"
+    )
+
+
+def test_wipe_scans_large_files_and_counts_unreadable_ones_as_not_verified(tmp_path, monkeypatch):
+    """Codex #1439：超过 64 MiB 的文件、读不了的文件都不能算「没有 key」。"""
+    key = "sk-" + "L" * 32
+    chunk = 1 << 20
+    big = tmp_path / "big.bin"
+    with open(big, "wb") as f:
+        f.write(b"\0" * chunk * 3)
+        f.write(b"x" * (chunk - 5) + key.encode())  # 跨块边界
+    assert A._files_containing([tmp_path], key.encode()) == ([big], [])
+    run_dir = tmp_path / "run"
+    (run_dir / "work").mkdir(parents=True)
+    locked = run_dir / "work" / "locked.bin"
+    locked.write_bytes(b"x")
+    real = A._file_contains
+
+    def fake(f, n, **k):
+        if f == locked:
+            raise OSError("locked")
+        return real(f, n, **k)
+
+    monkeypatch.setattr(A, "_file_contains", fake)
+    res = A.wipe_ondisk_key(run_dir, {"APPDATA": str(tmp_path / "none")}, key)
+    assert res["wiped"] is False and res["unreadable"] == [str(Path("work") / "locked.bin")]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="winlab.py 是 Mac 端入口（POSIX 权限位）")
+def test_default_and_ondisk_keys_must_differ_in_either_order(tmp_path, monkeypatch):
+    import getpass
+
+    monkeypatch.setattr(W, "MODEL_CONF_PATH", tmp_path / "model.json")
+    monkeypatch.setattr(W, "MODEL_CONF_ONDISK_PATH", tmp_path / "model-ondisk.json")
+    same = "sk-" + "s" * 32
+    monkeypatch.setattr(getpass, "getpass", lambda prompt="": same)
+    assert W.secret_init("deepseek", ondisk=True) == 0
+    assert W.secret_init("deepseek") == 2  # 后录默认那把、填了同一个 → 拒收
+    # 手工把两个文件改成同一把：落盘那格照样不跑
+    (tmp_path / "model.json").write_text(json.dumps({"api_key": same}))
+    (tmp_path / "model.json").chmod(0o600)
+    assert W.load_model_secret("zcode-native") is None
+
+
+def test_wipe_keeps_going_when_one_run_file_cannot_be_rewritten(tmp_path, monkeypatch):
+    """Codex #1439：run 目录里有个文件写不回去时，应用数据目录里的副本照样要删，结果如实 wiped=False。"""
+    key = "sk-" + "R" * 32
+    run_dir = tmp_path / "run"
+    (run_dir / "evidence").mkdir(parents=True)
+    stuck = run_dir / "evidence" / "stuck.log"
+    stuck.write_text(key, encoding="utf-8")
+    appdata = tmp_path / "appdata"
+    (appdata / "ZCode").mkdir(parents=True)
+    copy = appdata / "ZCode" / "state.json"
+    copy.write_text(key, encoding="utf-8")
+    real = Path.write_bytes
+
+    def fake(self, data):
+        if self == stuck:
+            raise PermissionError("read-only")
+        return real(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", fake)
+    res = A.wipe_ondisk_key(run_dir, {"APPDATA": str(appdata)}, key)
+    assert not copy.exists()  # 应用数据里的副本删掉了
+    assert res["wiped"] is False and res["residual"] == [str(Path("evidence") / "stuck.log")]
+
+
+def test_ondisk_key_is_wiped_even_when_the_uninstaller_raises(tmp_path, monkeypatch):
+    """Codex #1439：最后的卸载抛异常时，provider_config.json 里的 key 也不能留在盘上。"""
+    f = _FakeLive(monkeypatch, tmp_path)
+    key = "sk-" + "u" * 32
+    f.conf = {"api_key": key, "provider": "deepseek", "base_url": "https://x/anthropic"}
+    zdata_pc = tmp_path / "run" / "work" / "zdata" / ".zcode" / "v2" / "provider_config.json"
+
+    def body(*a, **k):
+        zdata_pc.parent.mkdir(parents=True, exist_ok=True)
+        zdata_pc.write_text(key, encoding="utf-8")
+        return {"result": "passed", "summary": "ok"}
+
+    calls = {"n": 0}
+
+    def uninstall(*a):
+        calls["n"] += 1
+        if calls["n"] > 1:  # 第一次是 preexisting 清理；第二次是收尾
+            raise PermissionError("uninstaller would not start")
+        return {"ok": True, "steps": []}
+
+    monkeypatch.setattr(A, "_desktop_live_body", body)
+    monkeypatch.setattr(A, "uninstall_desktop_host", uninstall)
+    monkeypatch.setattr(A, "_zcode_app_dirs", lambda env: [])
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    with pytest.raises(PermissionError):
+        A.run_desktop_live_task(f.lab, "rid", run_dir, {}, f.conf, "zcode-native")
+    assert not zdata_pc.exists()
+
+
+def test_stale_provider_configs_from_killed_runs_are_swept_before_the_next_run(tmp_path):
+    runs = tmp_path / "runs"
+    old = (
+        runs
+        / "20261026T000000Z-aaaaaa"
+        / "work"
+        / "zdata"
+        / ".zcode"
+        / "v2"
+        / "provider_config.json"
+    )
+    old.parent.mkdir(parents=True)
+    old.write_text("{}")
+    keep = runs / "20261026T000000Z-aaaaaa" / "evidence" / "x.txt"
+    keep.parent.mkdir(parents=True)
+    keep.write_text("x")
+    assert A.sweep_stale_ondisk_configs(runs) == ["20261026T000000Z-aaaaaa"]
+    assert not old.exists() and keep.exists()

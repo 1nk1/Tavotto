@@ -462,35 +462,71 @@ MODEL_CONF_PATH = Path(
     os.environ.get("TAVOTTO_WINLAB_MODEL_SECRET", "~/.config/tavotto-winlab/model.json")
 ).expanduser()
 MODEL_PROVIDERS = {"deepseek": "https://api.deepseek.com/anthropic"}
+#: 宿主只能从明文配置文件读 key 的那几格（ZCode）用**另一把**专用、限额的 key：用户 2026-10-26 同意这一处落盘例外，
+#: 与 hosts-live / 其余 desktop-live 的那把分开，缺了就不跑，绝不退回用默认那把
+MODEL_CONF_ONDISK_PATH = MODEL_CONF_PATH.with_name("model-ondisk.json")
+#: 要用落盘专用 key 的 desktop-live 模式（与 agent.DESKTOP_LIVE_ONDISK_MODES 一致，测试核对）
+ONDISK_MODES = ("zcode-native",)
 
 
-def load_model_secret() -> bytes | None:
-    """真实模型调用的凭据：本机 0600 文件，经 stdin 交给 Lab 的那一次运行，Lab 不落盘、不打印。"""
-    if not MODEL_CONF_PATH.exists():
+def model_conf_path(mode: str | None) -> Path:
+    return MODEL_CONF_ONDISK_PATH if mode in ONDISK_MODES else MODEL_CONF_PATH
+
+
+def _stored_key(path: Path) -> str | None:
+    try:
+        return json.loads(path.read_text()).get("api_key") or None
+    except (OSError, ValueError):
+        return None
+
+
+def load_model_secret(mode: str | None = None) -> bytes | None:
+    """真实模型调用的凭据：本机 0600 文件，经 stdin 交给 Lab 的那一次运行。除 ONDISK_MODES 外 Lab 不落盘、不打印。"""
+    path = model_conf_path(mode)
+    if not path.exists():
+        flag = " --ondisk" if mode in ONDISK_MODES else ""
         print(
-            f"missing {MODEL_CONF_PATH}: run `python3 scripts/winlab/winlab.py secret-init deepseek` in your own terminal",
+            f"missing {path}: run `python3 scripts/winlab/winlab.py secret-init deepseek{flag}` in your own terminal",
             file=sys.stderr,
         )
         return None
-    if MODEL_CONF_PATH.stat().st_mode & 0o077:
-        print(f"{MODEL_CONF_PATH} must be chmod 600", file=sys.stderr)
+    if path.stat().st_mode & 0o077:
+        print(f"{path} must be chmod 600", file=sys.stderr)
         return None
-    return MODEL_CONF_PATH.read_bytes()
+    if mode in ONDISK_MODES and _stored_key(path) == _stored_key(MODEL_CONF_PATH):
+        # 文件被手工改成同一把也不行：会落盘的只能是那把专用限额 key
+        print(
+            f"{path} holds the same key as {MODEL_CONF_PATH}; refusing to write it to disk",
+            file=sys.stderr,
+        )
+        return None
+    return path.read_bytes()
 
 
-def secret_init(provider: str) -> int:
-    """在用户自己的终端里录入（getpass 不回显），写 0600 文件；值从不进聊天或命令行参数。"""
+def secret_init(provider: str, ondisk: bool = False) -> int:
+    """在用户自己的终端里录入（getpass 不回显），写 0600 文件；值从不进聊天或命令行参数。
+    `--ondisk`：录的是给 ONDISK_MODES 用的那把专用限额 key（会在 Lab 上短暂落盘），存另一个文件。"""
     import getpass
 
-    key = getpass.getpass(f"{provider} API key (input hidden): ").strip()
+    path = MODEL_CONF_ONDISK_PATH if ondisk else MODEL_CONF_PATH
+    label = f"{provider} API key{' (dedicated, capped; written to disk on the Lab for ZCode)' if ondisk else ''}"
+    key = getpass.getpass(f"{label} (input hidden): ").strip()
     if not key:
         return 2
-    MODEL_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(MODEL_CONF_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # 两把必须不同，不论先录哪一把（Codex #1439：只在 --ondisk 时比会漏掉「后录默认那把、填了同一个」）
+    other = MODEL_CONF_PATH if ondisk else MODEL_CONF_ONDISK_PATH
+    if _stored_key(other) == key:
+        print(
+            "refused: the default key and the on-disk (ZCode) key must be different — create a separate capped key",
+            file=sys.stderr,
+        )
+        return 2
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         json.dump({"provider": provider, "base_url": MODEL_PROVIDERS[provider], "api_key": key}, f)
-    os.chmod(MODEL_CONF_PATH, 0o600)
-    print(f"saved to {MODEL_CONF_PATH} (0600)")
+    os.chmod(path, 0o600)
+    print(f"saved to {path} (0600)")
     return 0
 
 
@@ -741,6 +777,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("stop")
     si = sub.add_parser("secret-init", help="（在你自己的终端里）录入真实模型调用的 API key")
     si.add_argument("provider", choices=sorted(MODEL_PROVIDERS))
+    si.add_argument(
+        "--ondisk", action="store_true", help="ZCode 那几格用的专用限额 key（会在 Lab 上短暂落盘）"
+    )
     a = sub.add_parser("admin")
     asub = a.add_subparsers(dest="admin_verb", required=True)
     b = asub.add_parser("bootstrap")
@@ -787,7 +826,7 @@ def main(argv: list[str] | None = None) -> int:
                 return rc
         stdin = None
         if task.needs_model_conf:
-            stdin = load_model_secret()
+            stdin = load_model_secret(ns.mode)
             if stdin is None:
                 return 3
         argv = ["test", ns.task, "--network", network]
@@ -803,7 +842,7 @@ def main(argv: list[str] | None = None) -> int:
             argv += ["--mode", ns.mode]
         return show(*remote_json(argv, stdin=stdin))
     if ns.verb == "secret-init":
-        return secret_init(ns.provider)
+        return secret_init(ns.provider, ns.ondisk)
     if ns.verb == "admin":
         if ns.admin_verb == "bootstrap":
             return admin_bootstrap(ns.with_build_tools)
