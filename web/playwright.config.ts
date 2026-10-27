@@ -14,7 +14,8 @@ import { defineConfig, devices } from '@playwright/test'
 export default defineConfig({
   testDir: './e2e',
   // Agent 专用长时间性能基准由 playwright.perf.config.ts 启动，常规黄金路径不运行它。
-  testIgnore: ['perf-agent.spec.ts'],
+  // exec-trace-perf.spec.ts 是墙钟性能预算，与 perf-agent 一样只经 playwright.perf.config.ts（performance-agent workflow）跑
+  testIgnore: ['perf-agent.spec.ts', 'exec-trace-perf.spec.ts'],
   // 每个用例都要起一次后端（含冷启动的 matplotlib 会话），给足时间
   timeout: 180_000,
   expect: { timeout: 15_000 },
@@ -44,7 +45,7 @@ export default defineConfig({
       use: { ...devices['Desktop Chrome'] },
       // error-recovery-en / preparation-card-en 自带 en-US locale、由 chromium-en 跑：
       // 基础 project 再跑一遍就是同一份内容双倍的串行启动与渲染等待
-      testIgnore: ['error-recovery-en.spec.ts', 'preparation-card-en.spec.ts', 'perf-agent.spec.ts'],
+      testIgnore: ['error-recovery-en.spec.ts', 'preparation-card-en.spec.ts', 'perf-agent.spec.ts', 'exec-trace-perf.spec.ts'],
     },
     // WebKit 是 macOS 桌面壳（WKWebView）与 Safari 用户的引擎（审计 P1-03）：
     // 只跑黄金路径与可访问性——全量跑三遍只是把门禁拉长三倍，而剩下那些
@@ -103,6 +104,8 @@ export default defineConfig({
         'ai-draft.spec.ts',
         // 运行中会话的恢复（PR4b）：占位与锁的文案是中英两套，定位走 data-*
         'ai-restore.spec.ts',
+        // 执行记录（ADR 0151 PR3）：Waterfall 的标签 / 指标 / 图例是中英两套，英文更长；定位走 data-*，两种语言各走一遍
+        'exec-trace.spec.ts',
         // 执行器与模型两级选择器：家族 / 型号显示名是后端给的，其余文案中英两套，定位走 data-*
         'ai-model-picker.spec.ts',
         'a11y.spec.ts',
