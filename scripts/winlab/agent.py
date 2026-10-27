@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import datetime as _dt
 import hashlib
@@ -64,7 +65,19 @@ LIVE_HOST_IDS = ("claude-code", "codex-cli", "codebuddy", "minimax-code", "dsh")
 #: `desktop-hosts --mode`：桌面宿主 L2（固定版本见 DESKTOP_HOSTS）
 DESKTOP_HOST_IDS = ("vscode", "cursor", "trae-cn", "workbuddy", "zcode", "claude-desktop")
 #: `desktop-live --mode`：桌面宿主 + 其中的 AI 扩展，到 L3–L5（宿主 × 扩展的闭集见 DESKTOP_LIVE）
-DESKTOP_LIVE_MODES = ("vscode-claude", "cursor-claude", "trae-claude", "zcode-native")
+DESKTOP_LIVE_MODES = (
+    "vscode-claude",
+    "cursor-claude",
+    "trae-claude",
+    "zcode-native",
+    "workbuddy-native",
+    "workbuddy-native-phone",
+)
+#: 要用户扫码登录宿主账户的格（用户 2026-10-27：专用账户、每次扫、跑完清掉登录态）
+DESKTOP_LIVE_LOGIN_MODES = ("workbuddy-native", "workbuddy-native-phone")
+#: 推理用宿主账户自带模型、不经我们任何 key 的格：客户端不要求先录 key，Lab 也不读 stdin（Codex #1448 P2；
+#: winlab.py 的 ACCOUNT_MODEL_MODES 同一份，测试核对）
+DESKTOP_LIVE_ACCOUNT_MODEL_MODES = DESKTOP_LIVE_LOGIN_MODES
 #: 宿主只能从明文配置读 key 的格：用落盘专用 key（winlab.py ONDISK_MODES 同一份，测试核对），跑完 wipe_ondisk_key
 DESKTOP_LIVE_ONDISK_MODES = ("zcode-native",)
 #: 依赖安装配方的版本：改了 prepare 的安装步骤就加一，已有 venv 随之重装（散列戳里含它）。
@@ -3060,7 +3073,10 @@ NATIVE_BYOK_RE = re.compile(
 
 
 #: 原生探查时允许点的唯一入口按钮（逐字）：只为看下一屏要填什么，不填、不提交、不登录
-NATIVE_PEEK = {"zcode": "Use API key"}
+#: WorkBuddy 只点「Sign In」看它提供哪些登录方式（扫码 / 手机号…）；不输入、不提交（用户 2026-10-27：专用账户扫码登录）
+NATIVE_PEEK = {"zcode": "Use API key", "workbuddy": "Sign In"}
+#: 入口按钮之后再点的那一个（只读：WorkBuddy 把登录链接放进剪贴板，报告只记链接的协议 / 主机 / 路径）
+NATIVE_PEEK_FOLLOW = {"workbuddy": "Copy Login Link"}
 
 
 def summarize_native(win: dict) -> dict:
@@ -3191,6 +3207,11 @@ def run_desktop_hosts_task(
                     else []
                 ),
                 *(["--peek-button", NATIVE_PEEK[host.id]] if host.id in NATIVE_PEEK else []),
+                *(
+                    ["--follow-button", NATIVE_PEEK_FOLLOW[host.id]]
+                    if host.id in NATIVE_PEEK_FOLLOW
+                    else []
+                ),
             ]
         step = run_in_gui(lab, run_id, argv, work, henv, ev / "probe", 900 if native else 240)
     finally:
@@ -3271,6 +3292,8 @@ class DesktopLive:
     host: str
     extension: str = ""
     native: bool = False
+    #: 宿主账户怎么登录：qr = 截二维码给用户扫；phone = 手机号 + 短信验证码（经 `winlab login-input`）
+    login: str = ""
 
 
 DESKTOP_LIVE: dict[str, DesktopLive] = {
@@ -3278,6 +3301,8 @@ DESKTOP_LIVE: dict[str, DesktopLive] = {
     "cursor-claude": DesktopLive("cursor", "anthropic.claude-code"),
     "trae-claude": DesktopLive("trae-cn", "anthropic.claude-code"),
     "zcode-native": DesktopLive("zcode", native=True),
+    "workbuddy-native": DesktopLive("workbuddy", native=True, login="qr"),
+    "workbuddy-native-phone": DesktopLive("workbuddy", native=True, login="phone"),
 }
 assert tuple(DESKTOP_LIVE) == DESKTOP_LIVE_MODES
 #: 宿主装扩展时自报「版本不兼容」：这是宿主限制（not_supported），不是 Tavotto 的故障
@@ -3584,6 +3609,276 @@ def wipe_ondisk_key(run_dir: Path, env: dict, key: str) -> dict:
     }
 
 
+WORKBUDDY_LOGIN_HOST = "workbuddy.cn"
+#: WorkBuddy 的后台进程（daemon / 运行时）映像路径里都带这个；删「家」之前要先结束它们（否则 WinError 5）
+WORKBUDDY_PROCESS_TOKENS = ("workbuddy",)
+QR_LOGIN_TIMEOUT_S = 600
+
+
+def _home_env(home: Path) -> dict[str, str]:
+    """把宿主的用户目录整个指到 run 目录（Electron 的 homedir 取 USERPROFILE，应用数据取 APPDATA / LOCALAPPDATA）。"""
+    roaming, local = home / "AppData" / "Roaming", home / "AppData" / "Local"
+    for d in (roaming, local):
+        d.mkdir(parents=True, exist_ok=True)
+    return {
+        "USERPROFILE": str(home),
+        "HOME": str(home),
+        "APPDATA": str(roaming),
+        "LOCALAPPDATA": str(local),
+    }
+
+
+def workbuddy_isolated_config(home: Path, mcp_cmd: list[str], mcp_env: dict) -> Path:
+    """WorkBuddy 的 MCP 配置（`~/.workbuddy/mcp.json` 的 mcpServers，stdio → 录制器）。不写任何凭据。"""
+    f = home / ".workbuddy" / "mcp.json"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "tavotto": {"command": mcp_cmd[0], "args": mcp_cmd[1:], "env": mcp_env}
+                }
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    # 用户自己加的 MCP 要在连接器页点「Trust」才会加载（run 20261027T071832Z-65d729：Agent 回「tavotto 工具不在」）。
+    # WorkBuddy 5.8.3 把信任记在同目录 mcp-approvals.json：键 = 「配置指纹::服务名」，值 = 毫秒时间戳；指纹 =
+    # sha256(command | 排序后的 args 逗号连接 | 排序后的 env 键名逗号连接)。这里替用户点一次，只信任这一条
+    approvals = f.parent / "mcp-approvals.json"
+    try:
+        known = json.loads(approvals.read_text(encoding="utf-8"))
+        known = known if isinstance(known, dict) else {}
+    except (OSError, ValueError):
+        known = {}
+    known[f"{workbuddy_trust_hash(mcp_cmd, mcp_env)}::tavotto"] = int(time.time() * 1000)
+    approvals.write_text(json.dumps(known, indent=2), encoding="utf-8")
+    return f
+
+
+def workbuddy_trust_hash(mcp_cmd: list[str], mcp_env: dict) -> str:
+    """WorkBuddy 5.8.3 computeTrustConfigHash 对 stdio 服务的算法（没有 cwd 字段时）。"""
+    material = "|".join(
+        [mcp_cmd[0], ",".join(sorted(str(a) for a in mcp_cmd[1:])), ",".join(sorted(mcp_env))]
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+#: Windows 凭据管理器里可能属于 WorkBuddy 的条目（Electron keytar 等写在这里，不随环境变量隔离）
+WORKBUDDY_CRED_FILTERS = ("*workbuddy*", "*WorkBuddy*", "*codebuddy*", "*CodeBuddy*")
+
+
+def _delete_credentials(filters: tuple[str, ...]) -> list[str]:
+    """按目标名通配删掉当前用户的凭据条目；返回删掉的目标名。非 Windows 返回空。"""
+    if os.name != "nt":
+        return []
+    import ctypes
+    from ctypes import wintypes
+
+    class CREDENTIAL(ctypes.Structure):
+        _fields_ = [
+            ("Flags", wintypes.DWORD),
+            ("Type", wintypes.DWORD),
+            ("TargetName", wintypes.LPWSTR),
+            ("Comment", wintypes.LPWSTR),
+            ("LastWritten", wintypes.FILETIME),
+            ("CredentialBlobSize", wintypes.DWORD),
+            ("CredentialBlob", ctypes.c_void_p),
+            ("Persist", wintypes.DWORD),
+            ("AttributeCount", wintypes.DWORD),
+            ("Attributes", ctypes.c_void_p),
+            ("TargetAlias", wintypes.LPWSTR),
+            ("UserName", wintypes.LPWSTR),
+        ]
+
+    adv = ctypes.WinDLL("advapi32", use_last_error=True)
+    removed: list[str] = []
+    for flt in filters:
+        count = wintypes.DWORD()
+        arr = ctypes.POINTER(ctypes.POINTER(CREDENTIAL))()
+        if not adv.CredEnumerateW(flt, 0, ctypes.byref(count), ctypes.byref(arr)):
+            continue
+        try:
+            items = [(arr[i].contents.TargetName, arr[i].contents.Type) for i in range(count.value)]
+        finally:
+            adv.CredFree(arr)
+        for target, typ in items:
+            if target not in removed and adv.CredDeleteW(target, typ, 0):
+                removed.append(target)
+    return removed
+
+
+def workbuddy_home(lab: Lab) -> Path:
+    return lab.state / "workbuddy-home"
+
+
+def wipe_login_state(run_dir: Path) -> dict:
+    """扫码登录格的收尾：删掉 run 目录里的「家」与登录用 Edge 配置，删掉凭据管理器里 WorkBuddy 的条目，再核对都不在了。"""
+    work = run_dir / "work"
+    left_dirs = []
+    errors = {}
+    # 登录态常驻在 state\workbuddy-home（用户 2026-10-27）；这里只收本次 run 的东西：登录用的 Edge 配置、旧版放在
+    # run 里的「家」。WorkBuddy 的后台进程一并结束（不让它在两次 run 之间常驻）
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            _kill_matching(lambda img: any(t in img.lower() for t in WORKBUDDY_PROCESS_TOKENS))
+    for d in (work / "wbhome", work / "edge-login"):
+        err = _force_rmtree(d, WORKBUDDY_PROCESS_TOKENS)
+        if d.exists():
+            left_dirs.append(d.name)
+            errors[d.name] = err
+    removed: list[str] = []
+    left: list[str] = []  # 凭据管理器里的登录条目随常驻登录态保留；撤销走 sweep --workbuddy-logout
+    return {
+        "wiped": not left_dirs,
+        "persistent_login": "state\\workbuddy-home (user-approved 2026-10-27; `winlab sweep --workbuddy-logout` removes it)",
+        "dirs_left": left_dirs,
+        "errors": errors,
+        "credentials_removed": removed,
+        "credentials_left": left,
+    }
+
+
+_LONG_PREFIX = "\\\\?\\"
+
+
+def _long_path(p: Path) -> Path:
+    """Windows 扩展长度路径前缀：WorkBuddy 的运行时目录很深，Lab 的 LongPathsEnabled=0 时普通路径删不掉
+    （run 20261026T164733Z-d2e08d 的 wbhome 留了下来）。"""
+    if os.name != "nt":
+        return p
+    s = str(p.resolve())
+    return Path(s if s.startswith(_LONG_PREFIX) else _LONG_PREFIX + s)
+
+
+def _under_dir(img: str, d: Path) -> bool:
+    a = os.path.normcase(os.path.normpath(img))
+    b = os.path.normcase(os.path.normpath(str(d)))
+    return a == b or a.startswith(b.rstrip("\\/") + os.sep)
+
+
+def _kill_matching(pred) -> list[str]:
+    """结束当前用户下映像路径满足 pred 的进程（不在 Job 里的宿主后台进程，如 WorkBuddy 的 daemon）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    import window_probe as P  # 同目录部署；映像路径查询的唯一出处
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi")
+    arr = (wintypes.DWORD * 4096)()
+    got = wintypes.DWORD()
+    if not psapi.EnumProcesses(arr, ctypes.sizeof(arr), ctypes.byref(got)):
+        return []
+    killed = []
+    for pid in list(arr)[: got.value // ctypes.sizeof(wintypes.DWORD)]:
+        if pid in (0, os.getpid()):
+            continue
+        img = P._image_path(pid) or ""
+        if not img or not pred(img):
+            continue
+        h = k32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if h:
+            if k32.TerminateProcess(h, 1):
+                killed.append(Path(img).name)
+            k32.CloseHandle(h)
+    if killed:
+        time.sleep(2)  # 句柄释放
+    return killed
+
+
+def _force_rmtree(d: Path, kill_tokens: tuple[str, ...] = ()) -> str | None:
+    """删一个目录树，删不掉也不抛：先结束映像在它下面的进程（WorkBuddy 在「家」里跑的运行时不在 Job 里，
+    run 20261026T170159Z-0b45c5 的 wbhome 因此删不掉、登录态留在了盘上），再用长路径删、最多三次。返回最后的错误。"""
+    if not d.exists():
+        return None
+    if os.name == "nt":
+        with contextlib.suppress(Exception):
+            _kill_matching(
+                lambda img: _under_dir(img, d) or any(t in img.lower() for t in kill_tokens)
+            )
+    err = None
+    for attempt in range(3):
+        try:
+            _rmtree_no_follow(_long_path(d))
+            return None
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            err = f"{type(exc).__name__}: {exc}"[:200]
+            if attempt == 0 and os.name == "nt":
+                # 宿主给自己的目录设了只给它自己的 ACL（WorkBuddy 的 connectors\、logs\：WinError 5）：
+                # 我们是所有者，改回继承的权限再删（只动这棵要删的树）
+                subprocess.run(
+                    ["icacls", str(d), "/reset", "/T", "/C", "/Q"],
+                    capture_output=True,
+                    timeout=300,
+                )
+                subprocess.run(
+                    ["attrib", "-R", "-S", "-H", str(d / "*"), "/S", "/D"],
+                    capture_output=True,
+                    timeout=300,
+                )
+            time.sleep(2)
+    return err if d.exists() else None
+
+
+def cmd_sweep(lab: Lab, workbuddy_logout: bool = False) -> dict:
+    """只做收尾：删掉所有旧 run 里的落盘 key 配置与登录目录（不跑任何任务）。正在跑的那一个不碰。"""
+    holder = read_lock(lab)
+    if holder is not None or lock_is_fresh(lab):
+        return {"result": "error", "summary": "a job is running; retry after it finishes"}
+    swept = sweep_stale_ondisk_configs(lab.runs) + sweep_stale_login_dirs(lab.runs)
+    logout = None
+    if workbuddy_logout:
+        # 撤销常驻登录态：结束 WorkBuddy 进程、删「家」、删凭据管理器条目，再核对
+        err = _force_rmtree(workbuddy_home(lab), WORKBUDDY_PROCESS_TOKENS)
+        removed = _delete_credentials(WORKBUDDY_CRED_FILTERS)
+        logout = {
+            "home_removed": not workbuddy_home(lab).exists(),
+            "error": err,
+            "credentials_removed": removed,
+            "credentials_left": _delete_credentials(WORKBUDDY_CRED_FILTERS),
+        }
+    left = {
+        str(d.relative_to(lab.runs)): (
+            _force_rmtree(d, WORKBUDDY_PROCESS_TOKENS) if d.is_dir() else "file remains"
+        )
+        for pat in (
+            "*/work/wbhome",
+            "*/work/edge-login",
+            "*/work/zdata/.zcode/v2/provider_config.json",
+        )
+        for d in lab.runs.glob(pat)
+    }
+    left = {k: v for k, v in left.items() if (lab.runs / k).exists()}
+    # 撤销登录态是用户要的那件事：「家」删不掉或凭据还在，整次就不算完成（Codex #1448 P2）
+    logout_failed = logout is not None and (
+        not logout["home_removed"] or bool(logout["credentials_left"])
+    )
+    return {
+        "result": "passed" if not left and not logout_failed else "error",
+        "summary": f"swept {len(swept)} run(s); {len(left)} left"
+        + ("; WorkBuddy sign-in state NOT fully revoked" if logout_failed else ""),
+        "swept": swept,
+        "left": dict(list(left.items())[:20]),
+        **({"workbuddy_logout": logout} if logout is not None else {}),
+    }
+
+
+def sweep_stale_login_dirs(runs: Path) -> list[str]:
+    """被强行结束的旧 run 留下的「家」与登录用 Edge 配置：开跑前删掉。返回 run id。"""
+    swept: list[str] = []
+    if runs.is_dir():
+        for d in [*runs.glob("*/work/wbhome"), *runs.glob("*/work/edge-login")]:
+            _force_rmtree(d, WORKBUDDY_PROCESS_TOKENS)
+            rid = d.parents[1].name
+            if not d.exists() and rid not in swept:
+                swept.append(rid)
+    return swept
+
+
 def claude_isolated_config(cfg: Path, proj: Path) -> None:
     """隔离的 CLAUDE_CONFIG_DIR：预先放行 mcp__tavotto（只这一个服务器，不是放开全部），跳过首次引导，信任项目目录。
     `claude mcp add` 已经在这里写好 .claude.json 的 mcpServers，这里只合并其它键。"""
@@ -3617,6 +3912,7 @@ def driver_argv(
     label: str,
     open_uri: str = "none",
     kind: str = "vscode",
+    extra: list[str] | None = None,
 ) -> list[str]:
     """交互会话里跑驱动器的 argv（登记任务的固定形状；没有任何透传）。"""
     return [
@@ -3651,6 +3947,7 @@ def driver_argv(
         open_uri,
         "--kind",
         kind,
+        *(extra or []),
     ]
 
 
@@ -3661,6 +3958,8 @@ def run_desktop_live_task(
     host = DESKTOP_HOSTS[cell.host]
     ext = DESKTOP_EXTENSIONS[cell.extension] if cell.extension else None
     swept = sweep_stale_ondisk_configs(lab.runs) if mode in DESKTOP_LIVE_ONDISK_MODES else []
+    if mode in DESKTOP_LIVE_LOGIN_MODES:
+        swept += sweep_stale_login_dirs(lab.runs)
     levels = {"L2": "not_tested", "L3": "not_run", "L4": "not_run", "L5": "not_run"}
     base: dict = {
         "host": {"id": host.id, "name": host.name, "pinned_version": host.version},
@@ -3669,7 +3968,10 @@ def run_desktop_live_task(
         else None,
         "native_agent": cell.native,
         **({"swept_stale_ondisk_configs": swept} if swept else {}),
-        "model": {
+        # WorkBuddy 用登录账户自带的模型（界面上可见，如 GLM-5.3-Flash），不经我们的 key
+        "model": {"provider": "workbuddy-account", "model": None}
+        if cell.native and host.id == "workbuddy"
+        else {
             "provider": model_conf.get("provider"),
             "model": model_conf.get("model")
             or DEFAULT_HOST_MODEL,  # 与 _host_model_env 实际传给宿主的同一个
@@ -3741,7 +4043,14 @@ def run_desktop_live_task(
             # 卸载自己抛异常也要清 key（Codex #1439）：落盘例外的收尾放在最外层
             if mode in DESKTOP_LIVE_ONDISK_MODES:
                 base["ondisk_key"] = wipe_ondisk_key(run_dir, henv, model_conf["api_key"])
+            if mode in DESKTOP_LIVE_LOGIN_MODES:
+                base["login_state"] = wipe_login_state(run_dir)
     out["uninstall"] = base["uninstall"]
+    if "login_state" in base:
+        out["login_state"] = base["login_state"]
+        if not base["login_state"]["wiped"]:
+            out["result"] = "error"  # 登录态留在 Lab 上 = 违反用户的前提
+            out["summary"] = str(out.get("summary", "")) + " (sign-in state NOT fully wiped)"
     if "ondisk_key" in base:
         out["ondisk_key"] = base["ondisk_key"]
         if not base["ondisk_key"]["wiped"]:
@@ -3769,7 +4078,7 @@ def _install_extension(env, host, ext, vsix, inst, ext_dir, work, ev, profile, b
     """VS Code 系宿主：用宿主自带的命令行入口把固定版本的扩展装进 run 目录。
     返回 (结论或 None, 扩展随包的 claude.exe)。"""
     levels = base["levels"]
-    key = model_conf["api_key"]  # noqa: F841 — 与正文同名，日志抹密钥用
+    key = key_placeholder(model_conf)  # noqa: F841 — 与正文同名，日志抹密钥用
 
     def body():
         code_cmd = host_cli(Path(inst["root"]))
@@ -3839,7 +4148,8 @@ def _desktop_live_body(
     levels = base["levels"]
     work = run_dir / "work"
     ev = run_dir / "evidence" / "desktop-live"
-    key = model_conf["api_key"]
+    # 用账户自带模型的格（WorkBuddy）不经我们的 key：没有就用占位，抹它是空操作（Codex #1448 P2）
+    key = key_placeholder(model_conf)
     profile = work / "profile"
     claude_exe = None
     if not cell.native:
@@ -3866,7 +4176,32 @@ def _desktop_live_body(
     ]
     mcp_env = {"TAVOTTO_MCP_ROOTS": str(proj), "TAVOTTO_NO_TELEMETRY": "1"}
     zdata = work / "zdata"
-    if cell.native:
+    login_args: list[str] = []
+    if cell.native and host.id == "workbuddy":
+        # 「家」常驻在 state\workbuddy-home（用户 2026-10-27：专用账户登录态留在 Lab、只扫一次）：MCP 配置
+        # （~/.workbuddy/mcp.json，每次 run 改指本次的录制器）、应用数据、登录态都在这里，不进证据、不随 run 删。
+        # 推理用 WorkBuddy 账户自己的模型，不碰我们的 key
+        home = workbuddy_home(lab)
+        workbuddy_isolated_config(home, mcp_cmd, mcp_env)
+        gui_env = dict(env, **_home_env(home))
+        public_env, secret_env = gui_env, None
+        login_args = [
+            "--workspace-pick",
+            "folder",
+            "--login",
+            "qr",
+            "--login-host",
+            WORKBUDDY_LOGIN_HOST,
+            "--edge-profile",
+            str(work / "edge-login"),
+            "--login-timeout",
+            str(QR_LOGIN_TIMEOUT_S),
+            "--login-method",
+            cell.login or "qr",
+            "--login-inbox",
+            str(work),
+        ]
+    elif cell.native:
         # ZCode 只从明文 provider_config.json 读 key（用户 2026-10-26 同意的落盘例外，专用限额 key）：
         # 只写本次 run 的 ZCODE_DATA_BASE_DIR，跑完 wipe_ondisk_key 删除并核对无残留
         names = tavotto_tool_names(lab.repo / "codex-plugin" / "mcp")
@@ -3914,6 +4249,7 @@ def _desktop_live_body(
             if host.url_scheme and not cell.native
             else "none",
             kind="native" if cell.native else "vscode",
+            extra=login_args,
         )
         step = run_in_gui(
             lab,
@@ -3964,7 +4300,11 @@ def _desktop_live_body(
     s1 = parse_recorded(rec_log)
     split = _line_count(rec_log)
     sid = opened_session_id(s1)
-    data_dir = Path(env.get("LOCALAPPDATA") or Path.home()) / "Tavotto"
+    # 宿主拉起的 Tavotto 继承的是宿主的环境：WorkBuddy 的 LOCALAPPDATA 指在常驻家目录下（run 20261027T073602Z-c417c0
+    # 在 run 的 LOCALAPPDATA 里找不到会话日志）
+    data_dir = (
+        Path(public_env.get("LOCALAPPDATA") or env.get("LOCALAPPDATA") or Path.home()) / "Tavotto"
+    )
     journal_ok = journal_has_edits(data_dir, sid)
     r2: dict = {"step": {"skipped": "no session id from session 1"}, "driver": {}}
     if sid:
@@ -3978,8 +4318,18 @@ def _desktop_live_body(
     base["driver_step"] = {"session_1": r1["step"], "session_2": r2["step"]}
     base["driver_progress"] = {"session_1": r1["progress"], "session_2": r2.get("progress", [])}
     base["driver_log_tail"] = r1["log_tail"] if not r1["driver"] else ""
-    if cell.native:
+    if cell.native and host.id == "zcode":
         base["host_mcp_log"] = _grep_tail(ev / "zcode-logs", re.compile(r"mcp", re.I), 30)
+    if r1["driver"].get("login_required"):
+        levels.update(
+            L3="environment_unavailable", L4="environment_unavailable", L5="environment_unavailable"
+        )
+        return {
+            **base,
+            "result": "environment_unavailable",
+            "summary": f"{host.name}: QR sign-in was not completed within {QR_LOGIN_TIMEOUT_S} s (L3–L5 blocked)",
+            "blocked_reason": "host account sign-in not completed",
+        }
     # 面板文字尾部进报告（证据文件不回传 Mac）：判不出 L5 时能看到模型最后在说什么；已在 _scrub 之后
     base["panel_tail"] = {
         f"session_{n}": _tail_text(ev / f"round{n}-panel.txt", PANEL_TAIL_CHARS).replace(
@@ -4025,7 +4375,7 @@ def _desktop_live_body(
     return {
         **base,
         "result": av.aggregate([levels["L2"], levels["L3"], levels["L4"], levels["L5"]]),
-        "summary": f"{host.id} {host.display_version} + {agent_label}{' ' + ext.version if ext else ''} via {model_conf.get('provider', '?')}: "
+        "summary": f"{host.id} {host.display_version} + {agent_label}{' ' + ext.version if ext else ''} via {base['model']['provider'] or '?'}: "
         f"L3={levels['L3']} L4={levels['L4']} L5={levels['L5']}",
         "server_side_calls": {
             "session_1": [
@@ -4765,6 +5115,49 @@ def cmd_reports(lab: Lab, run_id: str | None) -> dict:
     return {"runs": sorted((p.stem for p in lab.reports.glob("*.json")), reverse=True)[:50]}
 
 
+LOGIN_INPUT_RE = {"phone": re.compile(r"1\d{10}"), "code": re.compile(r"\d{4,8}")}
+
+
+def cmd_login_input(lab: Lab, run_id: str, kind: str, value: str) -> dict:
+    """把用户给的手机号 / 短信验证码送进**正在跑**的那次 run（work\\login-<kind>.txt，驱动器读到即删）。
+    只认形状正确的值；不回显值本身。"""
+    holder = read_lock(lab) or {}
+    if not RUN_ID_RE.fullmatch(run_id or "") or holder.get("run_id") != run_id:
+        return {"result": "error", "summary": "that run is not the one running"}
+    pat = LOGIN_INPUT_RE.get(kind)
+    if pat is None or not pat.fullmatch(value.strip()):
+        return {"result": "error", "summary": f"bad {kind}"}
+    work = lab.runs / run_id / "work"
+    tmp = work / f"login-{kind}.txt.tmp"
+    tmp.write_text(value.strip(), encoding="utf-8")
+    os.replace(tmp, work / f"login-{kind}.txt")
+    return {"result": "passed", "summary": f"{kind} delivered"}
+
+
+SHOT_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,40}\.png")
+SHOT_MAX_BYTES = 4 * 1024**2
+
+
+def cmd_shot(lab: Lab, run_id: str, name: str) -> dict:
+    """取回某次 run 证据目录里的一张截图（只读，run 进行中也能取：WorkBuddy 扫码登录时把二维码交给用户）。
+    只认 run id 与形状固定的文件名、只在 evidence\\ 下找、必须是 PNG、有体积上限，不接受任何路径。"""
+    if not RUN_ID_RE.fullmatch(run_id or "") or not SHOT_NAME_RE.fullmatch(name or ""):
+        return {"result": "error", "summary": "bad run id or shot name"}
+    ev = lab.runs / run_id / "evidence"
+    hits = [p for p in ev.rglob(name) if p.is_file() and not p.is_symlink()] if ev.is_dir() else []
+    if len(hits) != 1:
+        return {"result": "error", "summary": f"{len(hits)} files named {name} in that run"}
+    data = hits[0].read_bytes()
+    if len(data) > SHOT_MAX_BYTES or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return {"result": "error", "summary": "not a small PNG"}
+    return {
+        "result": "passed",
+        "summary": name,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "png_b64": base64.b64encode(data).decode("ascii"),
+    }
+
+
 def cmd_clean(lab: Lab, keep: int) -> dict:
     """只删 runs\\ 下最旧的 run 目录（报告 JSON 保留）；正在跑的那一个永远不删。"""
     holder = read_lock(lab)
@@ -4828,6 +5221,14 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("--mode")
     r = sub.add_parser("reports")
     r.add_argument("--id")
+    li = sub.add_parser("login-input")
+    li.add_argument("--id", required=True)
+    li.add_argument("--kind", choices=("phone", "code"), required=True)
+    sw = sub.add_parser("sweep")
+    sw.add_argument("--workbuddy-logout", action="store_true")
+    sh = sub.add_parser("shot")
+    sh.add_argument("--id", required=True)
+    sh.add_argument("--name", required=True)
     c = sub.add_parser("clean")
     c.add_argument("--keep", type=int, default=20)
     sub.add_parser("stop")
@@ -4859,6 +5260,12 @@ def main(argv: list[str] | None = None, lab: Lab | None = None) -> int:
         return _emit(cmd_status(lab))
     if ns.verb == "reports":
         return _emit(cmd_reports(lab, ns.id))
+    if ns.verb == "shot":
+        return _emit(cmd_shot(lab, ns.id, ns.name))
+    if ns.verb == "sweep":
+        return _emit(cmd_sweep(lab, ns.workbuddy_logout))
+    if ns.verb == "login-input":
+        return _emit(cmd_login_input(lab, ns.id, ns.kind, sys.stdin.read(64)))
     if ns.verb == "clean":
         return _emit(cmd_clean(lab, max(0, ns.keep)))
     if ns.verb == "stop":
@@ -4897,7 +5304,7 @@ def main(argv: list[str] | None = None, lab: Lab | None = None) -> int:
         return av.EXIT_USAGE
     try:
         model_conf = None
-        if task.needs_model_conf:
+        if task.needs_model_conf and ns.mode not in DESKTOP_LIVE_ACCOUNT_MODEL_MODES:
             parsed = read_model_conf(sys.stdin)
             if isinstance(parsed, str):
                 return _emit({"result": "environment_unavailable", "summary": parsed})

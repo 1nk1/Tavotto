@@ -467,6 +467,8 @@ MODEL_PROVIDERS = {"deepseek": "https://api.deepseek.com/anthropic"}
 MODEL_CONF_ONDISK_PATH = MODEL_CONF_PATH.with_name("model-ondisk.json")
 #: 要用落盘专用 key 的 desktop-live 模式（与 agent.DESKTOP_LIVE_ONDISK_MODES 一致，测试核对）
 ONDISK_MODES = ("zcode-native",)
+#: 推理用宿主账户自带模型的 desktop-live 模式：不要求先录 key（与 agent.DESKTOP_LIVE_ACCOUNT_MODEL_MODES 一致，测试核对）
+ACCOUNT_MODEL_MODES = ("workbuddy-native", "workbuddy-native-phone")
 
 
 def model_conf_path(mode: str | None) -> Path:
@@ -478,6 +480,25 @@ def _stored_key(path: Path) -> str | None:
         return json.loads(path.read_text()).get("api_key") or None
     except (OSError, ValueError):
         return None
+
+
+def cmd_shot(run_id: str, name: str, out: Path) -> int:
+    """`agent shot` 的 Mac 端：解 base64、核散列后写到本机文件（0600），只打印路径与散列。"""
+    import base64
+
+    rc, rep = remote_json(["shot", "--id", run_id, "--name", name])
+    if rep.get("result") != "passed":
+        print(json.dumps({k: rep.get(k) for k in ("result", "summary")}), file=sys.stderr)
+        return rc or 1
+    data = base64.b64decode(rep["png_b64"])
+    if hashlib.sha256(data).hexdigest() != rep["sha256"]:
+        print("sha256 mismatch", file=sys.stderr)
+        return 1
+    fd = os.open(out, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    print(json.dumps({"saved": str(out), "sha256": rep["sha256"], "bytes": len(data)}))
+    return 0
 
 
 def load_model_secret(mode: str | None = None) -> bytes | None:
@@ -772,6 +793,21 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--mode", default="all", choices=["all", *lab_agent.NETWORK_MODES])
     r = sub.add_parser("reports")
     r.add_argument("--id")
+    li = sub.add_parser(
+        "login-input", help="把手机号 / 短信验证码送进正在跑的 run（值从 stdin 读，不进命令行）"
+    )
+    li.add_argument("--id", required=True)
+    li.add_argument("--kind", choices=("phone", "code"), required=True)
+    sw = sub.add_parser("sweep", help="只做收尾：删掉旧 run 里残留的落盘 key 配置与登录目录")
+    sw.add_argument(
+        "--workbuddy-logout",
+        action="store_true",
+        help="同时撤销常驻的 WorkBuddy 登录态（删 state\\workbuddy-home）",
+    )
+    sh = sub.add_parser("shot", help="取回某次 run 证据里的一张 PNG（run 进行中也行；扫码登录用）")
+    sh.add_argument("--id", required=True)
+    sh.add_argument("--name", required=True)
+    sh.add_argument("--out", required=True, help="本机保存路径")
     c = sub.add_parser("clean")
     c.add_argument("--keep", type=int, default=20)
     sub.add_parser("stop")
@@ -803,6 +839,18 @@ def main(argv: list[str] | None = None) -> int:
         return show(rc, {"local": local, "remote": rem})
     if ns.verb in ("status", "stop"):
         return show(*remote_json([ns.verb]))
+    if ns.verb == "shot":
+        return cmd_shot(ns.id, ns.name, Path(ns.out))
+    if ns.verb == "login-input":
+        return show(
+            *remote_json(
+                ["login-input", "--id", ns.id, "--kind", ns.kind], stdin=sys.stdin.buffer.read(64)
+            )
+        )
+    if ns.verb == "sweep":
+        return show(
+            *remote_json(["sweep", *(["--workbuddy-logout"] if ns.workbuddy_logout else [])])
+        )
     if ns.verb == "reports":
         return show(*remote_json(["reports", *(["--id", ns.id] if ns.id else [])]))
     if ns.verb == "clean":
@@ -825,7 +873,7 @@ def main(argv: list[str] | None = None) -> int:
             if rc != 0:
                 return rc
         stdin = None
-        if task.needs_model_conf:
+        if task.needs_model_conf and ns.mode not in ACCOUNT_MODEL_MODES:
             stdin = load_model_secret(ns.mode)
             if stdin is None:
                 return 3
