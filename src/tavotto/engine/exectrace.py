@@ -596,6 +596,7 @@ class ExecTrace:
         span_id: str | None = None,
         attributes: dict | None = None,
         dedup_key: str | None = None,
+        at_offset_ms: float | None = None,
     ) -> int:
         """记时间点事实，返回序号（0 = 没记：重复送达 / 冻结后迟到 / 名字不在闭集）。"""
         if name not in EVENT_NAMES:
@@ -608,7 +609,10 @@ class ExecTrace:
             if self._seen(dedup_key):
                 return 0
             target = span_id if span_id in self._spans else self.root_span_id
-            return self._push_event(name, target, attributes, self._offset_ms())
+            now = self._offset_ms()
+            # 别的计时源报来的时刻（同一进程的另一只单调钟换算过来）：只收落在 [0, 此刻] 的，否则按此刻记
+            at = _attr_value("ms", at_offset_ms)
+            return self._push_event(name, target, attributes, now if at is None or at > now else at)
 
     @_never_raises(default=False)
     def finish(
@@ -755,11 +759,24 @@ class NullTrace:
 _STAGE_STATUS = {"ok": STATUS_OK, "failed": STATUS_FAILED, "cancelled": STATUS_CANCELLED}
 
 
-def observe_stage_trace(trace, payload, *, parent: str | None = None) -> int:
+def _legacy_offset_ms(trace, legacy_t0, at_ms) -> float | None:
+    """旧阶段轨迹的时刻（它自己的 `perf_counter` 原点 + `at_ms`）→ 本 Trace 的偏移。两只钟都是本进程的单调钟，
+    此刻各读一次就能换算；注入了假钟（测试）或数字不对就不换算（回 None，按观察时刻记）。"""
+    if not isinstance(getattr(trace, "_clock", None), SystemClock):
+        return None
+    if not isinstance(legacy_t0, (int, float)) or not isinstance(at_ms, (int, float)):
+        return None
+    mono_at = time.monotonic() - (time.perf_counter() - (legacy_t0 + at_ms / 1000.0))
+    return (mono_at - trace._mono0) * 1000.0
+
+
+def observe_stage_trace(trace, payload, *, parent: str | None = None, legacy_t0=None) -> int:
     """把旧 `Trace.to_payload()` 的阶段事件映射成 `stage` 观察点（Event），返回记下的条数。
 
     只读 phase / outcome / code 三个字段——`facts` 一个都不读（那是 ADR 0071 给公开投影的标量，不是本层的白名单）；
     不造区间：两个相邻阶段之间的时间不算给前一个。旧轨迹仍是阶段事实的唯一判定权威。
+    `legacy_t0`：旧轨迹的 `perf_counter` 原点（`Trace._t0`）——给了就把每个点放在它真实发生的时刻，而不是全挤在观察这一刻
+    （真实 Codex 验证发现：准备的阶段点都落在收尾那一毫秒）。
     """
     if not isinstance(payload, dict) or not isinstance(payload.get("events"), list):
         return 0
@@ -772,8 +789,13 @@ def observe_stage_trace(trace, payload, *, parent: str | None = None) -> int:
         if not isinstance(ev, dict):
             continue
         attrs = {"phase": ev.get("phase"), "outcome": ev.get("outcome")}
+        at = _legacy_offset_ms(trace, legacy_t0, ev.get("at_ms")) if legacy_t0 is not None else None
         if trace.event(
-            "stage", span_id=parent, attributes=attrs, dedup_key=f"stage:{i}:{ev.get('phase')}"
+            "stage",
+            span_id=parent,
+            attributes=attrs,
+            dedup_key=f"stage:{i}:{ev.get('phase')}",
+            at_offset_ms=None if at is None or at < 0 else at,
         ):
             seen += 1
     return seen
@@ -947,6 +969,15 @@ class TraceStore:
                 best = snap
         return best
 
+    def scan(self, *, scopes: set) -> list[dict]:
+        """盘上属于这些 scope 的全部快照（总量有上限，扫一遍有界）。"""
+        out = []
+        for path, _open, _size, _mtime in self._entries():
+            record = self._read(path)
+            if record is not None and record.get("scope") in scopes:
+                out.append(record["trace"])
+        return out
+
     def _entries(self):
         try:
             names = os.listdir(self.root)
@@ -1108,6 +1139,28 @@ class Recorder:
         if self._store is None:
             return None
         return self._store.find(operation_kind, task_ref, scopes=wanted)
+
+    def recent(self, *, scopes, limit: int = 8) -> list[dict]:
+        """本项目最近的若干条 Trace（诊断包用）：失败 / 中断在前、同类按开始时间新到旧。内存里的优先（运行中的最新），
+        再补盘上的；同一 trace_id 只取一份。只读、零执行。"""
+        wanted = {_ref(s) for s in scopes if _ref(s) is not None}
+        if not wanted or limit <= 0:
+            return []
+        found: dict[str, dict] = {}
+        with self._lock:
+            live = [t for t in self._live.values() if t.scope in wanted]
+        for t in live:
+            snap = t.snapshot()
+            found[snap["trace_id"]] = snap
+        if self._store is not None:
+            for snap in self._store.scan(scopes=wanted):
+                found.setdefault(snap.get("trace_id"), snap)
+        failing = {STATUS_FAILED, STATUS_TIMEOUT, STATUS_INTERRUPTED}
+        ordered = sorted(
+            found.values(),
+            key=lambda s: (s.get("status") not in failing, -(s.get("started_at") or 0)),
+        )
+        return ordered[:limit]
 
 
 def scope_for(project_key) -> str | None:
