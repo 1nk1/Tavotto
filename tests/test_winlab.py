@@ -2562,6 +2562,10 @@ def test_ondisk_key_is_wiped_and_any_residual_fails_the_run(tmp_path, monkeypatc
     (appdata / "ZCode" / "Local Storage").mkdir(parents=True)
     (appdata / "ZCode" / "Local Storage" / "leveldb.log").write_bytes(b"x" + key.encode())
     env = {"APPDATA": str(appdata), "LOCALAPPDATA": str(tmp_path / "none")}
+    # 真实的应用数据目录与注册表不碰（Lab 上真目录里有 Claude*：run 20261027T095801Z-ae9014）
+    monkeypatch.setenv("APPDATA", str(appdata))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "none"))
+    monkeypatch.setattr(A, "claude3p_policy_wipe", lambda k: {"wiped": True, "present": False})
     res = A.wipe_ondisk_key(run_dir, env, key)
     assert res["wiped"] is True and res["checked_app_dirs"] == ["ZCode"]
     assert A._files_containing([run_dir, appdata], key.encode()) == ([], [])
@@ -2919,3 +2923,118 @@ def test_account_model_modes_never_ask_for_our_key(monkeypatch):
     for mode in W.ACCOUNT_MODEL_MODES:
         assert W.main(["test", "desktop-live", "--mode", mode]) == 0
         assert sent["stdin"] is None and sent["argv"][-1] == mode
+
+
+def test_claude_desktop_3p_config_talks_only_to_deepseek_and_allows_only_tavotto_tools(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "real-local"))
+    policy: dict = {}
+    monkeypatch.setattr(A, "claude3p_policy_write", lambda c: policy.update(c) or list(c))
+    monkeypatch.setattr(A, "claude3p_policy_wipe", lambda k: {"wiped": True, "present": False})
+    conf = {"base_url": "https://api.deepseek.com/anthropic", "api_key": "k" * 8, "model": "m1"}
+    cmd = ["py.exe", "rec.py", "log", "--", "py.exe", "server.py"]
+    res = A.claude3p_isolated_config(
+        tmp_path / "home",
+        {},
+        cmd,
+        {"TAVOTTO_MCP_ROOTS": "p"},
+        conf,
+        ["tavotto_health", "tavotto_export"],
+    )
+    written = res["files"]
+    assert len(written) == 2  # run 家目录 + 真实 LOCALAPPDATA（跑完删）
+    assert set(res["policy_written"]) == set(res["policy_expected"])
+    for f in written:
+        meta = json.loads((f.parent / "_meta.json").read_text(encoding="utf-8"))
+        assert f.name == f"{meta['appliedId']}.json"
+        c = json.loads(f.read_text(encoding="utf-8"))
+        assert c["inferenceProvider"] == "gateway"
+        assert c["inferenceGatewayBaseUrl"] == conf["base_url"]
+        # 应用只收 claude 名字的路由；DeepSeek 把 claude-sonnet* 映射到 deepseek-flash，界面标出真实供应商
+        assert c["inferenceModels"] == [
+            {"name": "claude-sonnet-4-5", "labelOverride": "DeepSeek (m1)"}
+        ]
+        assert c["modelDiscoveryEnabled"] is False
+        # 官方文档「Disabling all Anthropic-bound connections」的六条
+        for k in (
+            "disableEssentialTelemetry",
+            "disableNonessentialTelemetry",
+            "disableNonessentialServices",
+            "disableAutoUpdates",
+            "skipWebFetchPreflight",
+        ):
+            assert c[k] is True, k
+        assert c["modelCatalogEnabled"] is False
+        assert {"WebFetch", "Bash", "PowerShell", "Write", "Edit", "mcp__workspace__bash"} <= set(
+            c["disabledBuiltinTools"]
+        )
+        assert c["chatAdvancedFileAnalysisEnabled"] is False
+        assert c["coworkTabEnabled"] is False and c["isClaudeCodeForDesktopEnabled"] is False
+        (srv,) = c["managedMcpServers"]
+        assert srv["transport"] == "stdio" and [srv["command"], *srv["args"]] == cmd
+        assert srv["toolPolicy"] == {"tavotto_health": "allow", "tavotto_export": "allow"}
+    assert policy["inferenceProvider"] == "gateway"  # 同一份配置也进策略键（只在 Windows 上真写）
+    swept = A.sweep_stale_ondisk_configs(tmp_path / "no-runs")
+    assert swept == ["LOCALAPPDATA"]
+    assert not list((tmp_path / "real-local" / "Claude-3p" / "configLibrary").glob("*.json"))
+
+
+def test_uia_driver_reports_the_region_block_and_picks_the_lowest_wide_input():
+    assert D.REGION_BLOCK_RE.search(
+        "App unavailable\nUnfortunately, Claude is only available in certain regions"
+    )
+    assert not D.REGION_BLOCK_RE.search("How can I help you today?")
+    rect = [0, 0, 1000, 800]
+    nodes = [
+        {"t": "ControlType.Edit", "f": True, "r": [10, 20, 600, 30]},  # 上半部的搜索框
+        {"t": "ControlType.Edit", "f": True, "r": [100, 650, 120, 40]},  # 太窄
+        {"t": "ControlType.Document", "f": True, "r": [100, 600, 700, 80]},
+        {"t": "ControlType.Edit", "f": False, "r": [100, 700, 700, 40]},  # 不可聚焦
+    ]
+    assert D.uia_input(nodes, rect)["r"] == [100, 600, 700, 80]
+    assert D.uia_input(nodes[:2], rect) is None
+
+
+def test_uia_onboarding_clicks_only_whitelisted_buttons_never_sign_in():
+    nodes = [
+        {"t": "ControlType.Button", "n": "Or sign in with Claude.ai", "r": [1, 1, 50, 20]},
+        {"t": "ControlType.Text", "n": "Continue", "r": [1, 1, 50, 20]},
+        {"t": "ControlType.Button", "n": "Continue", "r": [10, 400, 200, 40]},
+    ]
+    assert D.uia_onboarding(nodes)["r"] == [10, 400, 200, 40]
+    assert D.uia_onboarding(nodes[:2]) is None
+
+
+def test_claude_desktop_pac_sends_only_the_download_host_through_dmit():
+    import urllib.request
+
+    pac = A.CLAUDE3P_PAC
+    assert '"downloads.claude.ai"' in pac and f"127.0.0.1:{A.PROXY_PORTS['trojan']}" in pac
+    assert pac.count("PROXY") == 1 and 'return "DIRECT"' in pac
+    port = A.serve_pac(pac)
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    with opener.open(f"http://127.0.0.1:{port}/proxy.pac", timeout=5) as r:
+        assert r.read().decode() == pac
+
+
+def test_claude3p_tool_uses_counts_only_tool_names(tmp_path):
+    d = tmp_path / "AppData" / "Local" / "Claude-3p" / "local-agent-mode-sessions" / "x"
+    d.mkdir(parents=True)
+    (d / "t.jsonl").write_text(
+        '{"type": "tool_use", "id": "a", "name": "mcp__tavotto__tavotto_health", "input": {}}\n'
+        '{"type":"tool_use","id":"b","name":"PowerShell","input":{"command":"dir"}}\n'
+        '{"type":"text","text":"name: nope"}\n',
+        encoding="utf-8",
+    )
+    assert A.claude3p_tool_uses(tmp_path) == {"mcp__tavotto__tavotto_health": 1, "PowerShell": 1}
+
+
+def test_claude_desktop_is_not_launched_unless_every_policy_value_was_written():
+    # Codex #1450 P1：策略没写全时应用会以标准模式起来、先连 claude.ai
+    src = (WINLAB / "agent.py").read_text(encoding="utf-8")
+    body = src[src.index("cfg = claude3p_isolated_config(") :]
+    check = body.index("if missing:")
+    assert check < body.index("gui_env = dict(env, **_home_env(home))")
+    assert '"environment_unavailable"' in body[check : check + 900]
+    assert "app not launched" in body[check : check + 900]

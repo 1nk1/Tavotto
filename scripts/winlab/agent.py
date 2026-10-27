@@ -72,6 +72,7 @@ DESKTOP_LIVE_MODES = (
     "zcode-native",
     "workbuddy-native",
     "workbuddy-native-phone",
+    "claude-desktop-native",
 )
 #: 要用户扫码登录宿主账户的格（用户 2026-10-27：专用账户、每次扫、跑完清掉登录态）
 DESKTOP_LIVE_LOGIN_MODES = ("workbuddy-native", "workbuddy-native-phone")
@@ -79,7 +80,7 @@ DESKTOP_LIVE_LOGIN_MODES = ("workbuddy-native", "workbuddy-native-phone")
 #: winlab.py 的 ACCOUNT_MODEL_MODES 同一份，测试核对）
 DESKTOP_LIVE_ACCOUNT_MODEL_MODES = DESKTOP_LIVE_LOGIN_MODES
 #: 宿主只能从明文配置读 key 的格：用落盘专用 key（winlab.py ONDISK_MODES 同一份，测试核对），跑完 wipe_ondisk_key
-DESKTOP_LIVE_ONDISK_MODES = ("zcode-native",)
+DESKTOP_LIVE_ONDISK_MODES = ("zcode-native", "claude-desktop-native")
 #: 依赖安装配方的版本：改了 prepare 的安装步骤就加一，已有 venv 随之重装（散列戳里含它）。
 DEPS_RECIPE = "2"
 
@@ -2773,6 +2774,11 @@ def _fetch_pinned_file(
     return dest, info
 
 
+def _pinned_cached(lab: Lab, host: DesktopHost) -> bool:
+    dest = lab.cache / "desktop-hosts" / host.id / host.version / host.url.rsplit("/", 1)[-1]
+    return dest.is_file() and _file_sha256(dest) == host.sha256
+
+
 def fetch_pinned(lab: Lab, host: DesktopHost) -> tuple[Path | None, dict]:
     """下载（或复用缓存）固定版本的安装包并核 SHA-256（规矩见 `_fetch_pinned_file`）。"""
     return _fetch_pinned_file(
@@ -3303,6 +3309,7 @@ DESKTOP_LIVE: dict[str, DesktopLive] = {
     "zcode-native": DesktopLive("zcode", native=True),
     "workbuddy-native": DesktopLive("workbuddy", native=True, login="qr"),
     "workbuddy-native-phone": DesktopLive("workbuddy", native=True, login="phone"),
+    "claude-desktop-native": DesktopLive("claude-desktop", native=True),
 }
 assert tuple(DESKTOP_LIVE) == DESKTOP_LIVE_MODES
 #: 宿主装扩展时自报「版本不兼容」：这是宿主限制（not_supported），不是 Tavotto 的故障
@@ -3529,12 +3536,22 @@ def zcode_isolated_config(
 
 
 #: ZCode 自己的应用数据目录（Electron userData 等）：key 可能被它另存一份，跑完一并核对
+#: 落盘例外的宿主把东西写进哪些应用数据目录（名字前缀）：收尾时在这些目录里找 key
+ONDISK_APP_DIR_PREFIXES = ("zcode", "claude")
+
+
 def _zcode_app_dirs(env: dict) -> list[Path]:
-    out = []
+    """宿主的应用数据目录：传入环境的和这个账户真实的 APPDATA / LOCALAPPDATA 都看（Electron 不一定认环境变量）。
+    AnthropicClaude 是安装目录（几百 MB 的程序文件、随卸载删），不扫。"""
+    out: list[Path] = []
     for var in ("APPDATA", "LOCALAPPDATA"):
-        base = env.get(var) or os.environ.get(var)
-        if base and Path(base).is_dir():
-            out += [p for p in Path(base).iterdir() if p.name.lower().startswith("zcode")]
+        for base in {env.get(var), os.environ.get(var)} - {None, ""}:
+            if Path(base).is_dir():
+                out += [
+                    p
+                    for p in Path(base).iterdir()
+                    if p.name.lower().startswith(ONDISK_APP_DIR_PREFIXES) and p not in out
+                ]
     return out
 
 
@@ -3567,6 +3584,241 @@ def _files_containing(roots: list[Path], needle: bytes) -> tuple[list[Path], lis
     return hits, unreadable
 
 
+#: Claude Desktop 第三方推理（用户 2026-10-27：「不连接claude的官方服务，只用DeepSeek连接」）：推理只走 DeepSeek 的
+#: Anthropic 兼容接口；官方文档「Disabling all Anthropic-bound connections」列的六条全关，Cowork / Code 不开（Code 的
+#: WebFetch 预检会连 Anthropic；Cowork 要从 Anthropic 下载 VM 包），只用 Chat + 托管的 tavotto MCP
+CLAUDE3P_NO_ANTHROPIC = {
+    "disableEssentialTelemetry": True,
+    "disableNonessentialTelemetry": True,
+    "disableNonessentialServices": True,
+    "disableAutoUpdates": True,
+    "modelCatalogEnabled": False,
+    "skipWebFetchPreflight": True,
+    # 同 desktop-live 其它格：执行 / 写入 / 上网的内置工具一律拒（run 20261027T091823Z-aeeda4 模型「ran a command」：
+    # Windows 上执行工具是 PowerShell，只拒 Bash 不够）；只读的 Read / Glob / Grep 留着（大结果会落成文件要读回）
+    "disabledBuiltinTools": [
+        "WebFetch",
+        "WebSearch",
+        "Bash",
+        "PowerShell",
+        "Write",
+        "Edit",
+        "NotebookEdit",
+        "Task",
+        # 应用自带的工作区 shell（run 20261027T093311Z-8822e5 的会话记录里模型用了它 2 次）：名字不叫 Bash
+        "mcp__workspace__bash",
+    ],
+    "chatAdvancedFileAnalysisEnabled": False,
+    "chatTabEnabled": True,
+    "coworkTabEnabled": False,
+    "isClaudeCodeForDesktopEnabled": False,
+}
+
+
+#: 见 claude3p_isolated_config 的 inferenceModels
+CLAUDE3P_ROUTE = "claude-sonnet-4-5"
+#: 会话开始时应用要从这里下内置的 Claude Code（run 20261027T090928Z-bc8056 直连 3 次超时、会话起不来）。
+#: 用户 2026-10-27：「如果一定要下载，就是用dmit吧」——只这一个主机经 DMIT，其余（含 DeepSeek 推理）直连
+CLAUDE3P_DOWNLOAD_HOST = "downloads.claude.ai"
+CLAUDE3P_PAC = (
+    "function FindProxyForURL(url, host) {"
+    f' if (host === "{CLAUDE3P_DOWNLOAD_HOST}") return "PROXY 127.0.0.1:{PROXY_PORTS["trojan"]}";'
+    ' return "DIRECT"; }'
+)
+
+
+def serve_pac(pac: str) -> int:
+    """本次 run 的 PAC 脚本，只在回环上、只回 /proxy.pac；守护线程，随 agent 进程结束。返回端口。"""
+    import http.server
+
+    body = pac.encode("ascii")
+
+    class H(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802 — http.server 的接口名
+            if self.path.split("?")[0] != "/proxy.pac":
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv.server_address[1]
+
+
+_TOOL_USE_RE = re.compile(r'"type"\s*:\s*"tool_use"[^{}]*?"name"\s*:\s*"([^"]{1,80})"')
+#: 执行类工具的命令原文（截 300 字）：要知道模型拿 shell 做了什么
+_SHELL_CMD_RE = re.compile(
+    r'"name"\s*:\s*"(?:mcp__workspace__bash|Bash|PowerShell)"\s*,\s*"input"\s*:\s*\{\s*"command"\s*:\s*"((?:[^"\\]|\\.){0,300})'
+)
+
+
+def claude3p_shell_commands(home: Path) -> list[str]:
+    out: list[str] = []
+    for f in (home / "AppData").rglob("*"):
+        if f.is_file() and f.suffix in (".json", ".jsonl") and f.stat().st_size < 50_000_000:
+            with contextlib.suppress(OSError):
+                for c in _SHELL_CMD_RE.findall(f.read_text(encoding="utf-8", errors="replace")):
+                    if c not in out:
+                        out.append(c)
+    return out[:10]
+
+
+def claude3p_tool_uses(home: Path) -> dict[str, int]:
+    """Claude Desktop 会话记录（应用数据下 local-agent-mode-sessions / claude-code-sessions 的 json / jsonl）里每个
+    工具名出现的次数。只取名字。"""
+    counts: dict[str, int] = {}
+    for sub in ("local-agent-mode-sessions", "claude-code-sessions"):
+        for base in (
+            home / "AppData" / "Local" / "Claude-3p",
+            home / "AppData" / "Roaming" / "Claude-3p",
+        ):
+            d = base / sub
+            if not d.is_dir():
+                continue
+            for f in d.rglob("*"):
+                if (
+                    f.is_file()
+                    and f.suffix in (".json", ".jsonl")
+                    and f.stat().st_size < 50_000_000
+                ):
+                    with contextlib.suppress(OSError):
+                        for name in _TOOL_USE_RE.findall(
+                            f.read_text(encoding="utf-8", errors="replace")
+                        ):
+                            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def claude3p_config_dirs(home: Path, env: dict) -> list[Path]:
+    """configLibrary 写两处：重定向的 run 家目录下，和这个账户真实的 %LOCALAPPDATA%（Electron 取应用目录不一定认
+    环境变量）。真实那处跑完由 wipe_ondisk_key 删掉。"""
+    dirs = [home / "AppData" / "Local" / "Claude-3p" / "configLibrary"]
+    real = os.environ.get("LOCALAPPDATA")
+    if real:
+        dirs.append(Path(real) / "Claude-3p" / "configLibrary")
+    return dirs
+
+
+#: 用户级策略（官方 MDM 位置之一，CC Desktop Switch 在 Windows 上也写这里）：本地 configLibrary 没被读到时
+#: 应用仍按标准模式加载 claude.ai（run 20261027T082635Z-022557 没有 Claude-3p 日志）。值一律 REG_SZ，数组 / 对象
+#: 写成 JSON 字符串、布尔写 "true" / "false"（configuration-format：Value types in a profile or registry policy）
+CLAUDE_POLICY_KEY = r"SOFTWARE\Policies\Claude"
+
+
+def _policy_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    return v if isinstance(v, str) else json.dumps(v)
+
+
+def claude3p_policy_write(conf: dict) -> list[str]:
+    """写 HKCU 策略的值。键本身由 `winlab admin claude-policy-acl` 一次性建好并授 tavotto-lab 写这一个键
+    （Policies 普通用户写不进：run 20261027T084529Z-3dfb43 写入 0 条）；没建就写不进，返回空表。"""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    names = []
+    with contextlib.suppress(OSError):
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, CLAUDE_POLICY_KEY, 0, winreg.KEY_SET_VALUE
+        ) as k:
+            for name, v in conf.items():
+                winreg.SetValueEx(k, name, 0, winreg.REG_SZ, _policy_value(v))
+                names.append(name)
+    return names
+
+
+def claude3p_policy_wipe(key: str) -> dict:
+    """删掉 HKCU 策略键下的全部值（键留着：它是管理员建的、tavotto-lab 只能写值），再核对：还有任何值都算没清干净。
+    `present` = 还有值。"""
+    try:
+        import winreg
+    except ImportError:
+        return {"wiped": True, "present": False}
+    with contextlib.suppress(OSError):
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            CLAUDE_POLICY_KEY,
+            0,
+            winreg.KEY_SET_VALUE | winreg.KEY_QUERY_VALUE,
+        ) as k:
+            while True:
+                try:
+                    name = winreg.EnumValue(k, 0)[0]
+                except OSError:
+                    break
+                winreg.DeleteValue(k, name)
+    leaked, present = False, False
+    with contextlib.suppress(OSError):
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CLAUDE_POLICY_KEY) as k:
+            i = 0
+            while True:
+                try:
+                    _, val, _ = winreg.EnumValue(k, i)
+                except OSError:
+                    break
+                present = True
+                leaked = leaked or key in str(val)
+                i += 1
+    return {"wiped": not present and not leaked, "present": present}
+
+
+def claude3p_isolated_config(
+    home: Path,
+    env: dict,
+    mcp_cmd: list[str],
+    mcp_env: dict,
+    model_conf: dict,
+    tool_names: list[str],
+    pac_url: str = "",
+) -> dict:
+    """Claude Desktop on 3P 的本地配置（`configLibrary\\_meta.json` 记 appliedId，`<id>.json` 平铺键值，格式同
+    in-app 配置窗口写的）：gateway → DeepSeek，模型显式列出、不做发现；tavotto 经 `managedMcpServers` 起本地
+    stdio → 录制器，只预先放行 tavotto 自己的工具。返回 {files: 写下的配置文件（含 key，落盘例外）,
+    policy_written: 写进策略键的值名, policy_expected: 应写的值名}——调用方要核对策略写全了才能起应用。"""
+    model = model_conf.get("model") or DEFAULT_HOST_MODEL
+    conf = {
+        "inferenceProvider": "gateway",
+        "inferenceGatewayBaseUrl": model_conf["base_url"],
+        "inferenceGatewayApiKey": model_conf["api_key"],
+        "inferenceGatewayAuthScheme": "bearer",
+        # 应用只收「指向 Anthropic 模型名」的路由，非 claude 名字整条删掉（run 20261027T085727Z-9ddf76）；
+        # DeepSeek 的 Anthropic 接口把 claude-sonnet* 映射到 deepseek-flash（其官方文档），请求只到 DeepSeek
+        "inferenceModels": [{"name": CLAUDE3P_ROUTE, "labelOverride": f"DeepSeek ({model})"}],
+        "modelDiscoveryEnabled": False,
+        **CLAUDE3P_NO_ANTHROPIC,
+        **({"egressProxyPacUrl": pac_url} if pac_url else {}),
+        "managedMcpServers": [
+            {
+                "name": "tavotto",
+                "transport": "stdio",
+                "command": mcp_cmd[0],
+                "args": mcp_cmd[1:],
+                "env": mcp_env,
+                "toolPolicy": {n: "allow" for n in tool_names},
+            }
+        ],
+    }
+    written = []
+    policy_written = claude3p_policy_write(conf)
+    for d in claude3p_config_dirs(home, env):
+        d.mkdir(parents=True, exist_ok=True)
+        cid = "tavotto-lab"
+        (d / "_meta.json").write_text(json.dumps({"appliedId": cid}), encoding="utf-8")
+        f = d / f"{cid}.json"
+        f.write_text(json.dumps(conf, indent=2), encoding="utf-8")
+        written.append(f)
+    return {"files": written, "policy_written": policy_written, "policy_expected": list(conf)}
+
+
 def sweep_stale_ondisk_configs(runs: Path) -> list[str]:
     """上一次 run 被强行结束（超时 / stop）时 finally 没机会跑：开跑前把所有旧 run 里残留的
     provider_config.json 删掉（不看内容，文件本身就是落盘例外的产物）。返回删掉的 run id。"""
@@ -3576,7 +3828,19 @@ def sweep_stale_ondisk_configs(runs: Path) -> list[str]:
             with contextlib.suppress(OSError):
                 pc.unlink()
                 swept.append(pc.parents[4].name)
-    return swept
+        for pc in runs.glob("*/work/cdhome/AppData/Local/Claude-3p/configLibrary/*.json"):
+            with contextlib.suppress(OSError):
+                pc.unlink()
+                swept.append(pc.parents[6].name)
+    real = os.environ.get("LOCALAPPDATA")
+    if real:
+        for pc in (Path(real) / "Claude-3p" / "configLibrary").glob("*.json"):
+            with contextlib.suppress(OSError):
+                pc.unlink()
+                swept.append("LOCALAPPDATA")
+    if claude3p_policy_wipe("\0")["wiped"] is False:
+        swept.append("HKCU-policy-left")
+    return sorted(set(swept))
 
 
 def wipe_ondisk_key(run_dir: Path, env: dict, key: str) -> dict:
@@ -3587,6 +3851,10 @@ def wipe_ondisk_key(run_dir: Path, env: dict, key: str) -> dict:
     pc = zdata / ".zcode" / "v2" / "provider_config.json"
     with contextlib.suppress(OSError):
         pc.unlink()
+    for d in claude3p_config_dirs(run_dir / "work" / "cdhome", env):
+        for f in d.glob("*.json"):
+            with contextlib.suppress(OSError):
+                f.unlink()
     # 先删应用数据目录里的副本，再逐个文件抹 run 目录：任何一个文件读写失败都不中断收尾（Codex #1439），
     # 失败的文件留给下面的核对计入 residual / unreadable
     app_dirs = _zcode_app_dirs(env)
@@ -3597,12 +3865,16 @@ def wipe_ondisk_key(run_dir: Path, env: dict, key: str) -> dict:
         with contextlib.suppress(OSError):
             f.write_bytes(f.read_bytes().replace(needle, b"<redacted>"))
     left, unreadable = _files_containing([run_dir, *app_dirs], needle)
+    policy = claude3p_policy_wipe(key)
 
     def name(p: Path) -> str:
         return str(p.relative_to(run_dir)) if run_dir in p.parents else p.name
 
     return {
-        "wiped": not left and not unreadable,  # 读不了的文件 = 没核对完，不算清干净
+        "wiped": not left
+        and not unreadable
+        and policy["wiped"],  # 读不了的文件 = 没核对完，不算清干净
+        "policy_key_present": policy["present"],
         "residual": [name(p) for p in left][:10],
         "unreadable": [name(p) for p in unreadable][:10],
         "checked_app_dirs": [p.name for p in app_dirs],
@@ -3973,6 +4245,12 @@ def run_desktop_live_task(
         if cell.native and host.id == "workbuddy"
         else {
             "provider": model_conf.get("provider"),
+            "model": "deepseek-flash",  # DeepSeek 把 claude-sonnet* 路由映射到它
+            "route": CLAUDE3P_ROUTE,
+        }
+        if cell.native and host.id == "claude-desktop"
+        else {
+            "provider": model_conf.get("provider"),
             "model": model_conf.get("model")
             or DEFAULT_HOST_MODEL,  # 与 _host_model_env 实际传给宿主的同一个
         },
@@ -3984,6 +4262,13 @@ def run_desktop_live_task(
             **base,
             "result": "environment_unavailable",
             "summary": "venv missing: run `winlab prepare` first",
+        }
+    if mode == "claude-desktop-native" and not _pinned_cached(lab, host):
+        # 这一格不从 Anthropic 下载任何东西（用户 2026-10-27）：只用 L2 时已下好、已核散列的那份
+        return {
+            **base,
+            "result": "environment_unavailable",
+            "summary": "Claude Desktop installer is not in the Lab cache; this cell never downloads it",
         }
     setup, dl = fetch_pinned(lab, host)
     base["download"] = {"host": dl}
@@ -4201,6 +4486,42 @@ def _desktop_live_body(
             "--login-inbox",
             str(work),
         ]
+    elif cell.native and host.id == "claude-desktop":
+        # Claude Desktop on 3P：gateway → DeepSeek（落盘例外同 ZCode：专用限额 key，跑完 wipe_ondisk_key）；整个用户目录
+        # 指到 run 里（~/.claude、应用数据都隔离），配置另写一份到真实 LOCALAPPDATA（跑完删）
+        names = tavotto_tool_names(lab.repo / "codex-plugin" / "mcp")
+        if not names:
+            return {**base, "result": "error", "summary": "could not read tavotto MCP tool names"}
+        home = work / "cdhome"
+        if not _tcp_open("127.0.0.1", PROXY_PORTS["trojan"]):
+            # 内置 Claude Code 只能经 DMIT 取到；代理不在就如实不可用，不退回直连
+            return {
+                **base,
+                "result": "environment_unavailable",
+                "summary": f"DMIT proxy not listening; {CLAUDE3P_DOWNLOAD_HOST} is reachable only through it",
+            }
+        pac_port = serve_pac(CLAUDE3P_PAC)
+        base["egress"] = {
+            "pac": f"http://127.0.0.1:{pac_port}/proxy.pac",
+            "via_dmit": [CLAUDE3P_DOWNLOAD_HOST],
+            "everything_else": "DIRECT",
+        }
+        cfg = claude3p_isolated_config(
+            home, env, mcp_cmd, mcp_env, model_conf, names, pac_url=base["egress"]["pac"]
+        )
+        missing = sorted(set(cfg["policy_expected"]) - set(cfg["policy_written"]))
+        base["claude3p_policy_values"] = len(cfg["policy_written"])
+        if missing:
+            # 策略没写全就不起应用（Codex #1450 P1）：configLibrary 会被忽略，应用以标准模式起来、先连 claude.ai，
+            # 违反「不连接claude的官方服务」。已写的值由外层 finally 的 wipe_ondisk_key 删掉
+            return {
+                **base,
+                "result": "environment_unavailable",
+                "summary": "Claude Desktop policy values not written "
+                f"({len(missing)} missing, e.g. {missing[0]}): run `winlab admin claude-policy-acl` once; app not launched",
+            }
+        gui_env = dict(env, **_home_env(home))
+        public_env, secret_env = gui_env, None
     elif cell.native:
         # ZCode 只从明文 provider_config.json 读 key（用户 2026-10-26 同意的落盘例外，专用限额 key）：
         # 只写本次 run 的 ZCODE_DATA_BASE_DIR，跑完 wipe_ondisk_key 删除并核对无残留
@@ -4248,7 +4569,7 @@ def _desktop_live_body(
             open_uri=f"{host.url_scheme}://{ext.id}/open"
             if host.url_scheme and not cell.native
             else "none",
-            kind="native" if cell.native else "vscode",
+            kind=("uia" if host.id == "claude-desktop" else "native") if cell.native else "vscode",
             extra=login_args,
         )
         step = run_in_gui(
@@ -4320,6 +4641,49 @@ def _desktop_live_body(
     base["driver_log_tail"] = r1["log_tail"] if not r1["driver"] else ""
     if cell.native and host.id == "zcode":
         base["host_mcp_log"] = _grep_tail(ev / "zcode-logs", re.compile(r"mcp", re.I), 30)
+    if cell.native and host.id == "claude-desktop":
+        # 应用自己的日志（配置被拒的键、MCP 起没起来）；key 不进日志，落证前仍按 key 抹一遍
+        logs = [
+            work / "cdhome" / "AppData" / sub / app / "logs"
+            for sub in ("Local", "Roaming")
+            for app in ("Claude-3p", "Claude")
+        ]
+        for var, sub in (
+            ("LOCALAPPDATA", "Claude-3p"),
+            ("APPDATA", "Claude"),
+            ("LOCALAPPDATA", "Claude"),
+        ):
+            if os.environ.get(var):
+                logs.append(Path(os.environ[var]) / sub / "logs")
+        base["host_mcp_log"] = [
+            line.replace(key, "<redacted>")
+            for d in logs
+            for line in _grep_tail(
+                d,
+                re.compile(
+                    r"mcp|configLibrary|inference|gateway|region|3p|policy|managed|deployment"
+                    r"|downloads\.claude|claude\.ai|anthropic\.com|bundle|\bvm\b|sandbox|download",
+                    re.I,
+                ),
+                80,
+            )
+        ]
+    if cell.native and host.id == "claude-desktop":
+        # 模型实际用过的工具名（不含参数与结果）：会话记录里的 tool_use。面板只说「ran a command」，要知道是哪个工具
+        base["host_tool_uses"] = claude3p_tool_uses(work / "cdhome")
+        base["host_shell_commands"] = [
+            c.replace(key, "<redacted>") for c in claude3p_shell_commands(work / "cdhome")
+        ]
+    if r1["driver"].get("region_blocked"):
+        levels.update(
+            L3="environment_unavailable", L4="environment_unavailable", L5="environment_unavailable"
+        )
+        return {
+            **base,
+            "result": "environment_unavailable",
+            "summary": f"{host.name}: the app itself reports it is unavailable in this region (L3–L5 BLOCKED; not bypassed)",
+            "blocked_reason": "host unavailable in region",
+        }
     if r1["driver"].get("login_required"):
         levels.update(
             L3="environment_unavailable", L4="environment_unavailable", L5="environment_unavailable"
