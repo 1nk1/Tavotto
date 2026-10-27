@@ -467,6 +467,9 @@ def test_attributes_and_vocabularies_are_closed_sets():
         "retries",
         "items",
         "reported_ms",
+        "changed",
+        "refresh",
+        "checks_failed",
     }
     with pytest.raises(ValueError):
         xt.register_vocabulary("prompt", ["x"])
@@ -586,7 +589,7 @@ def test_span_churn_checkpoints_at_most_once_per_interval(clock):
     saves = []
 
     class CountingStore:
-        def save(self, trace):
+        def submit(self, trace):
             saves.append(trace.frozen)
 
     t = xt.ExecTrace("ai_task", clock=clock, store=CountingStore())

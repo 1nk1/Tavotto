@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import atexit
 import functools
 import json
 import os
@@ -69,6 +70,7 @@ SPAN_NAMES = (
     "verify",
     "settle",
     "export",
+    "execute",
 )
 
 #: 终局状态。`running` 只在快照里出现；`unknown` = 没被合法结束（冻结 / 恢复时补上），永不当成功读。
@@ -135,6 +137,7 @@ _VOCABULARIES: dict[str, set[str]] = {
     "usage_source": {"reported", "estimated"},
     "pricing_version": set(),
     "currency": {"USD"},
+    "refresh": set(),
 }
 
 #: attributes 白名单：键 → 类型（`count` 非负整数 / `ms` 非负毫秒 / `flag` 布尔 / `enum:<词表>`）。
@@ -156,6 +159,9 @@ ATTRIBUTES: dict[str, str] = {
     "retries": "count",
     "items": "count",
     "reported_ms": "ms",
+    "changed": "flag",
+    "refresh": "enum:refresh",
+    "checks_failed": "count",
 }
 
 # ---------------------------------------------------------------- 上限
@@ -544,6 +550,44 @@ class ExecTrace:
             span["duration_ms"] = 0.0
         return span_id
 
+    @_never_raises()
+    def reported(
+        self,
+        name: str,
+        kind: str,
+        status: str,
+        *,
+        duration_ms,
+        parent: str | None = None,
+        attempt: int = 1,
+        error_code: str | None = None,
+        attributes: dict | None = None,
+        usage: dict | None = None,
+    ) -> str | None:
+        """事后才知道的区间：别的进程报来「刚才那件事花了 N 毫秒」（agent_runner 的一轮模型请求）。Span 结束在**收到
+        的这一刻**，起点倒推 N 毫秒、但不早于父 Span 的起点（不让子越出父）；`timing="reported"`。时长不合法就记成 point。"""
+        span_id = self.start_span(name, kind, parent=parent, attempt=attempt, attributes=attributes)
+        if span_id is None:
+            return None
+        self.end_span(span_id, status, error_code=error_code, usage=usage)
+        ms = _attr_value("ms", duration_ms)
+        with self._lock:
+            span = self._spans[span_id]
+            end = (
+                span["end_offset_ms"]
+                if span["end_offset_ms"] is not None
+                else span["start_offset_ms"]
+            )
+            if ms is None:
+                span["timing"] = TIMING_POINT
+                span["start_offset_ms"] = span["end_offset_ms"] = end
+            else:
+                floor = self._spans.get(span["parent_span_id"], {}).get("start_offset_ms", 0.0)
+                span["start_offset_ms"] = round(max(floor, end - ms), 3)
+                span["timing"] = TIMING_REPORTED
+            span["duration_ms"] = round(end - span["start_offset_ms"], 3)
+        return span_id
+
     @_never_raises(default=0)
     def event(
         self,
@@ -567,8 +611,14 @@ class ExecTrace:
             return self._push_event(name, target, attributes, self._offset_ms())
 
     @_never_raises(default=False)
-    def finish(self, status: str, *, error_code: str | None = None) -> bool:
-        """冻结终局。还开着的 Span 不会被解释成成功：取消 / 超时随根，其余一律 `unknown`。只生效一次。"""
+    def finish(
+        self, status: str, *, error_code: str | None = None, attributes: dict | None = None
+    ) -> bool:
+        """冻结终局。还开着的 Span 不会被解释成成功：取消 / 超时随根，其余一律 `unknown`。只生效一次。
+
+        `attributes` 记在根 Span 上：任务的几件**不同**事实（Agent 退出、文件变没变、刷新结局、任务结局）分开放，
+        不合并成一个「成功」。
+        """
         if status not in END_STATUSES:
             return False
         with self._lock:
@@ -590,6 +640,9 @@ class ExecTrace:
                 span["duration_ms"] = round(span["end_offset_ms"] - span["start_offset_ms"], 3)
                 span["timing"] = TIMING_UNMEASURED
             root = self._spans[self.root_span_id]
+            kept, rejected = project_attributes(attributes)
+            self._rejected += rejected
+            root["attributes"].update(kept)
             root["status"] = status
             root["error_code"] = _code(error_code) if status != STATUS_OK else None
             root["end_offset_ms"] = round(end, 3)
@@ -606,6 +659,11 @@ class ExecTrace:
     @property
     def frozen(self) -> bool:
         return self._frozen
+
+    def bind_scope(self, scope: str | None) -> None:
+        """作业先建、后知道属于哪个项目（导出作业的 `project_id`）：只许绑一次，形状不对不绑。"""
+        if self.scope is None:
+            self.scope = _ref(scope)
 
     def snapshot(self) -> dict:
         """只读的公开投影（所有字段都是入口校验过的闭集 / 数字 / 不透明 id，可以原样交给前端）。"""
@@ -655,7 +713,7 @@ class ExecTrace:
             if not force and now - self._last_checkpoint < CHECKPOINT_S:
                 return
             self._last_checkpoint = now
-            store.save(self)
+            store.submit(self)
         except Exception:  # noqa: BLE001
             self._internal_errors += 1
 
@@ -676,6 +734,9 @@ class NullTrace:
     def point(self, *a, **k):
         return None
 
+    def reported(self, *a, **k):
+        return None
+
     def event(self, *a, **k):
         return 0
 
@@ -683,6 +744,9 @@ class NullTrace:
         return False
 
     def snapshot(self):
+        return None
+
+    def bind_scope(self, scope):
         return None
 
 
@@ -729,11 +793,54 @@ class TraceStore:
 
     _TOKEN = secrets.token_hex(8)
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(self, root: Path | None = None, *, background: bool = False) -> None:
         self._root = root
         self._lock = threading.Lock()
         self.write_errors = 0
         self.corrupt = 0
+        #: 后台写（进程级记录器用）：`submit()` 只把 Trace 记进待写表、立刻返回；写线程每次取**那一刻**的快照写盘。
+        #: 业务线程（可能正持着导出全局锁、AI 请求锁、脚本锁）因此永远不做磁盘 I/O——盘慢 / 卡住只拖慢 Trace 自己。
+        self._background = background
+        self._pending: OrderedDict[str, ExecTrace] = OrderedDict()
+        self._pending_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._idle = threading.Event()
+        self._idle.set()
+        self._writer: threading.Thread | None = None
+
+    def submit(self, trace: ExecTrace) -> None:
+        """要求写一次（合并：同一条 Trace 待写多次只写一次最新的）。同步模式直接写（测试 / 工具用）。"""
+        if not self._background:
+            self.save(trace)
+            return
+        with self._pending_lock:
+            self._pending[trace.trace_id] = trace
+            self._pending.move_to_end(trace.trace_id)
+            self._idle.clear()
+            if self._writer is None or not self._writer.is_alive():
+                self._writer = threading.Thread(
+                    target=self._drain, name="tavotto-exectrace-writer", daemon=True
+                )
+                self._writer.start()
+        self._wake.set()
+
+    def _drain(self) -> None:
+        while True:
+            self._wake.wait(timeout=30.0)
+            self._wake.clear()
+            while True:
+                with self._pending_lock:
+                    if not self._pending:
+                        self._idle.set()
+                        break
+                    _, trace = self._pending.popitem(last=False)
+                self.save(trace)  # 自己吞异常、计 write_errors
+
+    def flush(self, timeout: float = 5.0) -> bool:
+        """等待待写表写空（测试 / 退出时用）；超时回 False，不抛。"""
+        if not self._background:
+            return True
+        return self._idle.wait(timeout)
 
     @property
     def root(self) -> Path:
@@ -949,11 +1056,9 @@ class Recorder:
         with self._lock:
             self._live[trace.trace_id] = trace
             while len(self._live) > MAX_LIVE:
-                # 只挤掉已冻结的；全在跑就留着（运行中的不丢）
+                # 先挤掉已冻结的；全在跑（有调用方忘了 finish）就挤最旧的——内存表有界，它的 checkpoint 仍在盘上
                 victim = next((k for k, t in self._live.items() if t.frozen), None)
-                if victim is None:
-                    break
-                del self._live[victim]
+                del self._live[victim if victim is not None else next(iter(self._live))]
         return trace
 
     def get(self, trace_id: str, *, scope: str | None) -> dict | None:
@@ -967,7 +1072,52 @@ class Recorder:
         return self._store.load(trace_id, scope=_ref(scope))
 
 
+def scope_for(project_key) -> str | None:
+    """项目的不透明 scope 键：项目 id / 解析后的根路径 → sha256 前 32 位。Trace 里永不出现路径本身。"""
+    if not isinstance(project_key, str) or not project_key:
+        return None
+    import hashlib
+
+    return hashlib.sha256(project_key.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+
+
+#: 进程级入口：业务模块只经 `begin()` 拿 Trace。存储根延迟到第一次写才解析（`data_dir()` 在测试里被重定向）。
+RECORDER = Recorder(TraceStore(background=True))
+
+
+def _flush_at_exit() -> None:
+    # 正常退出时把最后几次终局写完（最多等 1 秒）；被强杀的进程留下的 `.open` 由下次启动 `recover()` 收成 interrupted
+    try:
+        if RECORDER._store is not None:
+            RECORDER._store.flush(1.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+atexit.register(_flush_at_exit)
+
+
+def begin(operation_kind: str, **kwargs):
+    """开一条根 Trace；关掉时 / 建不起来时回 `NullTrace`（同一套接口，业务代码不必判空）。"""
+    return RECORDER.begin(operation_kind, **kwargs)
+
+
+def recover_on_startup() -> int:
+    """服务启动时调一次：属主已不在的运行中记录收成 interrupted、过期的清掉。永不抛。"""
+    if not enabled():
+        return 0
+    try:
+        store = RECORDER._store
+        return store.recover() if store is not None else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 __all__ = [
+    "RECORDER",
+    "begin",
+    "recover_on_startup",
+    "scope_for",
     "ATTRIBUTES",
     "END_STATUSES",
     "EVENT_NAMES",
